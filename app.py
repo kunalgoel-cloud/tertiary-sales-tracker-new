@@ -5,18 +5,32 @@ import re
 import plotly.express as px
 from datetime import datetime, timedelta
 
-# --- 1. DATABASE SETUP ---
+# --- 1. DATABASE SETUP & MIGRATION ---
 st.set_page_config(page_title="Executive Sales Tracker", layout="wide")
 conn = sqlite3.connect('sales_history.db', check_same_thread=False)
 c = conn.cursor()
 
+# Create tables if they don't exist
 c.execute('CREATE TABLE IF NOT EXISTS sales (date TEXT, channel TEXT, item_name TEXT, qty_sold REAL, revenue REAL)')
-# Added var_col to the mapping memory schema
-c.execute('CREATE TABLE IF NOT EXISTS col_map (channel TEXT PRIMARY KEY, item_col TEXT, qty_col TEXT, rev_col TEXT, date_col TEXT, var_col TEXT)')
+c.execute('''CREATE TABLE IF NOT EXISTS col_map 
+             (channel TEXT PRIMARY KEY, item_col TEXT, qty_col TEXT, rev_col TEXT, date_col TEXT, var_col TEXT)''')
 c.execute('CREATE TABLE IF NOT EXISTS item_map (raw_name TEXT PRIMARY KEY, master_name TEXT)')
 c.execute('CREATE TABLE IF NOT EXISTS master_skus (name TEXT PRIMARY KEY)')
 c.execute('CREATE TABLE IF NOT EXISTS master_channels (name TEXT PRIMARY KEY)')
 conn.commit()
+
+# Schema Migration: Add var_col to existing databases that don't have it
+try:
+    c.execute("ALTER TABLE col_map ADD COLUMN var_col TEXT")
+    conn.commit()
+except sqlite3.OperationalError:
+    pass # Column already exists
+
+# Seed initial channels if empty
+if not c.execute("SELECT name FROM master_channels").fetchall():
+    for ch in ["Blinkit", "Swiggy", "Amazon", "Big Basket"]:
+        c.execute("INSERT OR IGNORE INTO master_channels VALUES (?)", (ch,))
+    conn.commit()
 
 def clean_num(val):
     if pd.isna(val): return 0.0
@@ -35,7 +49,7 @@ with st.sidebar:
             c.execute("DELETE FROM col_map"); c.execute("DELETE FROM item_map"); conn.commit()
             st.success("Mappings Reset!"); st.rerun()
 
-# --- 3. DASHBOARD TABS ---
+# --- 3. MAIN DASHBOARD ---
 st.title("📈 Tertiary Sales Executive Dashboard")
 view_metric = st.radio("Display Dashboard By:", ["Revenue (₹)", "Quantity (Units)"], horizontal=True)
 target_col = "revenue" if "Revenue" in view_metric else "qty_sold"
@@ -70,11 +84,11 @@ with tab1:
         range_df = history_df[mask].copy()
 
         f1, f2 = st.columns(2)
-        available_chans = sorted(range_df['channel'].unique())
+        available_chans = sorted(range_df['channel'].unique()) if not range_df.empty else []
         with f1: sel_chan = st.multiselect("Filter Channels", available_chans, default=available_chans)
         
         chan_mask = range_df['channel'].isin(sel_chan)
-        available_items = sorted(range_df[chan_mask]['item_name'].unique())
+        available_items = sorted(range_df[chan_mask]['item_name'].unique()) if not range_df[chan_mask].empty else []
         with f2: sel_item = st.multiselect("Filter Products", available_items)
 
         final_mask = chan_mask
@@ -106,7 +120,7 @@ with tab1:
     else:
         st.info("No history found. Upload data to begin.")
 
-# --- TAB 2: SMART UPLOAD (WITH VARIANT LOGIC) ---
+# --- TAB 2: SMART UPLOAD ---
 with tab2:
     chans = [r[0] for r in c.execute("SELECT name FROM master_channels ORDER BY name ASC").fetchall()]
     channel = st.selectbox("Select Channel", chans)
@@ -116,7 +130,6 @@ with tab2:
         df = pd.read_csv(uploaded_file) if uploaded_file.name.endswith('.csv') else pd.read_excel(uploaded_file)
         c_names = ["None"] + df.columns.tolist()
         
-        # Load column memory
         res = c.execute("SELECT * FROM col_map WHERE channel = ?", (channel,)).fetchone()
         saved = {"item": 0, "qty": 0, "rev": 0, "date": 0, "var": 0}
         if res:
@@ -138,11 +151,10 @@ with tab2:
             st.markdown("### 🛠 Step 2: Mapping")
             masters = [r[0] for r in c.execute("SELECT name FROM master_skus ORDER BY name ASC").fetchall()]
             
-            # Identify unique items based on Name + Variant
             if col_var != "None":
                 df_unique = df[[col_item, col_var]].drop_duplicates()
                 df_unique['mapping_key'] = df_unique[col_item].astype(str) + " | " + df_unique[col_var].astype(str)
-                df_unique['display_label'] = df_unique[col_item].astype(str) + " [Variant: " + df_unique[col_var].astype(str) + "]"
+                df_unique['display_label'] = df_unique[col_item].astype(str) + " (" + df_unique[col_var].astype(str) + ")"
             else:
                 df_unique = df[[col_item]].drop_duplicates()
                 df_unique['mapping_key'] = df_unique[col_item].astype(str)
@@ -150,12 +162,9 @@ with tab2:
 
             mapping_updates = {}
             for _, row in df_unique.iterrows():
-                key = row['mapping_key']
+                key, label = row['mapping_key'], row['display_label']
                 known = c.execute("SELECT master_name FROM item_map WHERE raw_name = ?", (key,)).fetchone()
-                if known:
-                    mapping_updates[key] = known[0]
-                else:
-                    mapping_updates[key] = st.selectbox(f"Map: '{row['display_label']}'", masters, key=f"up_{key}")
+                mapping_updates[key] = st.selectbox(f"Map: '{label}'", masters, index=(masters.index(known[0]) if known and known[0] in masters else 0), key=f"up_{key}")
 
             if st.button("🚀 Process & Save Data"):
                 c.execute("INSERT OR REPLACE INTO col_map VALUES (?, ?, ?, ?, ?, ?)", (channel, col_item, col_qty, col_rev, col_date, col_var))
