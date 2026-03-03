@@ -9,6 +9,7 @@ st.set_page_config(page_title="Executive Sales Tracker", layout="wide")
 conn = sqlite3.connect('sales_history.db', check_same_thread=False)
 c = conn.cursor()
 
+# Tables for History, Column Mappings, and Item Mappings
 c.execute('''CREATE TABLE IF NOT EXISTS sales 
              (date TEXT, channel TEXT, item_name TEXT, qty_sold REAL, revenue REAL)''')
 c.execute('''CREATE TABLE IF NOT EXISTS col_map 
@@ -80,7 +81,7 @@ with tab1:
                 known = c.execute("SELECT master_name FROM item_map WHERE raw_name = ?", (item,)).fetchone()
                 default_val = known[0] if known else item
                 
-                # Searchable Dropdown
+                # Searchable Dropdown with "Add New" option
                 mapping_updates[item] = st.selectbox(
                     f"Map: '{item}'",
                     options=list(set([default_val] + existing_masters + ["+ ADD NEW SKU"])),
@@ -90,11 +91,14 @@ with tab1:
                     mapping_updates[item] = st.text_input(f"New Master Name for '{item}':", key=f"new_{item}")
 
             if st.button("🚀 Process & Save Data"):
+                # Save Column Mappings to memory
                 c.execute("INSERT OR REPLACE INTO col_map VALUES (?, ?, ?, ?, ?)", (channel, col_item, col_qty, col_rev, col_date))
+                # Save Item Mappings to memory
                 for raw, master in mapping_updates.items():
                     if master: c.execute("INSERT OR REPLACE INTO item_map VALUES (?, ?)", (raw, master))
                 conn.commit()
 
+                # Process Rows
                 final_data = []
                 for _, row in df.iterrows():
                     row_date = str(manual_date)
@@ -109,12 +113,13 @@ with tab1:
                     })
                 
                 upload_df = pd.DataFrame(final_data)
+                # Override logic: Delete old data for these specific dates/channel
                 for d in upload_df['date'].unique():
                     c.execute("DELETE FROM sales WHERE date = ? AND channel = ?", (d, channel))
                 
                 upload_df.to_sql('sales', conn, if_exists='append', index=False)
                 conn.commit()
-                st.success("Data Updated!"); st.rerun()
+                st.success("Data Saved Successfully!"); st.rerun()
 
 # --- 5. ANALYTICS (STACKED CHART) ---
 with tab2:
@@ -129,41 +134,32 @@ with tab2:
         if sel_item: mask &= history_df['item_name'].isin(sel_item)
         filtered = history_df[mask].sort_values('date')
         
-        # Determine what to color the stacks by
+        # Determine Color Logic
         color_theme = "item_name" if sel_item else "channel"
         
-        # STACKED BAR CHART: One bar per date
+        # --- STACKED BAR CHART ---
         fig = px.bar(
-            filtered, 
-            x="date", 
-            y=target_col, 
-            color=color_theme, 
-            barmode="relative", # This stacks them vertically
-            title=f"Total {metric_label} Trend",
-            height=600,
-            labels={target_col: metric_label, "date": "Date"}
+            filtered, x="date", y=target_col, color=color_theme, 
+            barmode="stack", title=f"Total {metric_label} Trend",
+            height=600, labels={target_col: metric_label, "date": "Date"}
         )
         
-        # Show Total on top of the stacked bar
-        fig.update_layout(barmode='stack', xaxis={'categoryorder':'category ascending'})
+        # Fix X-Axis to be chronological categories
         fig.update_xaxes(type='category', tickangle=-45)
         
-        # This part adds total labels on top of the whole stack
-        total_df = filtered.groupby('date')[target_col].sum().reset_index()
+        # Add Total Labels at the very top of each stacked bar
+        totals = filtered.groupby('date')[target_col].sum().reset_index()
         fig.add_scatter(
-            x=total_df['date'], 
-            y=total_df[target_col], 
-            text=total_df[target_col].apply(lambda x: f'{x:.1s}'),
-            mode='text',
-            textposition='top center',
-            showlegend=False
+            x=totals['date'], y=totals[target_col], 
+            text=totals[target_col].apply(lambda x: f'{x:,.0f}'),
+            mode='text', textposition='top center', showlegend=False
         )
-        
+
         st.plotly_chart(fig, use_container_width=True)
         
-        # Totals Metric & Data Table
+        # KPI & Table
         st.divider()
         st.metric(f"Grand Total {metric_label}", f"{filtered[target_col].sum():,.2f}")
         st.dataframe(filtered, use_container_width=True)
     else:
-        st.info("Upload data to see analytics.")
+        st.info("No data yet. Upload a file in the first tab.")
