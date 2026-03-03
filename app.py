@@ -1,228 +1,202 @@
 import streamlit as st
+from streamlit_gsheets import GSheetsConnection
 import pandas as pd
-import sqlite3
 import re
 import plotly.express as px
 from datetime import datetime, timedelta
 
-# --- 1. DATABASE SETUP & MIGRATION ---
-st.set_page_config(page_title="Executive Sales Tracker", layout="wide")
-conn = sqlite3.connect('sales_history.db', check_same_thread=False)
-c = conn.cursor()
+# --- 1. SETUP & CONNECTION ---
+st.set_page_config(page_title="Executive Sales Tracker (Cloud)", layout="wide")
+st.title("📈 Cloud-Synced Sales Dashboard")
 
-c.execute('CREATE TABLE IF NOT EXISTS sales (date TEXT, channel TEXT, item_name TEXT, qty_sold REAL, revenue REAL)')
-c.execute('''CREATE TABLE IF NOT EXISTS col_map 
-             (channel TEXT PRIMARY KEY, item_col TEXT, qty_col TEXT, rev_col TEXT, date_col TEXT, var_col TEXT)''')
-c.execute('CREATE TABLE IF NOT EXISTS item_map (raw_name TEXT PRIMARY KEY, master_name TEXT)')
-c.execute('CREATE TABLE IF NOT EXISTS master_skus (name TEXT PRIMARY KEY)')
-c.execute('CREATE TABLE IF NOT EXISTS master_channels (name TEXT PRIMARY KEY)')
-conn.commit()
+# Your specific Google Sheet Link
+SHEET_URL = "https://docs.google.com/spreadsheets/d/1V2KD7IU7BaHZnkXH96GhGiYp-nW_wFdTFTaNPGM5DX0/edit?usp=sharing"
 
-try:
-    c.execute("ALTER TABLE col_map ADD COLUMN var_col TEXT")
-    conn.commit()
-except sqlite3.OperationalError:
-    pass 
+# Establish Google Sheets Connection
+conn = st.connection("gsheets", type=GSheetsConnection)
 
-if not c.execute("SELECT name FROM master_channels").fetchall():
-    for ch in ["Blinkit", "Swiggy", "Amazon", "Big Basket"]:
-        c.execute("INSERT OR IGNORE INTO master_channels VALUES (?)", (ch,))
-    conn.commit()
+# Helper function to read sheets safely with fallback to empty dataframes
+def load_sheet(name, columns):
+    try:
+        df = conn.read(spreadsheet=SHEET_URL, worksheet=name, ttl=0) # ttl=0 ensures live data
+        if df is None or df.empty: 
+            return pd.DataFrame(columns=columns)
+        return df
+    except Exception:
+        return pd.DataFrame(columns=columns)
+
+# Load Live Data from Cloud
+history_df = load_sheet("sales", ["date", "channel", "item_name", "qty_sold", "revenue"])
+col_map_df = load_sheet("col_map", ["channel", "item_col", "qty_col", "rev_col", "date_col", "var_col"])
+item_map_df = load_sheet("item_map", ["raw_name", "master_name"])
+master_skus = load_sheet("master_skus", ["name"])
+master_chans = load_sheet("master_channels", ["name"])
 
 def clean_num(val):
     if pd.isna(val): return 0.0
     res = re.sub(r'[^\d.]', '', str(val))
     return float(res) if res else 0.0
 
-# --- 2. ADMIN SIDEBAR ---
-with st.sidebar:
-    st.header("⚙️ Admin Controls")
-    if st.checkbox("Show Data Management"):
-        st.warning("Danger Zone")
-        if st.button("🗑️ Flush All Sales History"):
-            c.execute("DELETE FROM sales"); conn.commit()
-            st.success("History Cleared!"); st.rerun()
-        if st.button("🔄 Reset All Mappings"):
-            c.execute("DELETE FROM col_map"); c.execute("DELETE FROM item_map"); conn.commit()
-            st.success("Mappings Reset!"); st.rerun()
-
-# --- 3. MAIN DASHBOARD ---
-st.title("📈 Tertiary Sales Executive Dashboard")
-view_metric = st.radio("Display Dashboard By:", ["Revenue (₹)", "Quantity (Units)"], horizontal=True)
-target_col = "revenue" if "Revenue" in view_metric else "qty_sold"
-metric_label = "Revenue" if "Revenue" in view_metric else "Qty"
-currency_prefix = "₹" if "Revenue" in view_metric else ""
-
+# --- 2. NAVIGATION TABS ---
 tab1, tab2, tab3 = st.tabs(["📊 Trend Analytics", "📤 Smart Upload", "🛠 Configuration"])
 
 # --- TAB 1: ANALYTICS ---
 with tab1:
-    history_df = pd.read_sql("SELECT * FROM sales", conn)
+    view_metric = st.radio("Display By:", ["Revenue (₹)", "Quantity (Units)"], horizontal=True)
+    target_col = "revenue" if "Revenue" in view_metric else "qty_sold"
+    metric_label = "Revenue" if "Revenue" in view_metric else "Qty"
+    currency = "₹" if "Revenue" in view_metric else ""
+
     if not history_df.empty:
         history_df['date_dt'] = pd.to_datetime(history_df['date'])
-        min_db_date, max_db_date = history_df['date_dt'].min().date(), history_df['date_dt'].max().date()
         today = datetime.now().date()
-
-        st.subheader("Filters")
-        q_col1, q_col2 = st.columns([3, 1])
-        with q_col1:
-            time_preset = st.radio("Quick Select Period:", ["Last 7 Days", "Last 30 Days", "Month to Date", "All Time", "Custom"], horizontal=True, index=3)
-        with q_col2:
+        
+        # Filters Header
+        q1, q2 = st.columns([3, 1])
+        with q1:
+            time_preset = st.radio("Period:", ["Last 7 Days", "Last 30 Days", "Month to Date", "All Time", "Custom"], horizontal=True, index=3)
+        with q2:
             show_labels = st.checkbox("Show Data Labels", value=True)
 
-        if time_preset == "Last 7 Days": start_date, end_date = today - timedelta(days=6), today
-        elif time_preset == "Last 30 Days": start_date, end_date = today - timedelta(days=29), today
-        elif time_preset == "Month to Date": start_date, end_date = today.replace(day=1), today
-        elif time_preset == "All Time": start_date, end_date = min_db_date, max_db_date
+        # Time Logic
+        if time_preset == "Last 7 Days": start_d, end_d = today - timedelta(days=6), today
+        elif time_preset == "Last 30 Days": start_d, end_d = today - timedelta(days=29), today
+        elif time_preset == "Month to Date": start_d, end_d = today.replace(day=1), today
+        elif time_preset == "All Time": start_d, end_d = history_df['date_dt'].min().date(), history_df['date_dt'].max().date()
         else:
-            dr = st.date_input("Custom Range", value=(min_db_date, max_db_date))
-            start_date, end_date = (dr[0], dr[1]) if len(dr) == 2 else (min_db_date, max_db_date)
+            dr = st.date_input("Select Custom Range", value=(today - timedelta(days=7), today))
+            start_d, end_d = (dr[0], dr[1]) if len(dr) == 2 else (today, today)
 
-        # Calculate number of days in range for DRR
-        num_days = (end_date - start_date).days + 1
-
-        mask = (history_df['date_dt'].dt.date >= start_date) & (history_df['date_dt'].dt.date <= end_date)
+        num_days = (end_d - start_d).days + 1
+        mask = (history_df['date_dt'].dt.date >= start_d) & (history_df['date_dt'].dt.date <= end_d)
         range_df = history_df[mask].copy()
 
-        f1, f2 = st.columns(2)
-        available_chans = sorted(range_df['channel'].unique()) if not range_df.empty else []
-        with f1: sel_chan = st.multiselect("Filter Channels", available_chans, default=available_chans)
-        
-        chan_mask = range_df['channel'].isin(sel_chan)
-        available_items = sorted(range_df[chan_mask]['item_name'].unique()) if not range_df[chan_mask].empty else []
-        with f2: sel_item = st.multiselect("Filter Products", available_items)
+        # Dynamic Filters
+        c1, c2 = st.columns(2)
+        with c1: 
+            chans = sorted(range_df['channel'].unique())
+            sel_chan = st.multiselect("Filter Channels", chans, default=chans)
+        with c2:
+            items = sorted(range_df[range_df['channel'].isin(sel_chan)]['item_name'].unique())
+            sel_item = st.multiselect("Filter Products", items)
 
-        final_mask = chan_mask
-        if sel_item: final_mask &= range_df['item_name'].isin(sel_item)
-        filtered = range_df[final_mask].copy()
+        f_mask = range_df['channel'].isin(sel_chan)
+        if sel_item: f_mask &= range_df['item_name'].isin(sel_item)
+        filtered = range_df[f_mask]
 
-        # --- TOP METRICS (Total + DRR) ---
-        total_val = filtered[target_col].sum()
-        avg_drr = total_val / num_days if num_days > 0 else 0
-
+        # Top Metric Cards
+        total = filtered[target_col].sum()
+        drr = total / num_days if num_days > 0 else 0
         m1, m2 = st.columns(2)
-        with m1:
-            st.metric(label=f"Total {metric_label}", value=f"{currency_prefix}{total_val:,.2f}")
-        with m2:
-            st.metric(label=f"Average DRR (Daily Run Rate)", value=f"{currency_prefix}{avg_drr:,.2f}", help=f"Total divided by {num_days} days")
-        
-        st.divider()
+        m1.metric(f"Total {metric_label}", f"{currency}{total:,.2f}")
+        m2.metric("Average DRR", f"{currency}{drr:,.2f}", help=f"Average per day over {num_days} days")
 
+        # Visualization
         if not filtered.empty:
-            color_theme = "item_name" if sel_item else "channel"
-            plot_df = filtered.groupby(['date', color_theme])[target_col].sum().reset_index()
-            all_dates = pd.date_range(start_date, end_date).strftime('%Y-%m-%d').tolist()
-            all_groups = plot_df[color_theme].unique()
-            
-            if len(all_groups) > 0:
-                template = pd.MultiIndex.from_product([all_dates, all_groups], names=['date', color_theme]).to_frame(index=False)
-                plot_df = pd.merge(template, plot_df, on=['date', color_theme], how='left').fillna(0).sort_values('date')
+            color = "item_name" if sel_item else "channel"
+            plot_df = filtered.groupby(['date', color])[target_col].sum().reset_index()
+            # Timeline Zero-Fill
+            all_dates = pd.date_range(start_d, end_d).strftime('%Y-%m-%d').tolist()
+            groups = plot_df[color].unique()
+            template = pd.MultiIndex.from_product([all_dates, groups], names=['date', color]).to_frame(index=False)
+            plot_df = pd.merge(template, plot_df, on=['date', color], how='left').fillna(0)
 
-                fig = px.bar(plot_df, x="date", y=target_col, color=color_theme, barmode="stack", height=550)
-                fig.update_xaxes(type='category', tickangle=-45)
-                
-                # Add a horizontal line for DRR
-                fig.add_hline(y=avg_drr, line_dash="dash", line_color="red", 
-                              annotation_text=f"Avg DRR: {avg_drr:,.0f}", 
-                              annotation_position="top left")
-
-                if show_labels:
-                    fig.update_traces(texttemplate='%{y:.2s}', textposition='inside')
-                    totals = plot_df.groupby('date')[target_col].sum().reset_index()
-                    fig.add_scatter(x=totals['date'], y=totals[target_col], text=totals[target_col].apply(lambda x: f'{x:,.0f}' if x > 0 else ''), mode='text', textposition='top center', showlegend=False)
-                st.plotly_chart(fig, use_container_width=True)
-                st.dataframe(filtered.drop(columns=['date_dt']), use_container_width=True)
+            fig = px.bar(plot_df, x="date", y=target_col, color=color, barmode="stack", height=500)
+            fig.add_hline(y=drr, line_dash="dash", line_color="red", annotation_text="Avg DRR Line")
+            if show_labels:
+                fig.update_traces(texttemplate='%{y:.2s}', textposition='inside')
+            st.plotly_chart(fig, use_container_width=True)
+            st.dataframe(filtered.drop(columns=['date_dt']), use_container_width=True)
     else:
-        st.info("No history found. Upload data to begin.")
+        st.info("The database is currently empty. Please use the 'Smart Upload' tab to add sales data.")
 
 # --- TAB 2: SMART UPLOAD ---
 with tab2:
-    chans = [r[0] for r in c.execute("SELECT name FROM master_channels ORDER BY name ASC").fetchall()]
-    channel = st.selectbox("Select Channel", chans)
-    uploaded_file = st.file_uploader("Upload Sales File", type=["csv", "xlsx"])
+    if master_chans.empty:
+        st.warning("Please add Sales Channels in the 'Configuration' tab first.")
+    else:
+        channel = st.selectbox("Select Channel for Upload", master_chans['name'].tolist())
+        uploaded_file = st.file_uploader("Upload Sales File (CSV or Excel)", type=["csv", "xlsx"])
 
-    if uploaded_file:
-        df = pd.read_csv(uploaded_file) if uploaded_file.name.endswith('.csv') else pd.read_excel(uploaded_file)
-        c_names = ["None"] + df.columns.tolist()
-        
-        res = c.execute("SELECT * FROM col_map WHERE channel = ?", (channel,)).fetchone()
-        saved = {"item": 0, "qty": 0, "rev": 0, "date": 0, "var": 0}
-        if res:
-            saved = {k: (c_names.index(v) if v in c_names else 0) for k, v in zip(["item", "qty", "rev", "date", "var"], res[1:])}
-
-        st.markdown("### 🛠 Step 1: Confirm Columns")
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            col_item = st.selectbox("Product Name Column", c_names, index=saved["item"])
-            col_qty = st.selectbox("Quantity Column", c_names, index=saved["qty"])
-        with col2:
-            col_rev = st.selectbox("Revenue Column", c_names, index=saved["rev"])
-            col_date = st.selectbox("Order Date Column", c_names, index=saved["date"])
-        with col3:
-            col_var = st.selectbox("Variant Column (Optional)", c_names, index=saved["var"])
-            manual_date = st.date_input("Manual Date (if Date Column is 'None')")
-
-        if col_item != "None":
-            st.markdown("### 🛠 Step 2: Mapping")
-            masters = [r[0] for r in c.execute("SELECT name FROM master_skus ORDER BY name ASC").fetchall()]
+        if uploaded_file:
+            df = pd.read_csv(uploaded_file) if uploaded_file.name.endswith('.csv') else pd.read_excel(uploaded_file)
+            cols = ["None"] + df.columns.tolist()
             
-            if col_var != "None":
-                df_unique = df[[col_item, col_var]].drop_duplicates()
-                df_unique['mapping_key'] = df_unique[col_item].astype(str) + " | " + df_unique[col_var].astype(str)
-                df_unique['display_label'] = df_unique[col_item].astype(str) + " (" + df_unique[col_var].astype(str) + ")"
-            else:
-                df_unique = df[[col_item]].drop_duplicates()
-                df_unique['mapping_key'] = df_unique[col_item].astype(str)
-                df_unique['display_label'] = df_unique[col_item].astype(str)
+            # Auto-load previous column mapping for this channel
+            mem = col_map_df[col_map_df['channel'] == channel]
+            saved = {k: (cols.index(mem[k].iloc[0]) if not mem.empty and mem[k].iloc[0] in cols else 0) 
+                     for k in ["item_col", "qty_col", "rev_col", "date_col", "var_col"]}
 
-            mapping_updates = {}
-            for _, row in df_unique.iterrows():
-                key, label = row['mapping_key'], row['display_label']
-                known = c.execute("SELECT master_name FROM item_map WHERE raw_name = ?", (key,)).fetchone()
-                mapping_updates[key] = st.selectbox(f"Map: '{label}'", masters, index=(masters.index(known[0]) if known and known[0] in masters else 0), key=f"up_{key}")
+            st.markdown("### 🛠 Step 1: Confirm Column Headers")
+            c1, c2, c3 = st.columns(3)
+            ci = c1.selectbox("Product Name Column", cols, index=saved["item_col"])
+            cq = c1.selectbox("Quantity Column", cols, index=saved["qty_col"])
+            cr = c2.selectbox("Revenue Column", cols, index=saved["rev_col"])
+            cd = c2.selectbox("Order Date Column", cols, index=saved["date_col"])
+            cv = c3.selectbox("Variant Column (Optional)", cols, index=saved["var_col"])
+            md = c3.date_input("Manual Date (If no date column exists)")
 
-            if st.button("🚀 Process & Save Data"):
-                c.execute("INSERT OR REPLACE INTO col_map VALUES (?, ?, ?, ?, ?, ?)", (channel, col_item, col_qty, col_rev, col_date, col_var))
-                for raw, master in mapping_updates.items():
-                    c.execute("INSERT OR REPLACE INTO item_map VALUES (?, ?)", (raw, master))
-                conn.commit()
-
-                final_data = []
-                for _, row in df.iterrows():
-                    row_date = str(manual_date)
-                    if col_date != "None":
-                        try: row_date = pd.to_datetime(row[col_date]).strftime("%Y-%m-%d")
-                        except: pass
-                    
-                    row_key = str(row[col_item]) + (" | " + str(row[col_var]) if col_var != "None" else "")
-                    final_data.append({
-                        'date': row_date, 'channel': channel,
-                        'item_name': mapping_updates.get(row_key, "Unknown"),
-                        'qty_sold': clean_num(row[col_qty]), 'revenue': clean_num(row[col_rev])
-                    })
+            if ci != "None" and not master_skus.empty:
+                st.markdown("### 🛠 Step 2: Map to Master SKUs")
+                df_unique = df[[ci, cv]].drop_duplicates() if cv != "None" else df[[ci]].drop_duplicates()
+                mapping_updates = {}
+                m_list = master_skus['name'].tolist()
                 
-                upload_df = pd.DataFrame(final_data)
-                for d in upload_df['date'].unique():
-                    c.execute("DELETE FROM sales WHERE date = ? AND channel = ?", (d, channel))
-                upload_df.to_sql('sales', conn, if_exists='append', index=False)
-                conn.commit(); st.success("History Updated!"); st.rerun()
+                for _, row in df_unique.iterrows():
+                    key = f"{row[ci]} | {row[cv]}" if cv != "None" else str(row[ci])
+                    known = item_map_df[item_map_df['raw_name'] == key]
+                    mapping_updates[key] = st.selectbox(f"Map '{key}' to:", m_list, 
+                                                       index=(m_list.index(known['master_name'].iloc[0]) if not known.empty and known['master_name'].iloc[0] in m_list else 0),
+                                                       key=f"map_{key}")
+
+                if st.button("🚀 Sync Data to Cloud"):
+                    with st.spinner("Writing to Google Sheets..."):
+                        # 1. Update Column Mapping Table
+                        new_col_row = pd.DataFrame([[channel, ci, cq, cr, cd, cv]], columns=col_map_df.columns)
+                        updated_col_map = pd.concat([col_map_df[col_map_df['channel'] != channel], new_col_row])
+                        conn.update(spreadsheet=SHEET_URL, worksheet="col_map", data=updated_col_map)
+
+                        # 2. Update Item Mapping Memory
+                        new_mapping_rows = []
+                        for k, v in mapping_updates.items():
+                            new_mapping_rows.append([k, v])
+                        new_map_df = pd.DataFrame(new_mapping_rows, columns=["raw_name", "master_name"])
+                        updated_item_map = pd.concat([item_map_df, new_map_df]).drop_duplicates(subset=['raw_name'], keep='last')
+                        conn.update(spreadsheet=SHEET_URL, worksheet="item_map", data=updated_item_map)
+
+                        # 3. Process and Append Sales
+                        final_rows = []
+                        for _, row in df.iterrows():
+                            d_val = pd.to_datetime(row[cd]).strftime("%Y-%m-%d") if cd != "None" else str(md)
+                            key = f"{row[ci]} | {row[cv]}" if cv != "None" else str(row[ci])
+                            final_rows.append([d_val, channel, mapping_updates[key], clean_num(row[cq]), clean_num(row[cr])])
+                        
+                        new_sales = pd.DataFrame(final_rows, columns=["date", "channel", "item_name", "qty_sold", "revenue"])
+                        # Logic: Remove existing records for the same dates+channel to prevent duplicates on re-upload
+                        updated_history = pd.concat([history_df[~((history_df['date'].isin(new_sales['date'])) & (history_df['channel'] == channel))], new_sales])
+                        conn.update(spreadsheet=SHEET_URL, worksheet="sales", data=updated_history)
+                        
+                        st.success("Cloud Sync Complete! Data is now safe in Google Sheets."); st.rerun()
+            elif master_skus.empty:
+                st.error("Please add Master SKUs in the Configuration tab before mapping.")
 
 # --- TAB 3: CONFIGURATION ---
 with tab3:
+    st.info("Add your global products and sales channels here. These lists are stored in Google Sheets.")
     c1, c2 = st.columns(2)
     with c1:
-        st.subheader("📦 Master SKU List")
-        new_sku = st.text_input("Add New SKU")
-        if st.button("Add SKU") and new_sku: 
-            try: c.execute("INSERT INTO master_skus VALUES (?)", (new_sku.strip(),)); conn.commit(); st.rerun()
-            except: st.error("Exists!")
-        m_list = [r[0] for r in c.execute("SELECT name FROM master_skus ORDER BY name ASC").fetchall()]
-        st.dataframe(pd.DataFrame(m_list, columns=["Product Name"]), height=300, use_container_width=True)
+        st.subheader("📦 Master SKU Management")
+        new_sku = st.text_input("New Master SKU Name")
+        if st.button("Add SKU") and new_sku:
+            updated_skus = pd.concat([master_skus, pd.DataFrame([[new_sku.strip()]], columns=["name"])]).drop_duplicates()
+            conn.update(spreadsheet=SHEET_URL, worksheet="master_skus", data=updated_skus)
+            st.success(f"Added {new_sku}"); st.rerun()
+        st.dataframe(master_skus, use_container_width=True, height=400)
     with c2:
         st.subheader("🏢 Sales Channels")
-        new_chan = st.text_input("Add New Channel")
-        if st.button("Add Channel") and new_chan:
-            try: c.execute("INSERT INTO master_channels VALUES (?)", (new_chan.strip(),)); conn.commit(); st.rerun()
-            except: st.error("Exists!")
-        c_list = [r[0] for r in c.execute("SELECT name FROM master_channels ORDER BY name ASC").fetchall()]
-        st.dataframe(pd.DataFrame(c_list, columns=["Channel Name"]), height=300, use_container_width=True)
+        new_ch = st.text_input("New Channel Name (e.g. Blinkit)")
+        if st.button("Add Channel") and new_ch:
+            updated_chans = pd.concat([master_chans, pd.DataFrame([[new_ch.strip()]], columns=["name"])]).drop_duplicates()
+            conn.update(spreadsheet=SHEET_URL, worksheet="master_channels", data=updated_chans)
+            st.success(f"Added {new_ch}"); st.rerun()
+        st.dataframe(master_chans, use_container_width=True, height=400)
