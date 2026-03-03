@@ -51,7 +51,6 @@ if "authenticated" not in st.session_state:
 
 role = st.session_state["role"]
 
-# FETCH DATA WITH CACHE CLEARING (ttl=0 ensures fresh data on every rerun)
 @st.cache_data(ttl=0)
 def get_data_safe(table, default_cols):
     try:
@@ -76,7 +75,7 @@ with st.sidebar:
             if st.button("Clear Records"):
                 if del_chan != "Select...":
                     supabase.table("sales").delete().eq("date", str(del_date)).eq("channel", del_chan).execute()
-                    st.cache_data.clear() # Force fresh fetch
+                    st.cache_data.clear() 
                     st.success(f"Deleted {del_chan} for {del_date}"); st.rerun()
     if st.button("Logout"):
         del st.session_state["authenticated"]; st.rerun()
@@ -91,43 +90,56 @@ with tabs[0]: # ANALYTICS
     else:
         history_df['date_dt'] = pd.to_datetime(history_df['date'])
         
-        # Header Metrics
+        # Header Metrics Choice
         v1, v2 = st.columns([2, 1])
         with v1: metric_choice = st.radio("Display By:", ["Revenue (₹)", "Quantity (Units)"], horizontal=True)
         with v2: show_labels = st.checkbox("Show Data Labels", value=True)
-        
         target = "revenue" if "Revenue" in metric_choice else "qty_sold"
         
-        # Filters
-        st.subheader("Timeframe")
-        t1, t2 = st.columns([3, 1])
-        with t1: preset = st.radio("Filter:", ["Last 7 Days", "Last 30 Days", "Month to Date", "All Time"], horizontal=True, index=3)
+        # --- RESTORED FILTERS ---
+        st.subheader("Filters")
         
+        # 1. Date Filter
+        preset = st.radio("Date Range:", ["Last 7 Days", "Last 30 Days", "Month to Date", "All Time"], horizontal=True, index=3)
         end_d = datetime.now().date()
         if preset == "Last 7 Days": start_d = end_d - timedelta(days=6)
         elif preset == "Last 30 Days": start_d = end_d - timedelta(days=29)
         elif preset == "Month to Date": start_d = end_d.replace(day=1)
         else: start_d = history_df['date_dt'].min().date()
 
-        mask = (history_df['date_dt'].dt.date >= start_d) & (history_df['date_dt'].dt.date <= end_d)
-        f_df = history_df[mask].copy()
+        date_mask = (history_df['date_dt'].dt.date >= start_d) & (history_df['date_dt'].dt.date <= end_d)
+        range_df = history_df[date_mask].copy()
+
+        # 2. Channel & Product Filters
+        f1, f2 = st.columns(2)
+        avail_chans = sorted(range_df['channel'].unique().tolist())
+        with f1: sel_chans = st.multiselect("Select Channels", avail_chans, default=avail_chans)
+        
+        chan_mask = range_df['channel'].isin(sel_chans)
+        avail_items = sorted(range_df[chan_mask]['item_name'].unique().tolist())
+        with f2: sel_items = st.multiselect("Select Products", avail_items, default=avail_items)
+
+        # Apply final filtering
+        f_df = range_df[chan_mask & range_df['item_name'].isin(sel_items)].copy()
 
         if not f_df.empty:
-            num_days = (end_d - start_d).days + 1
+            num_days = max((end_d - start_d).days + 1, 1)
             total_val = f_df[target].sum()
             
             m1, m2 = st.columns(2)
             m1.metric(f"Total {metric_choice}", f"₹{total_val:,.2f}" if "Revenue" in metric_choice else f"{total_val:,.0f}")
             m2.metric("Daily Run Rate (DRR)", f"₹{total_val/num_days:,.2f}" if "Revenue" in metric_choice else f"{total_val/num_days:,.1f}")
             
-            # Chart
+            # Chart - grouped to ensure clean stacks
             chart_data = f_df.groupby(['date', 'channel'])[target].sum().reset_index().sort_values('date')
             fig = px.bar(chart_data, x="date", y=target, color="channel", barmode="stack", height=500)
             if show_labels: fig.update_traces(texttemplate='%{y:.2s}', textposition='inside')
             st.plotly_chart(fig, use_container_width=True)
             
-            with st.expander("View Raw Data Table"):
+            with st.expander("View Filtered Data Table"):
                 st.dataframe(f_df.sort_values('date', ascending=False).drop(columns=['date_dt', 'id']), hide_index=True)
+        else:
+            st.warning("No data matches the selected filters.")
 
 if role == "admin":
     with tabs[1]: # SMART UPLOAD
@@ -148,9 +160,7 @@ if role == "admin":
             manual_date = c3.date_input("Manual Date (if Date Col is 'None')")
 
             if p_col != "None":
-                # Filter out Sub-total rows automatically
                 df = df[~df[p_col].astype(str).str.contains("Total|Grand Total|Sub-total", case=False, na=False)]
-                
                 df['m_key'] = df[p_col].astype(str) + ((" | " + df[v_col].astype(str)) if v_col != "None" else "")
                 u_keys = df['m_key'].unique()
                 sku_map, masters = {}, master_skus['name'].tolist()
@@ -163,12 +173,10 @@ if role == "admin":
                     sku_map[k] = st.selectbox(f"Map: {k}", masters, index=idx)
 
                 if st.button("🚀 Sync and Update Dashboard"):
-                    with st.spinner("Processing and Uploading..."):
-                        # 1. Update Mapping
+                    with st.spinner("Processing..."):
                         for k, v in sku_map.items():
                             supabase.table("item_map").upsert({"raw_name": k, "master_name": v}).execute()
                         
-                        # 2. Process Sales Rows
                         temp_rows = []
                         for _, row in df.iterrows():
                             final_dt = parse_date_smart(row[d_col]) if d_col != "None" else str(manual_date)
@@ -179,14 +187,11 @@ if role == "admin":
                                 })
                         
                         if temp_rows:
-                            # 3. Aggregate before insert
                             final_df = pd.DataFrame(temp_rows).groupby(['date', 'channel', 'item_name']).agg({'qty_sold':'sum', 'revenue':'sum'}).reset_index()
                             final_df['revenue'] = final_df['revenue'].round(2)
                             supabase.table("sales").insert(final_df.to_dict(orient='records')).execute()
-                            
-                            # 4. FORCE REFRESH
                             st.cache_data.clear()
-                            st.success(f"Successfully uploaded ₹{final_df['revenue'].sum():,.2f} to {sel_ch}!")
+                            st.success(f"Uploaded ₹{final_df['revenue'].sum():,.2f}!")
                             st.rerun()
 
     with tabs[2]: # CONFIG
