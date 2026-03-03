@@ -11,7 +11,7 @@ conn = sqlite3.connect('sales_history.db', check_same_thread=False)
 c = conn.cursor()
 
 c.execute('CREATE TABLE IF NOT EXISTS sales (date TEXT, channel TEXT, item_name TEXT, qty_sold REAL, revenue REAL)')
-# Added var_col to the mapping memory
+# Added var_col to the mapping memory schema
 c.execute('CREATE TABLE IF NOT EXISTS col_map (channel TEXT PRIMARY KEY, item_col TEXT, qty_col TEXT, rev_col TEXT, date_col TEXT, var_col TEXT)')
 c.execute('CREATE TABLE IF NOT EXISTS item_map (raw_name TEXT PRIMARY KEY, master_name TEXT)')
 c.execute('CREATE TABLE IF NOT EXISTS master_skus (name TEXT PRIMARY KEY)')
