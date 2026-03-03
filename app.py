@@ -50,24 +50,39 @@ if check_auth():
             return df if not df.empty else pd.DataFrame(columns=default_cols)
         except: return pd.DataFrame(columns=default_cols)
 
-    # Load Data
+    # Load Global Data
     history_df = get_data_safe("sales", ["id", "date", "channel", "item_name", "qty_sold", "revenue"])
     master_skus = get_data_safe("master_skus", ["name"])
     master_chans = get_data_safe("master_channels", ["name"])
     item_map_df = get_data_safe("item_map", ["raw_name", "master_name"])
 
-    # --- 3. SIDEBAR ---
+    # --- 3. SIDEBAR (DANGER ZONE + SELECTIVE DELETE) ---
     with st.sidebar:
         st.header(f"👤 {role.upper()}")
+        
         if role == "admin":
             st.divider()
-            if st.checkbox("Unlock Danger Zone"):
-                if st.button("🗑️ Flush Sales History"):
+            st.subheader("🛠 Data Correction")
+            with st.expander("Delete Specific Entry"):
+                del_date = st.date_input("Select Date to Clear", value=datetime.now().date())
+                del_chan = st.selectbox("Select Channel to Clear", ["Select..."] + master_chans['name'].tolist())
+                if st.button("🗑️ Delete Selection"):
+                    if del_chan != "Select...":
+                        supabase.table("sales").delete().eq("date", str(del_date)).eq("channel", del_chan).execute()
+                        st.success(f"Deleted {del_chan} data for {del_date}")
+                        st.rerun()
+                    else:
+                        st.error("Please select a channel")
+
+            st.divider()
+            if st.checkbox("Unlock Global Danger Zone"):
+                if st.button("💥 Flush Entire History"):
                     supabase.table("sales").delete().neq("id", -1).execute()
                     st.rerun()
-                if st.button("🔄 Reset Mappings"):
+                if st.button("🔄 Reset All Mappings"):
                     supabase.table("item_map").delete().neq("raw_name", "dummy").execute()
                     st.rerun()
+        
         st.divider()
         if st.button("Logout"):
             del st.session_state["authenticated"]
@@ -82,8 +97,6 @@ if check_auth():
             st.info("No data found. Admin must upload sales data first.")
         else:
             history_df['date_dt'] = pd.to_datetime(history_df['date'])
-            
-            # View Controls
             v1, v2 = st.columns([2, 1])
             with v1:
                 view_metric = st.radio("Display Dashboard By:", ["Revenue (₹)", "Quantity (Units)"], horizontal=True)
@@ -93,7 +106,6 @@ if check_auth():
             with v2:
                 show_labels = st.checkbox("Show Data Labels", value=True)
 
-            # Time Filters
             st.subheader("Time Filters")
             today = datetime.now().date()
             t_col1, t_col2 = st.columns([3, 1])
@@ -112,11 +124,9 @@ if check_auth():
             mask = (history_df['date_dt'].dt.date >= start_date) & (history_df['date_dt'].dt.date <= end_date)
             range_df = history_df[mask].copy()
 
-            # Channel & Item Filters
             f1, f2 = st.columns(2)
             avail_chans = sorted(range_df['channel'].unique())
             with f1: sel_chan = st.multiselect("Filter Channels", avail_chans, default=avail_chans)
-            
             chan_mask = range_df['channel'].isin(sel_chan)
             avail_items = sorted(range_df[chan_mask]['item_name'].unique())
             with f2: sel_item = st.multiselect("Filter Products", avail_items)
@@ -125,7 +135,6 @@ if check_auth():
             if sel_item: final_mask &= range_df['item_name'].isin(sel_item)
             filtered = range_df[final_mask].copy()
 
-            # Metrics
             total_val = filtered[target_col].sum()
             avg_drr = total_val / num_days if num_days > 0 else 0
 
@@ -133,23 +142,19 @@ if check_auth():
             m1.metric(f"Total {metric_label}", f"{currency_prefix}{total_val:,.2f}")
             m2.metric("Daily Run Rate (DRR)", f"{currency_prefix}{avg_drr:,.2f}", help=f"Total over {num_days} days")
 
-            # Plot
             if not filtered.empty:
                 color_theme = "item_name" if sel_item else "channel"
                 plot_df = filtered.groupby(['date', color_theme])[target_col].sum().reset_index().sort_values('date')
-                
                 fig = px.bar(plot_df, x="date", y=target_col, color=color_theme, barmode="stack", height=500)
-                fig.add_hline(y=avg_drr, line_dash="dash", line_color="red", annotation_text=f"Avg DRR: {avg_drr:,.0f}")
-                
+                fig.add_hline(y=avg_drr, line_dash="dash", line_color="red", annotation_text=f"Avg DRR")
                 if show_labels:
                     fig.update_traces(texttemplate='%{y:.2s}', textposition='inside')
                     totals = plot_df.groupby('date')[target_col].sum().reset_index()
                     fig.add_scatter(x=totals['date'], y=totals[target_col], text=totals[target_col].apply(lambda x: f'{x:,.0f}'), mode='text', textposition='top center', showlegend=False)
-                
                 st.plotly_chart(fig, use_container_width=True)
                 st.dataframe(filtered.drop(columns=['date_dt', 'id']), hide_index=True)
 
-    # --- TAB 2 & 3: UPLOAD & CONFIG ---
+    # --- TAB 2 & 3: UPLOAD & CONFIG (ADMIN) ---
     if role == "admin":
         with tabs[1]:
             st.subheader("Upload Sales Report")
