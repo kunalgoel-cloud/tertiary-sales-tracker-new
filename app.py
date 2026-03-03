@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+from numpy import nan
 from supabase import create_client, Client
 import re
 import plotly.express as px
@@ -17,9 +18,13 @@ except Exception:
     st.stop()
 
 def clean_num(val):
-    if pd.isna(val): return 0.0
-    res = re.sub(r'[^\d.]', '', str(val))
-    return float(res) if res else 0.0
+    if pd.isna(val) or val == "": return 0.0
+    # Strip currency, commas, and handle negative numbers for refunds
+    s = str(val).strip().replace(',', '')
+    if s.startswith('(') and s.endswith(')'): s = '-' + s[1:-1]
+    res = re.sub(r'[^-0-9.]', '', s)
+    try: return round(float(res), 2) if res else 0.0
+    except: return 0.0
 
 # --- 2. AUTHENTICATION SYSTEM ---
 def check_auth():
@@ -176,19 +181,45 @@ if check_auth():
                     sku_map = {}
                     masters = master_skus['name'].tolist() if not master_skus.empty else []
                     for k in u_keys:
+                        # Skip summary rows if found in Shopify files
+                        if str(k).lower() in ["total", "grand total"]: continue
                         ex = item_map_df[item_map_df['raw_name'] == k]
                         idx = masters.index(ex['master_name'].iloc[0]) if not ex.empty and ex['master_name'].iloc[0] in masters else 0
                         sku_map[k] = st.selectbox(f"Map: {k}", masters, index=idx)
 
                     if st.button("🚀 Sync to Cloud"):
-                        for k, v in sku_map.items():
-                            supabase.table("item_map").upsert({"raw_name": k, "master_name": v}).execute()
-                        f_rows = []
-                        for _, r in df.iterrows():
-                            dt = pd.to_datetime(r[d_col]).strftime("%Y-%m-%d") if d_col != "None" else str(fixed_date)
-                            f_rows.append({"date": dt, "channel": selected_channel, "item_name": sku_map[r['m_key']], "qty_sold": clean_num(r[q_col]), "revenue": clean_num(r[r_col])})
-                        supabase.table("sales").insert(f_rows).execute()
-                        st.success("Uploaded!"); st.rerun()
+                        with st.spinner("Deduplicating & Syncing..."):
+                            # 1. Update mappings
+                            for k, v in sku_map.items():
+                                supabase.table("item_map").upsert({"raw_name": k, "master_name": v}).execute()
+                            
+                            # 2. Collect rows from file
+                            raw_rows = []
+                            for _, r in df.iterrows():
+                                if str(r[p_col]).lower() in ["total", "grand total"]: continue
+                                dt = pd.to_datetime(r[d_col]).strftime("%Y-%m-%d") if d_col != "None" else str(fixed_date)
+                                raw_rows.append({
+                                    "date": dt, 
+                                    "channel": selected_channel, 
+                                    "item_name": sku_map[r['m_key']], 
+                                    "qty_sold": clean_num(r[q_col]), 
+                                    "revenue": clean_num(r[r_col])
+                                })
+                            
+                            if raw_rows:
+                                # 3. AGGREGATE (Sum up same items on same day - critical for Big Basket/Shopify)
+                                final_df = pd.DataFrame(raw_rows).groupby(['date', 'channel', 'item_name']).agg({
+                                    'qty_sold': 'sum', 
+                                    'revenue': 'sum'
+                                }).reset_index()
+
+                                # 4. UPSERT (Update existing, Insert new - prevents API error)
+                                res = supabase.table("sales").upsert(
+                                    final_df.to_dict(orient='records'),
+                                    on_conflict="date,channel,item_name"
+                                ).execute()
+                                
+                                st.success(f"Synced {len(final_df)} unique master records!"); st.rerun()
 
         with tabs[2]:
             st.subheader("⚙️ System Configuration")
