@@ -9,7 +9,6 @@ st.set_page_config(page_title="Executive Sales Tracker", layout="wide")
 conn = sqlite3.connect('sales_history.db', check_same_thread=False)
 c = conn.cursor()
 
-# Tables for History, Column Mappings, and Item Mappings
 c.execute('''CREATE TABLE IF NOT EXISTS sales 
              (date TEXT, channel TEXT, item_name TEXT, qty_sold REAL, revenue REAL)''')
 c.execute('''CREATE TABLE IF NOT EXISTS col_map 
@@ -39,8 +38,9 @@ with st.sidebar:
 st.title("📊 Tertiary Sales Executive Dashboard")
 view_metric = st.radio("Display Dashboard By:", ["Revenue (₹)", "Quantity (Units)"], horizontal=True)
 target_col = "revenue" if "Revenue" in view_metric else "qty_sold"
+metric_label = "Revenue" if "Revenue" in view_metric else "Qty"
 
-tab1, tab2 = st.tabs(["📤 Smart Upload & Mapping", "📈 Trend Analytics"])
+tab1, tab2 = st.tabs(["📤 Smart Upload & Mapping", "📊 Trend Analytics"])
 
 # --- 4. SMART UPLOAD & MAPPING ---
 with tab1:
@@ -51,108 +51,119 @@ with tab1:
         df = pd.read_csv(uploaded_file) if uploaded_file.name.endswith('.csv') else pd.read_excel(uploaded_file)
         c_names = ["None / Manual Selection"] + df.columns.tolist()
         
-        # Load remembered column mappings for this channel
+        # Load remembered column mappings
         res = c.execute("SELECT * FROM col_map WHERE channel = ?", (channel,)).fetchone()
         saved = {"item": 0, "qty": 0, "rev": 0, "date": 0}
         if res:
-            saved = {
-                "item": c_names.index(res[1]) if res[1] in c_names else 0,
-                "qty": c_names.index(res[2]) if res[2] in c_names else 0,
-                "rev": c_names.index(res[3]) if res[3] in c_names else 0,
-                "date": c_names.index(res[4]) if res[4] in c_names else 0
-            }
+            saved = {k: (c_names.index(v) if v in c_names else 0) for k, v in zip(["item", "qty", "rev", "date"], res[1:])}
 
         st.markdown("### 🛠 Step 1: Confirm Column Mappings")
-        col_item = st.selectbox("Product Name Column", c_names, index=saved["item"])
-        col_qty = st.selectbox("Quantity Column", c_names, index=saved["qty"])
-        col_rev = st.selectbox("Revenue Column", c_names, index=saved["rev"])
-        col_date = st.selectbox("Order Date Column (Select 'None' to use manual date below)", c_names, index=saved["date"])
+        col1, col2 = st.columns(2)
+        with col1:
+            col_item = st.selectbox("Product Name Column", c_names, index=saved["item"])
+            col_qty = st.selectbox("Quantity Column", c_names, index=saved["qty"])
+        with col2:
+            col_rev = st.selectbox("Revenue Column", c_names, index=saved["rev"])
+            col_date = st.selectbox("Order Date Column", c_names, index=saved["date"])
         
-        manual_date = st.date_input("Manual Date (Only used if Date Column is 'None')")
+        manual_date = st.date_input("Manual Date (Only if Date Column is 'None')")
 
         if col_item != "None / Manual Selection":
-            st.markdown("### 🛠 Step 2: Item SKU Mapping")
+            st.markdown("### 🛠 Step 2: SKU Mapping")
+            
+            # Get existing master SKUs for the dropdown
+            existing_masters = sorted([r[0] for r in c.execute("SELECT DISTINCT master_name FROM item_map").fetchall()])
             unique_raw_items = df[col_item].unique()
             mapping_updates = {}
             
-            # Identify New vs Known items
-            new_items = []
             for item in unique_raw_items:
                 known = c.execute("SELECT master_name FROM item_map WHERE raw_name = ?", (item,)).fetchone()
-                if not known:
-                    new_items.append(item)
-                else:
-                    mapping_updates[item] = known[0]
-
-            if new_items:
-                st.info(f"System found {len(new_items)} new item names. Please map them to your Master SKUs:")
-                for item in new_items:
-                    mapping_updates[item] = st.text_input(f"Map '{item}' to:", value=item, key=f"new_{item}")
-            else:
-                st.success("✅ All items in this file are already mapped in memory!")
+                default_val = known[0] if known else item
+                
+                # Searchable Dropdown
+                mapping_updates[item] = st.selectbox(
+                    f"Map: '{item}'",
+                    options=list(set([default_val] + existing_masters + ["+ ADD NEW SKU"])),
+                    key=f"map_{item}"
+                )
+                if mapping_updates[item] == "+ ADD NEW SKU":
+                    mapping_updates[item] = st.text_input(f"New Master Name for '{item}':", key=f"new_{item}")
 
             if st.button("🚀 Process & Save Data"):
-                # A. Update Persistent Memory
-                c.execute("INSERT OR REPLACE INTO col_map VALUES (?, ?, ?, ?, ?)", 
-                          (channel, col_item, col_qty, col_rev, col_date))
+                c.execute("INSERT OR REPLACE INTO col_map VALUES (?, ?, ?, ?, ?)", (channel, col_item, col_qty, col_rev, col_date))
                 for raw, master in mapping_updates.items():
-                    c.execute("INSERT OR REPLACE INTO item_map VALUES (?, ?)", (raw, master))
+                    if master: c.execute("INSERT OR REPLACE INTO item_map VALUES (?, ?)", (raw, master))
                 conn.commit()
 
-                # B. Prepare Data Rows
                 final_data = []
                 for _, row in df.iterrows():
-                    # Determine Date
                     row_date = str(manual_date)
                     if col_date != "None / Manual Selection":
-                        row_date = pd.to_datetime(row[col_date]).strftime("%Y-%m-%d")
+                        try: row_date = pd.to_datetime(row[col_date]).strftime("%Y-%m-%d")
+                        except: pass
                     
                     final_data.append({
-                        'date': row_date,
-                        'channel': channel,
+                        'date': row_date, 'channel': channel,
                         'item_name': mapping_updates.get(row[col_item], row[col_item]),
-                        'qty_sold': clean_num(row[col_qty]),
-                        'revenue': clean_num(row[col_rev])
+                        'qty_sold': clean_num(row[col_qty]), 'revenue': clean_num(row[col_rev])
                     })
                 
                 upload_df = pd.DataFrame(final_data)
-                
-                # C. Handle Overrides: Delete existing for specific dates found in this file
-                dates_in_file = upload_df['date'].unique()
-                for d in dates_in_file:
+                for d in upload_df['date'].unique():
                     c.execute("DELETE FROM sales WHERE date = ? AND channel = ?", (d, channel))
                 
                 upload_df.to_sql('sales', conn, if_exists='append', index=False)
                 conn.commit()
-                st.success(f"Successfully processed {len(upload_df)} entries and updated memory!")
-                st.rerun()
+                st.success("Data Updated!"); st.rerun()
 
-# --- 5. ANALYTICS ---
+# --- 5. ANALYTICS (STACKED CHART) ---
 with tab2:
     history_df = pd.read_sql("SELECT * FROM sales", conn)
     if not history_df.empty:
         st.subheader("Filters")
         f1, f2 = st.columns(2)
-        with f1:
-            sel_chan = st.multiselect("Channels", sorted(history_df['channel'].unique()), default=history_df['channel'].unique())
-        with f2:
-            sel_item = st.multiselect("Products", sorted(history_df['item_name'].unique()))
+        with f1: sel_chan = st.multiselect("Channels", sorted(history_df['channel'].unique()), default=history_df['channel'].unique())
+        with f2: sel_item = st.multiselect("Products", sorted(history_df['item_name'].unique()))
 
         mask = history_df['channel'].isin(sel_chan)
         if sel_item: mask &= history_df['item_name'].isin(sel_item)
-        
         filtered = history_df[mask].sort_values('date')
         
-        # Summary Metric
-        st.metric(f"Total {view_metric}", f"{filtered[target_col].sum():,.2f}")
-
+        # Determine what to color the stacks by
+        color_theme = "item_name" if sel_item else "channel"
+        
+        # STACKED BAR CHART: One bar per date
         fig = px.bar(
-            filtered, x="date", y=target_col, color="item_name" if sel_item else "channel", 
-            barmode="group", text=target_col
+            filtered, 
+            x="date", 
+            y=target_col, 
+            color=color_theme, 
+            barmode="relative", # This stacks them vertically
+            title=f"Total {metric_label} Trend",
+            height=600,
+            labels={target_col: metric_label, "date": "Date"}
         )
-        fig.update_traces(texttemplate='%{text:.2s}', textposition='outside')
-        fig.update_xaxes(type='category', title="Date")
+        
+        # Show Total on top of the stacked bar
+        fig.update_layout(barmode='stack', xaxis={'categoryorder':'category ascending'})
+        fig.update_xaxes(type='category', tickangle=-45)
+        
+        # This part adds total labels on top of the whole stack
+        total_df = filtered.groupby('date')[target_col].sum().reset_index()
+        fig.add_scatter(
+            x=total_df['date'], 
+            y=total_df[target_col], 
+            text=total_df[target_col].apply(lambda x: f'{x:.1s}'),
+            mode='text',
+            textposition='top center',
+            showlegend=False
+        )
+        
         st.plotly_chart(fig, use_container_width=True)
+        
+        # Totals Metric & Data Table
+        st.divider()
+        st.metric(f"Grand Total {metric_label}", f"{filtered[target_col].sum():,.2f}")
         st.dataframe(filtered, use_container_width=True)
     else:
-        st.info("No history found. Go to the 'Smart Upload' tab to add data.")
+        st.info("Upload data to see analytics.")
