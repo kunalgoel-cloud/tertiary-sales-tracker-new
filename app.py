@@ -10,7 +10,6 @@ st.set_page_config(page_title="Executive Sales Tracker", layout="wide")
 conn = sqlite3.connect('sales_history.db', check_same_thread=False)
 c = conn.cursor()
 
-# Create tables if they don't exist
 c.execute('CREATE TABLE IF NOT EXISTS sales (date TEXT, channel TEXT, item_name TEXT, qty_sold REAL, revenue REAL)')
 c.execute('''CREATE TABLE IF NOT EXISTS col_map 
              (channel TEXT PRIMARY KEY, item_col TEXT, qty_col TEXT, rev_col TEXT, date_col TEXT, var_col TEXT)''')
@@ -19,14 +18,12 @@ c.execute('CREATE TABLE IF NOT EXISTS master_skus (name TEXT PRIMARY KEY)')
 c.execute('CREATE TABLE IF NOT EXISTS master_channels (name TEXT PRIMARY KEY)')
 conn.commit()
 
-# Schema Migration: Add var_col to existing databases that don't have it
 try:
     c.execute("ALTER TABLE col_map ADD COLUMN var_col TEXT")
     conn.commit()
 except sqlite3.OperationalError:
-    pass # Column already exists
+    pass 
 
-# Seed initial channels if empty
 if not c.execute("SELECT name FROM master_channels").fetchall():
     for ch in ["Blinkit", "Swiggy", "Amazon", "Big Basket"]:
         c.execute("INSERT OR IGNORE INTO master_channels VALUES (?)", (ch,))
@@ -54,6 +51,7 @@ st.title("📈 Tertiary Sales Executive Dashboard")
 view_metric = st.radio("Display Dashboard By:", ["Revenue (₹)", "Quantity (Units)"], horizontal=True)
 target_col = "revenue" if "Revenue" in view_metric else "qty_sold"
 metric_label = "Revenue" if "Revenue" in view_metric else "Qty"
+currency_prefix = "₹" if "Revenue" in view_metric else ""
 
 tab1, tab2, tab3 = st.tabs(["📊 Trend Analytics", "📤 Smart Upload", "🛠 Configuration"])
 
@@ -80,6 +78,9 @@ with tab1:
             dr = st.date_input("Custom Range", value=(min_db_date, max_db_date))
             start_date, end_date = (dr[0], dr[1]) if len(dr) == 2 else (min_db_date, max_db_date)
 
+        # Calculate number of days in range for DRR
+        num_days = (end_date - start_date).days + 1
+
         mask = (history_df['date_dt'].dt.date >= start_date) & (history_df['date_dt'].dt.date <= end_date)
         range_df = history_df[mask].copy()
 
@@ -95,8 +96,16 @@ with tab1:
         if sel_item: final_mask &= range_df['item_name'].isin(sel_item)
         filtered = range_df[final_mask].copy()
 
+        # --- TOP METRICS (Total + DRR) ---
         total_val = filtered[target_col].sum()
-        st.markdown(f"### Grand Total {metric_label}: :green[{total_val:,.2f}]")
+        avg_drr = total_val / num_days if num_days > 0 else 0
+
+        m1, m2 = st.columns(2)
+        with m1:
+            st.metric(label=f"Total {metric_label}", value=f"{currency_prefix}{total_val:,.2f}")
+        with m2:
+            st.metric(label=f"Average DRR (Daily Run Rate)", value=f"{currency_prefix}{avg_drr:,.2f}", help=f"Total divided by {num_days} days")
+        
         st.divider()
 
         if not filtered.empty:
@@ -111,6 +120,12 @@ with tab1:
 
                 fig = px.bar(plot_df, x="date", y=target_col, color=color_theme, barmode="stack", height=550)
                 fig.update_xaxes(type='category', tickangle=-45)
+                
+                # Add a horizontal line for DRR
+                fig.add_hline(y=avg_drr, line_dash="dash", line_color="red", 
+                              annotation_text=f"Avg DRR: {avg_drr:,.0f}", 
+                              annotation_position="top left")
+
                 if show_labels:
                     fig.update_traces(texttemplate='%{y:.2s}', textposition='inside')
                     totals = plot_df.groupby('date')[target_col].sum().reset_index()
