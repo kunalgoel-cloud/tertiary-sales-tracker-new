@@ -13,7 +13,7 @@ try:
     key = st.secrets["SUPABASE_KEY"]
     supabase: Client = create_client(url, key)
 except Exception:
-    st.error("Missing Supabase Secrets! Please check your Streamlit Cloud Settings.")
+    st.error("Missing Supabase Secrets!")
     st.stop()
 
 # --- 2. UTILITY FUNCTIONS ---
@@ -64,13 +64,16 @@ master_chans = get_data_fresh("master_channels", ["name"])
 item_map_df = get_data_fresh("item_map", ["raw_name", "master_name"])
 history_df = get_data_fresh("sales", ["id", "date", "channel", "item_name", "qty_sold", "revenue"])
 
-# --- 5. TABS ---
+# --- 5. TABS DEFINITION ---
+# Force tab creation based on role
 if role == "admin":
-    tabs = st.tabs(["📊 Analytics", "📤 Smart Upload", "🛠 Config"])
+    tab_list = ["📊 Analytics", "📤 Smart Upload", "🛠 Config"]
 else:
-    tabs = st.tabs(["📊 Analytics"])
+    tab_list = ["📊 Analytics"]
 
-# TAB 0: ANALYTICS (Common to all)
+tabs = st.tabs(tab_list)
+
+# --- TAB 0: ANALYTICS ---
 with tabs[0]:
     if history_df.empty:
         st.info("No data found. Upload records in 'Smart Upload' to begin.")
@@ -95,7 +98,7 @@ with tabs[0]:
             st.plotly_chart(px.bar(chart_data, x='date', y='revenue', color='channel', barmode='stack', height=500), use_container_width=True)
         else: st.warning("No data matches selected filters.")
 
-# ADMIN ONLY TABS
+# --- ADMIN ONLY LOGIC ---
 if role == "admin":
     # TAB 1: SMART UPLOAD
     with tabs[1]:
@@ -110,7 +113,6 @@ if role == "admin":
             cols = raw_df.columns.tolist()
             st.markdown("---")
             mc1, mc2, mc3 = st.columns(3)
-            # Smart detection for Shopify and Big Basket
             p_idx = next((i for i, c in enumerate(cols) if c in ["Product title", "sku_description"]), 0)
             q_idx = next((i for i, c in enumerate(cols) if c in ["Net items sold", "total_quantity"]), 0)
             r_idx = next((i for i, c in enumerate(cols) if c in ["Total sales", "total_sales"]), 0)
@@ -119,7 +121,7 @@ if role == "admin":
             q_col = mc2.selectbox("Qty Col", cols, index=q_idx)
             r_col = mc2.selectbox("Revenue Col", cols, index=r_idx)
             d_col = mc3.selectbox("Date Col", ["None"] + cols)
-            man_date = mc3.date_input("Manual Date (if Date Col is None)")
+            man_date = mc3.date_input("Manual Date")
 
             st.markdown("#### 🛠 Mapping & Preview")
             sku_map = {name: st.selectbox(f"Map: {name}", master_skus['name'].tolist(), index=0) for name in raw_df[p_col].unique() if str(name).lower() not in ["total", "grand total"]}
@@ -138,7 +140,7 @@ if role == "admin":
                     supabase.table("sales").upsert(preview_df.to_dict(orient='records'), on_conflict="date,channel,item_name").execute()
                     st.success("Sync Complete!"); st.rerun()
 
-    # TAB 2: CONFIG & CLEANING (DANGER ZONE)
+    # TAB 2: CONFIG & DANGER ZONE
     with tabs[2]:
         st.subheader("System Configuration")
         sc1, sc2 = st.columns(2)
@@ -155,28 +157,18 @@ if role == "admin":
         
         st.markdown("---")
         st.subheader("🚨 Danger Zone (Clean & Wipe)")
-        st.warning("These actions modify the database directly. Use with caution.")
+        st.error("Actions here are permanent.")
         
-        # Option 1: Cleanup Duplicates (The "Clean" button)
-        st.markdown("### 🧼 1. Clean Duplicates")
-        st.info("This will remove duplicate entries for the same Date/Channel/Item while keeping the latest record.")
-        if st.button("Run Deduplication Engine"):
-            # This logic executes the SQL cleanup we discussed
-            supabase.rpc("deduplicate_sales").execute() # Requires the SQL function to be saved in Supabase
-            # Alternative if RPC is not set up: 
-            st.write("Deduplication logic triggered...")
-            st.success("Database cleaned!")
-
-        # Option 2: Wipe Channel
-        st.markdown("### 🗑️ 2. Wipe Specific Channel")
-        wc1, wc2 = st.columns([2,1])
-        wipe_ch = wc1.selectbox("Select Channel to Clear", ["Select..."] + master_chans['name'].tolist())
-        if wc2.button("Wipe Channel") and wipe_ch != "Select...":
-            supabase.table("sales").delete().eq("channel", wipe_ch).execute()
-            st.success(f"All data for {wipe_ch} has been removed."); st.rerun()
+        # CLEAR SALES DATA
+        st.markdown("### 🧹 Sales Data Management")
+        c_wipe1, c_wipe2 = st.columns([2, 1])
+        wipe_ch = c_wipe1.selectbox("Channel to Wipe", ["All Data"] + master_chans['name'].tolist())
         
-        # Option 3: Full Reset
-        st.markdown("### 💀 3. Full Database Reset")
-        if st.button("DELETE ALL SALES HISTORY"):
-            supabase.table("sales").delete().neq("id", -1).execute()
-            st.success("All sales records have been deleted."); st.rerun()
+        if c_wipe2.button("🗑️ Execute Wipe"):
+            if wipe_ch == "All Data":
+                supabase.table("sales").delete().neq("id", -1).execute()
+                st.success("Entire sales database cleared.")
+            else:
+                supabase.table("sales").delete().eq("channel", wipe_ch).execute()
+                st.success(f"All data for {wipe_ch} cleared.")
+            st.rerun()
