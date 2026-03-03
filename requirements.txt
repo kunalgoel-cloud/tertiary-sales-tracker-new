@@ -1,5 +1,5 @@
 streamlit
 pandas
 plotly
-openpyxl
-st-gsheets-connection
+streamlit-gsheets-connection
+xlsxwriter
