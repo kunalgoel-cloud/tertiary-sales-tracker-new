@@ -43,15 +43,25 @@ def check_auth():
 if check_auth():
     role = st.session_state["role"]
     
-    # Helper to fetch data from Supabase
-    def get_data(table):
+    # --- 3. SAFE DATA FETCHING (Fixes KeyError) ---
+    def get_data_safe(table, default_cols):
         try:
             res = supabase.table(table).select("*").execute()
-            return pd.DataFrame(res.data)
-        except:
-            return pd.DataFrame()
+            df = pd.DataFrame(res.data)
+            if df.empty:
+                return pd.DataFrame(columns=default_cols)
+            return df
+        except Exception:
+            # Returns empty dataframe with required columns to prevent crashes
+            return pd.DataFrame(columns=default_cols)
 
-    # --- 3. SIDEBAR (DANGER ZONE) ---
+    # Load All Global Data with column enforcement
+    history_df = get_data_safe("sales", ["id", "date", "channel", "item_name", "qty_sold", "revenue"])
+    master_skus = get_data_safe("master_skus", ["name"])
+    master_chans = get_data_safe("master_channels", ["name"])
+    item_map_df = get_data_safe("item_map", ["raw_name", "master_name"])
+
+    # --- 4. SIDEBAR (DANGER ZONE) ---
     with st.sidebar:
         st.header(f"👤 {role.upper()}")
         if role == "admin":
@@ -65,7 +75,7 @@ if check_auth():
                     st.rerun()
                 
                 if st.button("🔄 Reset Item Mappings"):
-                    supabase.table("item_map").delete().neq("master_name", "dummy").execute()
+                    supabase.table("item_map").delete().neq("raw_name", "dummy_val").execute()
                     st.success("Mappings Reset!")
                     st.rerun()
         
@@ -74,13 +84,7 @@ if check_auth():
             del st.session_state["authenticated"]
             st.rerun()
 
-    # Load All Global Data
-    history_df = get_data("sales")
-    master_skus = get_data("master_skus")
-    master_chans = get_data("master_channels")
-    item_map_df = get_data("item_map")
-
-    # --- 4. TABS ---
+    # --- 5. TABS ---
     if role == "admin":
         tab1, tab2, tab3 = st.tabs(["📊 Analytics", "📤 Smart Upload", "🛠 Configuration"])
     else:
@@ -99,7 +103,7 @@ if check_auth():
                          title=f"Daily {view_metric}", barmode="stack")
             
             st.plotly_chart(fig, use_container_width=True)
-            st.dataframe(history_df.sort_values('date', ascending=False), hide_index=True, width=1200)
+            st.dataframe(history_df.sort_values('date', ascending=False), hide_index=True)
 
     # --- TAB 2: SMART UPLOAD (ADMIN ONLY) ---
     if role == "admin":
@@ -126,7 +130,7 @@ if check_auth():
                     st.divider()
                     st.markdown("### 🛠 Step 2: Mapping to Master SKUs")
                     
-                    # Create the composite key
+                    # Create the composite mapping key (Product + Variant)
                     df['mapping_key'] = df[p_col].astype(str) + ((" | " + df[v_col].astype(str)) if v_col != "None" else "")
                     unique_keys = df['mapping_key'].unique()
                     
@@ -134,13 +138,14 @@ if check_auth():
                     masters = master_skus['name'].tolist() if not master_skus.empty else []
                     
                     for key in unique_keys:
+                        # Find existing mapping in item_map_df
                         existing = item_map_df[item_map_df['raw_name'] == key]
                         idx = masters.index(existing['master_name'].iloc[0]) if not existing.empty and existing['master_name'].iloc[0] in masters else 0
                         sku_map[key] = st.selectbox(f"Map: {key}", masters, index=idx)
 
                     if st.button("🚀 Sync to Cloud"):
                         with st.spinner("Processing..."):
-                            # 1. Update Mapping Logic
+                            # 1. Update Mapping Logic in Cloud
                             for k, v in sku_map.items():
                                 supabase.table("item_map").upsert({"raw_name": k, "master_name": v}).execute()
                             
