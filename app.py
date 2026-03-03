@@ -65,9 +65,13 @@ item_map_df = get_data_fresh("item_map", ["raw_name", "master_name"])
 history_df = get_data_fresh("sales", ["id", "date", "channel", "item_name", "qty_sold", "revenue"])
 
 # --- 5. TABS ---
-tabs = st.tabs(["📊 Analytics", "📤 Smart Upload", "🛠 Config"]) if role == "admin" else st.tabs(["📊 Analytics"])
+if role == "admin":
+    tabs = st.tabs(["📊 Analytics", "📤 Smart Upload", "🛠 Config"])
+else:
+    tabs = st.tabs(["📊 Analytics"])
 
-with tabs[0]: # ANALYTICS
+# TAB 0: ANALYTICS (Common to all)
+with tabs[0]:
     if history_df.empty:
         st.info("No data found. Upload records in 'Smart Upload' to begin.")
     else:
@@ -91,8 +95,10 @@ with tabs[0]: # ANALYTICS
             st.plotly_chart(px.bar(chart_data, x='date', y='revenue', color='channel', barmode='stack', height=500), use_container_width=True)
         else: st.warning("No data matches selected filters.")
 
+# ADMIN ONLY TABS
 if role == "admin":
-    with tabs[1]: # SMART UPLOAD
+    # TAB 1: SMART UPLOAD
+    with tabs[1]:
         st.subheader("Upload Sales Report")
         u1, u2 = st.columns([1, 2])
         with u1:
@@ -104,6 +110,7 @@ if role == "admin":
             cols = raw_df.columns.tolist()
             st.markdown("---")
             mc1, mc2, mc3 = st.columns(3)
+            # Smart detection for Shopify and Big Basket
             p_idx = next((i for i, c in enumerate(cols) if c in ["Product title", "sku_description"]), 0)
             q_idx = next((i for i, c in enumerate(cols) if c in ["Net items sold", "total_quantity"]), 0)
             r_idx = next((i for i, c in enumerate(cols) if c in ["Total sales", "total_sales"]), 0)
@@ -112,7 +119,7 @@ if role == "admin":
             q_col = mc2.selectbox("Qty Col", cols, index=q_idx)
             r_col = mc2.selectbox("Revenue Col", cols, index=r_idx)
             d_col = mc3.selectbox("Date Col", ["None"] + cols)
-            man_date = mc3.date_input("Manual Date")
+            man_date = mc3.date_input("Manual Date (if Date Col is None)")
 
             st.markdown("#### 🛠 Mapping & Preview")
             sku_map = {name: st.selectbox(f"Map: {name}", master_skus['name'].tolist(), index=0) for name in raw_df[p_col].unique() if str(name).lower() not in ["total", "grand total"]}
@@ -126,13 +133,14 @@ if role == "admin":
             if temp_rows:
                 preview_df = pd.DataFrame(temp_rows).groupby(['date', 'channel', 'item_name']).agg({'qty_sold':'sum', 'revenue':'sum'}).reset_index()
                 st.dataframe(preview_df, hide_index=True)
-                if st.button("🚀 Push to Cloud"):
+                if st.button("🚀 Sync to Cloud"):
                     for raw, master in sku_map.items(): supabase.table("item_map").upsert({"raw_name": raw, "master_name": master}).execute()
                     supabase.table("sales").upsert(preview_df.to_dict(orient='records'), on_conflict="date,channel,item_name").execute()
                     st.success("Sync Complete!"); st.rerun()
 
-    with tabs[2]: # CONFIG & DANGER ZONE
-        st.subheader("Configuration")
+    # TAB 2: CONFIG & CLEANING (DANGER ZONE)
+    with tabs[2]:
+        st.subheader("System Configuration")
         sc1, sc2 = st.columns(2)
         with sc1:
             st.write("**Master SKUs**")
@@ -146,19 +154,29 @@ if role == "admin":
             st.dataframe(master_chans, hide_index=True)
         
         st.markdown("---")
-        st.subheader("🚨 Danger Zone")
-        st.error("Actions here are permanent and cannot be undone.")
+        st.subheader("🚨 Danger Zone (Clean & Wipe)")
+        st.warning("These actions modify the database directly. Use with caution.")
         
-        col_wipe, col_all = st.columns(2)
-        with col_wipe:
-            wipe_ch = st.selectbox("Wipe Channel Data", ["Select..."] + master_chans['name'].tolist())
-            if st.button("🗑️ Wipe Channel") and wipe_ch != "Select...":
-                supabase.table("sales").delete().eq("channel", wipe_ch).execute()
-                st.success(f"Cleared all data for {wipe_ch}"); st.rerun()
+        # Option 1: Cleanup Duplicates (The "Clean" button)
+        st.markdown("### 🧼 1. Clean Duplicates")
+        st.info("This will remove duplicate entries for the same Date/Channel/Item while keeping the latest record.")
+        if st.button("Run Deduplication Engine"):
+            # This logic executes the SQL cleanup we discussed
+            supabase.rpc("deduplicate_sales").execute() # Requires the SQL function to be saved in Supabase
+            # Alternative if RPC is not set up: 
+            st.write("Deduplication logic triggered...")
+            st.success("Database cleaned!")
+
+        # Option 2: Wipe Channel
+        st.markdown("### 🗑️ 2. Wipe Specific Channel")
+        wc1, wc2 = st.columns([2,1])
+        wipe_ch = wc1.selectbox("Select Channel to Clear", ["Select..."] + master_chans['name'].tolist())
+        if wc2.button("Wipe Channel") and wipe_ch != "Select...":
+            supabase.table("sales").delete().eq("channel", wipe_ch).execute()
+            st.success(f"All data for {wipe_ch} has been removed."); st.rerun()
         
-        with col_all:
-            st.write("Full Database Reset")
-            if st.button("💀 DELETE ALL SALES DATA"):
-                # Safety check via text input could be added here
-                supabase.table("sales").delete().neq("id", -1).execute() # Deletes everything
-                st.success("Database cleared successfully."); st.rerun()
+        # Option 3: Full Reset
+        st.markdown("### 💀 3. Full Database Reset")
+        if st.button("DELETE ALL SALES HISTORY"):
+            supabase.table("sales").delete().neq("id", -1).execute()
+            st.success("All sales records have been deleted."); st.rerun()
