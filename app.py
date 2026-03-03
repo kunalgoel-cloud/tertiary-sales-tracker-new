@@ -3,161 +3,117 @@ import pandas as pd
 from supabase import create_client, Client
 import re
 import plotly.express as px
-from datetime import datetime, timedelta
+from datetime import datetime
 
-# --- 1. CONFIG & DB CONNECTION ---
-st.set_page_config(page_title="Mamanourish Sales Diagnostic", layout="wide")
-
+# --- 1. CONNECTION ---
 try:
-    url = st.secrets["SUPABASE_URL"]
-    key = st.secrets["SUPABASE_KEY"]
-    supabase: Client = create_client(url, key)
+    supabase: Client = create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
 except Exception as e:
-    st.error(f"Connection Secret Error: {e}")
-    st.stop()
+    st.error(f"Secret Error: {e}"); st.stop()
 
-# UTILITIES
-def clean_num(val):
-    if pd.isna(val) or val == "": return 0.0
-    s = str(val).strip()
-    if s.startswith('(') and s.endswith(')'): s = '-' + s[1:-1]
-    res = re.sub(r'[^-0-9.]', '', s)
-    try: return round(float(res), 2) if res else 0.0
-    except: return 0.0
-
+# --- 2. THE DATE PARSER (CRITICAL FIX) ---
 def parse_date_smart(val):
-    if pd.isna(val): return None
+    if pd.isna(val) or val == "None": return None
+    # Split "20260219 - 20260219"
     s = str(val).split(" - ")[0].strip()
+    # Handle YYYYMMDD
     if len(s) == 8 and s.isdigit():
         try: return datetime.strptime(s, "%Y%m%d").strftime("%Y-%m-%d")
         except: pass
+    # Handle standard formats
     try: return pd.to_datetime(s).strftime("%Y-%m-%d")
     except: return None
 
-# --- 2. AUTHENTICATION ---
-if "authenticated" not in st.session_state:
-    st.title("🔐 Mamanourish Sales Portal")
-    role_choice = st.selectbox("Select Role", ["Select...", "Admin (Full Access)", "Viewer (View Only)"])
-    pw = st.text_input("Password", type="password")
-    if st.button("Login"):
-        if role_choice == "Admin (Full Access)" and pw == "mamaadmin2026":
-            st.session_state["authenticated"], st.session_state["role"] = True, "admin"
-            st.rerun()
-        elif role_choice == "Viewer (View Only)" and pw == "mamaview2026":
-            st.session_state["authenticated"], st.session_state["role"] = True, "viewer"
-            st.rerun()
-    st.stop()
+def clean_num(val):
+    if pd.isna(val) or val == "": return 0.0
+    s = str(val).strip().replace(',', '')
+    if s.startswith('(') and s.endswith(')'): s = '-' + s[1:-1]
+    res = re.sub(r'[^-0-9.]', '', s)
+    try: return float(res) if res else 0.0
+    except: return 0.0
 
-# --- 3. FETCH DATA (NO CACHING FOR TROUBLESHOOTING) ---
-def get_data_fresh(table):
-    """Fetches data directly with no caching to ensure we see the latest."""
-    try:
-        res = supabase.table(table).select("*").execute()
-        return pd.DataFrame(res.data)
-    except Exception as e:
-        st.sidebar.error(f"DB Fetch Error ({table}): {e}")
-        return pd.DataFrame()
-
-# Global Data Loads
-master_skus = get_data_fresh("master_skus")
-master_chans = get_data_fresh("master_channels")
-item_map_df = get_data_fresh("item_map")
-history_df = get_data_fresh("sales")
+# --- 3. DATA FETCHING ---
+def get_fresh_data():
+    res = supabase.table("sales").select("*").execute()
+    return pd.DataFrame(res.data)
 
 # --- 4. TABS ---
-tabs = st.tabs(["📊 Analytics", "📤 Smart Upload", "🛠 Config"])
+t1, t2 = st.tabs(["📊 Analytics", "📤 Smart Upload"])
 
-with tabs[0]: # ANALYTICS
-    if history_df.empty:
-        st.warning("Database currently empty. Upload data in the next tab.")
+with t1:
+    df = get_fresh_data()
+    if df.empty:
+        st.info("Database is empty.")
     else:
-        history_df['date_dt'] = pd.to_datetime(history_df['date'])
-        
-        # Filters
+        df['date'] = pd.to_datetime(df['date'])
         st.subheader("Filters")
-        c1, c2, c3 = st.columns(3)
-        with c1: 
-            p_range = st.selectbox("Range", ["All Time", "Last 7 Days", "Last 30 Days"])
-            if p_range == "Last 7 Days": start_d = datetime.now().date() - timedelta(days=7)
-            elif p_range == "Last 30 Days": start_d = datetime.now().date() - timedelta(days=30)
-            else: start_d = history_df['date_dt'].min().date()
+        c1, c2 = st.columns(2)
+        with c1:
+            sel_chan = st.multiselect("Channels", df['channel'].unique(), default=df['channel'].unique())
+        with c2:
+            # FIXED: Ensure the graph shows the last 30 days by default to capture Feb 20th
+            min_date = df['date'].min().date()
+            max_date = df['date'].max().date()
+            date_range = st.date_input("Date Range", [min_date, max_date])
+
+        # Filter Logic
+        mask = (df['channel'].isin(sel_chan))
+        if len(date_range) == 2:
+            mask = mask & (df['date'].dt.date >= date_range[0]) & (df['date'].dt.date <= date_range[1])
         
-        with c2: sel_chans = st.multiselect("Channels", history_df['channel'].unique(), default=history_df['channel'].unique())
-        with c3: sel_items = st.multiselect("Products", history_df['item_name'].unique(), default=history_df['item_name'].unique())
-
-        # Filtering Logic
-        f_df = history_df[
-            (history_df['date_dt'].dt.date >= start_d) & 
-            (history_df['channel'].isin(sel_chans)) & 
-            (history_df['item_name'].isin(sel_items))
-        ].copy()
-
+        f_df = df[mask]
+        
         if not f_df.empty:
-            st.metric("Filtered Revenue", f"₹{f_df['revenue'].sum():,.2f}")
-            fig = px.bar(f_df.groupby(['date', 'channel'])['revenue'].sum().reset_index(), x='date', y='revenue', color='channel')
-            st.plotly_chart(fig, use_container_width=True)
+            st.metric("Total Revenue", f"₹{f_df['revenue'].sum():,.2f}")
+            # Grouping by date for the graph
+            chart_data = f_df.groupby(['date', 'channel'])['revenue'].sum().reset_index()
+            st.plotly_chart(px.bar(chart_data, x='date', y='revenue', color='channel', barmode='stack'), use_container_width=True)
+            st.write("Last 10 Rows in Database:", f_df.tail(10))
         else:
-            st.error("No data matches current filters. Check the Debug Console below.")
+            st.warning("No data found for selected filters.")
 
-with tabs[1]: # UPLOAD
-    st.subheader("Upload New Data")
-    chan = st.selectbox("Target Channel", master_chans['name'] if not master_chans.empty else [])
-    up = st.file_uploader("Upload File", type=["csv", "xlsx"])
+with t2:
+    st.subheader("Upload Big Basket / Blinkit Report")
+    sel_ch = st.selectbox("Channel", ["Blinkit", "Big Basket", "Zepto"])
+    up = st.file_uploader("Upload CSV", type=["csv"])
     
-    if up and chan:
-        df = pd.read_csv(up) if up.name.endswith('.csv') else pd.read_excel(up)
-        st.write("Preview:", df.head(3))
+    if up:
+        raw_df = pd.read_csv(up)
+        cols = raw_df.columns.tolist()
         
-        col_p = st.selectbox("Product Column", df.columns)
-        col_q = st.selectbox("Qty Column", df.columns)
-        col_r = st.selectbox("Revenue Column", df.columns)
-        col_d = st.selectbox("Date Column (Optional)", ["None"] + list(df.columns))
-        m_date = st.date_input("Fallback Date")
+        # AUTO-DETECTION of your specific file headers
+        def_p = "sku_description" if "sku_description" in cols else cols[0]
+        def_q = "total_quantity" if "total_quantity" in cols else cols[0]
+        def_r = "total_sales" if "total_sales" in cols else cols[0]
+        def_d = "date_range" if "date_range" in cols else "None"
 
-        if st.button("🚀 Push to Cloud"):
-            rows = []
-            for _, r in df.iterrows():
-                dt = parse_date_smart(r[col_d]) if col_d != "None" else str(m_date)
-                rows.append({
-                    "date": dt, "channel": chan, "item_name": str(r[col_p]),
-                    "qty_sold": clean_num(r[col_q]), "revenue": clean_num(r[col_r])
-                })
+        c1, c2 = st.columns(2)
+        p_col = c1.selectbox("Product Description Col", cols, index=cols.index(def_p))
+        d_col = c1.selectbox("Date Range Col", ["None"] + cols, index=(cols.index(def_d)+1 if def_d != "None" else 0))
+        q_col = c2.selectbox("Quantity Col", cols, index=cols.index(def_q))
+        r_col = c2.selectbox("Revenue/Sales Col", cols, index=cols.index(def_r))
+        
+        if st.button("🚀 Push to Supabase"):
+            batch = []
+            valid_dates = 0
+            for _, row in raw_df.iterrows():
+                # Extract date
+                final_date = parse_date_smart(row[d_col]) if d_col != "None" else datetime.now().strftime("%Y-%m-%d")
+                
+                if final_date:
+                    valid_dates += 1
+                    batch.append({
+                        "date": final_date,
+                        "channel": sel_ch,
+                        "item_name": str(row[p_col]),
+                        "qty_sold": clean_num(row[q_col]),
+                        "revenue": clean_num(row[r_col])
+                    })
             
-            # Batch Upload
-            res = supabase.table("sales").insert(rows).execute()
-            if res.data:
-                st.success(f"Successfully inserted {len(res.data)} rows into Supabase!")
+            if batch:
+                st.write(f"Parsed {valid_dates} valid rows. Sending to cloud...")
+                res = supabase.table("sales").insert(batch).execute()
+                st.success(f"Uploaded {len(res.data)} rows successfully!")
                 st.rerun()
             else:
-                st.error("Upload failed. No data returned from Supabase.")
-
-# --- 5. THE DEBUG CONSOLE (STAYS AT BOTTOM) ---
-st.divider()
-st.subheader("🔍 Troubleshooting / Debug Console")
-d1, d2, d3 = st.columns(3)
-
-with d1:
-    st.write("**Database Status**")
-    st.write(f"Total Rows in `sales`: {len(history_df)}")
-    if not history_df.empty:
-        st.write(f"Latest Date Found: {history_df['date'].max()}")
-
-with d2:
-    st.write("**Permission Check**")
-    # This checks if RLS is blocking the read
-    try:
-        check = supabase.table("sales").select("count", count="exact").execute()
-        st.write(f"Supabase Count API says: {check.count} rows")
-    except Exception as e:
-        st.error(f"RLS/Permission Error: {e}")
-
-with d3:
-    st.write("**Filter Diagnostics**")
-    if 'start_d' in locals():
-        st.write(f"Current Start Date Filter: {start_d}")
-        st.write(f"Rows matching Date: {len(history_df[history_df['date_dt'].dt.date >= start_d]) if not history_df.empty else 0}")
-
-if st.button("🗑 Force Clear All App Cache"):
-    st.cache_data.clear()
-    st.cache_resource.clear()
-    st.rerun()
+                st.error("No valid data found to upload. Check date formats.")
