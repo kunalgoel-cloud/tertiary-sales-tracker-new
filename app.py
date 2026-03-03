@@ -5,7 +5,7 @@ import re
 import plotly.express as px
 from datetime import datetime, timedelta
 
-# --- 1. CONFIG & DB CONNECTION ---
+# --- 1. CONFIG & PERMANENT DB CONNECTION ---
 st.set_page_config(page_title="Mamanourish Executive Tracker", layout="wide")
 
 try:
@@ -13,162 +13,197 @@ try:
     key = st.secrets["SUPABASE_KEY"]
     supabase: Client = create_client(url, key)
 except Exception:
-    st.error("Missing Supabase Secrets!")
+    st.error("Missing Supabase Secrets! Please add SUPABASE_URL and SUPABASE_KEY to Streamlit Secrets.")
     st.stop()
 
-# --- 2. UTILITY FUNCTIONS ---
 def clean_num(val):
-    if pd.isna(val) or val == "": return 0.0
-    s = str(val).strip().replace(',', '')
-    if s.startswith('(') and s.endswith(')'): s = '-' + s[1:-1]
-    res = re.sub(r'[^-0-9.]', '', s)
-    try: return round(float(res), 2) if res else 0.0
-    except: return 0.0
+    if pd.isna(val): return 0.0
+    res = re.sub(r'[^\d.]', '', str(val))
+    return float(res) if res else 0.0
 
-def parse_date_smart(val):
-    if pd.isna(val) or str(val).lower() in ["none", "nan"]: return None
-    s = str(val).split(" - ")[0].strip()
-    if len(s) == 8 and s.isdigit():
-        try: return datetime.strptime(s, "%Y%m%d").strftime("%Y-%m-%d")
-        except: pass
-    try: return pd.to_datetime(s).strftime("%Y-%m-%d")
-    except: return None
+# --- 2. AUTHENTICATION SYSTEM ---
+def check_auth():
+    if "authenticated" not in st.session_state:
+        st.title("🔐 Mamanourish Sales Portal")
+        role_choice = st.selectbox("I am a...", ["Select Role", "Admin (Full Access)", "Viewer (View Only)"])
+        pw = st.text_input("Enter Password", type="password")
+        if st.button("Login"):
+            if role_choice == "Admin (Full Access)" and pw == "mamaadmin2026":
+                st.session_state["authenticated"] = True
+                st.session_state["role"] = "admin"
+                st.rerun()
+            elif role_choice == "Viewer (View Only)" and pw == "mamaview2026":
+                st.session_state["authenticated"] = True
+                st.session_state["role"] = "viewer"
+                st.rerun()
+            else: st.error("Incorrect password.")
+        return False
+    return True
 
-# --- 3. AUTHENTICATION ---
-if "authenticated" not in st.session_state:
-    st.title("🔐 Mamanourish Sales Portal")
-    role_choice = st.selectbox("Select Role", ["Select...", "Admin (Full Access)", "Viewer (View Only)"])
-    pw = st.text_input("Password", type="password")
-    if st.button("Login"):
-        if role_choice == "Admin (Full Access)" and pw == "mamaadmin2026":
-            st.session_state["authenticated"], st.session_state["role"] = True, "admin"
+if check_auth():
+    role = st.session_state["role"]
+    
+    def get_data_safe(table, default_cols):
+        try:
+            res = supabase.table(table).select("*").execute()
+            df = pd.DataFrame(res.data)
+            return df if not df.empty else pd.DataFrame(columns=default_cols)
+        except: return pd.DataFrame(columns=default_cols)
+
+    # Load Global Data
+    history_df = get_data_safe("sales", ["id", "date", "channel", "item_name", "qty_sold", "revenue"])
+    master_skus = get_data_safe("master_skus", ["name"])
+    master_chans = get_data_safe("master_channels", ["name"])
+    item_map_df = get_data_safe("item_map", ["raw_name", "master_name"])
+
+    # --- 3. SIDEBAR (DANGER ZONE + SELECTIVE DELETE) ---
+    with st.sidebar:
+        st.header(f"👤 {role.upper()}")
+        
+        if role == "admin":
+            st.divider()
+            st.subheader("🛠 Data Correction")
+            with st.expander("Delete Specific Entry"):
+                del_date = st.date_input("Select Date to Clear", value=datetime.now().date())
+                del_chan = st.selectbox("Select Channel to Clear", ["Select..."] + master_chans['name'].tolist())
+                if st.button("🗑️ Delete Selection"):
+                    if del_chan != "Select...":
+                        supabase.table("sales").delete().eq("date", str(del_date)).eq("channel", del_chan).execute()
+                        st.success(f"Deleted {del_chan} data for {del_date}")
+                        st.rerun()
+                    else:
+                        st.error("Please select a channel")
+
+            st.divider()
+            if st.checkbox("Unlock Global Danger Zone"):
+                if st.button("💥 Flush Entire History"):
+                    supabase.table("sales").delete().neq("id", -1).execute()
+                    st.rerun()
+                if st.button("🔄 Reset All Mappings"):
+                    supabase.table("item_map").delete().neq("raw_name", "dummy").execute()
+                    st.rerun()
+        
+        st.divider()
+        if st.button("Logout"):
+            del st.session_state["authenticated"]
             st.rerun()
-        elif role_choice == "Viewer (View Only)" and pw == "mamaview2026":
-            st.session_state["authenticated"], st.session_state["role"] = True, "viewer"
-            st.rerun()
-        else: st.error("Invalid credentials.")
-    st.stop()
 
-role = st.session_state["role"]
+    # --- 4. TABS ---
+    tabs = st.tabs(["📊 Trend Analytics", "📤 Smart Upload", "🛠 Configuration"]) if role == "admin" else st.tabs(["📊 Analytics"])
+    
+    # --- TAB 1: ANALYTICS ---
+    with tabs[0]:
+        if history_df.empty:
+            st.info("No data found. Admin must upload sales data first.")
+        else:
+            history_df['date_dt'] = pd.to_datetime(history_df['date'])
+            v1, v2 = st.columns([2, 1])
+            with v1:
+                view_metric = st.radio("Display Dashboard By:", ["Revenue (₹)", "Quantity (Units)"], horizontal=True)
+                target_col = "revenue" if "Revenue" in view_metric else "qty_sold"
+                metric_label = "Revenue" if "Revenue" in view_metric else "Qty"
+                currency_prefix = "₹" if "Revenue" in view_metric else ""
+            with v2:
+                show_labels = st.checkbox("Show Data Labels", value=True)
 
-# --- 4. DATA FETCHING ---
-def get_data_fresh(table, default_cols):
-    try:
-        res = supabase.table(table).select("*").execute()
-        df = pd.DataFrame(res.data)
-        return df if not df.empty else pd.DataFrame(columns=default_cols)
-    except: return pd.DataFrame(columns=default_cols)
-
-master_skus = get_data_fresh("master_skus", ["name"])
-master_chans = get_data_fresh("master_channels", ["name"])
-item_map_df = get_data_fresh("item_map", ["raw_name", "master_name"])
-history_df = get_data_fresh("sales", ["id", "date", "channel", "item_name", "qty_sold", "revenue"])
-
-# --- 5. TABS DEFINITION ---
-# Force tab creation based on role
-if role == "admin":
-    tab_list = ["📊 Analytics", "📤 Smart Upload", "🛠 Config"]
-else:
-    tab_list = ["📊 Analytics"]
-
-tabs = st.tabs(tab_list)
-
-# --- TAB 0: ANALYTICS ---
-with tabs[0]:
-    if history_df.empty:
-        st.info("No data found. Upload records in 'Smart Upload' to begin.")
-    else:
-        history_df['date_dt'] = pd.to_datetime(history_df['date'])
-        st.subheader("Dashboard Filters")
-        f1, f2, f3 = st.columns(3)
-        with f1:
-            p_range = st.radio("Timeframe", ["All Time", "Last 7 Days", "Last 30 Days"], horizontal=True)
-            if p_range == "Last 7 Days": start_d = datetime.now().date() - timedelta(days=7)
-            elif p_range == "Last 30 Days": start_d = datetime.now().date() - timedelta(days=30)
-            else: start_d = history_df['date_dt'].min().date()
-        with f2:
-            sel_chans = st.multiselect("Channels", sorted(history_df['channel'].unique()), default=history_df['channel'].unique())
-        with f3:
-            sel_items = st.multiselect("Master SKUs", sorted(history_df['item_name'].unique()), default=history_df['item_name'].unique())
-
-        f_df = history_df[(history_df['date_dt'].dt.date >= start_d) & (history_df['channel'].isin(sel_chans)) & (history_df['item_name'].isin(sel_items))].copy()
-        if not f_df.empty:
-            st.metric("Total Revenue", f"₹{f_df['revenue'].sum():,.2f}")
-            chart_data = f_df.groupby(['date', 'channel'])['revenue'].sum().reset_index().sort_values('date')
-            st.plotly_chart(px.bar(chart_data, x='date', y='revenue', color='channel', barmode='stack', height=500), use_container_width=True)
-        else: st.warning("No data matches selected filters.")
-
-# --- ADMIN ONLY LOGIC ---
-if role == "admin":
-    # TAB 1: SMART UPLOAD
-    with tabs[1]:
-        st.subheader("Upload Sales Report")
-        u1, u2 = st.columns([1, 2])
-        with u1:
-            sel_ch = st.selectbox("Select Target Channel", master_chans['name'].tolist())
-            up = st.file_uploader("Upload CSV", type=["csv"])
-        
-        if up and sel_ch:
-            raw_df = pd.read_csv(up)
-            cols = raw_df.columns.tolist()
-            st.markdown("---")
-            mc1, mc2, mc3 = st.columns(3)
-            p_idx = next((i for i, c in enumerate(cols) if c in ["Product title", "sku_description"]), 0)
-            q_idx = next((i for i, c in enumerate(cols) if c in ["Net items sold", "total_quantity"]), 0)
-            r_idx = next((i for i, c in enumerate(cols) if c in ["Total sales", "total_sales"]), 0)
+            st.subheader("Time Filters")
+            today = datetime.now().date()
+            t_col1, t_col2 = st.columns([3, 1])
+            with t_col1:
+                time_preset = st.radio("Period:", ["Last 7 Days", "Last 30 Days", "Month to Date", "All Time", "Custom"], horizontal=True, index=3)
             
-            p_col = mc1.selectbox("Product Col", cols, index=p_idx)
-            q_col = mc2.selectbox("Qty Col", cols, index=q_idx)
-            r_col = mc2.selectbox("Revenue Col", cols, index=r_idx)
-            d_col = mc3.selectbox("Date Col", ["None"] + cols)
-            man_date = mc3.date_input("Manual Date")
-
-            st.markdown("#### 🛠 Mapping & Preview")
-            sku_map = {name: st.selectbox(f"Map: {name}", master_skus['name'].tolist(), index=0) for name in raw_df[p_col].unique() if str(name).lower() not in ["total", "grand total"]}
-            
-            temp_rows = []
-            for _, row in raw_df.iterrows():
-                if str(row[p_col]).lower() in ["total", "grand total"]: continue
-                dt = parse_date_smart(row[d_col]) if d_col != "None" else str(man_date)
-                if dt: temp_rows.append({"date": dt, "channel": sel_ch, "item_name": sku_map[row[p_col]], "qty_sold": clean_num(row[q_col]), "revenue": clean_num(row[r_col])})
-            
-            if temp_rows:
-                preview_df = pd.DataFrame(temp_rows).groupby(['date', 'channel', 'item_name']).agg({'qty_sold':'sum', 'revenue':'sum'}).reset_index()
-                st.dataframe(preview_df, hide_index=True)
-                if st.button("🚀 Sync to Cloud"):
-                    for raw, master in sku_map.items(): supabase.table("item_map").upsert({"raw_name": raw, "master_name": master}).execute()
-                    supabase.table("sales").upsert(preview_df.to_dict(orient='records'), on_conflict="date,channel,item_name").execute()
-                    st.success("Sync Complete!"); st.rerun()
-
-    # TAB 2: CONFIG & DANGER ZONE
-    with tabs[2]:
-        st.subheader("System Configuration")
-        sc1, sc2 = st.columns(2)
-        with sc1:
-            st.write("**Master SKUs**")
-            n_sku = st.text_input("New SKU")
-            if st.button("Add SKU") and n_sku: supabase.table("master_skus").insert({"name": n_sku}).execute(); st.rerun()
-            st.dataframe(master_skus, hide_index=True)
-        with sc2:
-            st.write("**Channels**")
-            n_ch = st.text_input("New Channel")
-            if st.button("Add Channel") and n_ch: supabase.table("master_channels").insert({"name": n_ch}).execute(); st.rerun()
-            st.dataframe(master_chans, hide_index=True)
-        
-        st.markdown("---")
-        st.subheader("🚨 Danger Zone (Clean & Wipe)")
-        st.error("Actions here are permanent.")
-        
-        # CLEAR SALES DATA
-        st.markdown("### 🧹 Sales Data Management")
-        c_wipe1, c_wipe2 = st.columns([2, 1])
-        wipe_ch = c_wipe1.selectbox("Channel to Wipe", ["All Data"] + master_chans['name'].tolist())
-        
-        if c_wipe2.button("🗑️ Execute Wipe"):
-            if wipe_ch == "All Data":
-                supabase.table("sales").delete().neq("id", -1).execute()
-                st.success("Entire sales database cleared.")
+            if time_preset == "Last 7 Days": start_date, end_date = today - timedelta(days=6), today
+            elif time_preset == "Last 30 Days": start_date, end_date = today - timedelta(days=29), today
+            elif time_preset == "Month to Date": start_date, end_date = today.replace(day=1), today
+            elif time_preset == "All Time": start_date, end_date = history_df['date_dt'].min().date(), history_df['date_dt'].max().date()
             else:
-                supabase.table("sales").delete().eq("channel", wipe_ch).execute()
-                st.success(f"All data for {wipe_ch} cleared.")
-            st.rerun()
+                dr = st.date_input("Range", value=(history_df['date_dt'].min().date(), today))
+                start_date, end_date = (dr[0], dr[1]) if len(dr) == 2 else (today, today)
+
+            num_days = (end_date - start_date).days + 1
+            mask = (history_df['date_dt'].dt.date >= start_date) & (history_df['date_dt'].dt.date <= end_date)
+            range_df = history_df[mask].copy()
+
+            f1, f2 = st.columns(2)
+            avail_chans = sorted(range_df['channel'].unique())
+            with f1: sel_chan = st.multiselect("Filter Channels", avail_chans, default=avail_chans)
+            chan_mask = range_df['channel'].isin(sel_chan)
+            avail_items = sorted(range_df[chan_mask]['item_name'].unique())
+            with f2: sel_item = st.multiselect("Filter Products", avail_items)
+
+            final_mask = chan_mask
+            if sel_item: final_mask &= range_df['item_name'].isin(sel_item)
+            filtered = range_df[final_mask].copy()
+
+            total_val = filtered[target_col].sum()
+            avg_drr = total_val / num_days if num_days > 0 else 0
+
+            m1, m2 = st.columns(2)
+            m1.metric(f"Total {metric_label}", f"{currency_prefix}{total_val:,.2f}")
+            m2.metric("Daily Run Rate (DRR)", f"{currency_prefix}{avg_drr:,.2f}", help=f"Total over {num_days} days")
+
+            if not filtered.empty:
+                color_theme = "item_name" if sel_item else "channel"
+                plot_df = filtered.groupby(['date', color_theme])[target_col].sum().reset_index().sort_values('date')
+                fig = px.bar(plot_df, x="date", y=target_col, color=color_theme, barmode="stack", height=500)
+                fig.add_hline(y=avg_drr, line_dash="dash", line_color="red", annotation_text=f"Avg DRR")
+                if show_labels:
+                    fig.update_traces(texttemplate='%{y:.2s}', textposition='inside')
+                    totals = plot_df.groupby('date')[target_col].sum().reset_index()
+                    fig.add_scatter(x=totals['date'], y=totals[target_col], text=totals[target_col].apply(lambda x: f'{x:,.0f}'), mode='text', textposition='top center', showlegend=False)
+                st.plotly_chart(fig, use_container_width=True)
+                st.dataframe(filtered.drop(columns=['date_dt', 'id']), hide_index=True)
+
+    # --- TAB 2 & 3: UPLOAD & CONFIG (ADMIN) ---
+    if role == "admin":
+        with tabs[1]:
+            st.subheader("Upload Sales Report")
+            channels = master_chans['name'].tolist() if not master_chans.empty else []
+            selected_channel = st.selectbox("Select Channel", channels)
+            up_file = st.file_uploader("Upload File", type=["csv", "xlsx"])
+
+            if up_file and selected_channel:
+                df = pd.read_csv(up_file) if up_file.name.endswith('.csv') else pd.read_excel(up_file)
+                cols = ["None"] + df.columns.tolist()
+                c1, c2, c3 = st.columns(3)
+                p_col = c1.selectbox("Product Col", cols); v_col = c1.selectbox("Var Col (Opt)", cols)
+                q_col = c2.selectbox("Qty Col", cols); r_col = c2.selectbox("Rev Col", cols)
+                d_col = c3.selectbox("Date Col", cols); fixed_date = c3.date_input("Manual Date")
+
+                if p_col != "None":
+                    df['m_key'] = df[p_col].astype(str) + ((" | " + df[v_col].astype(str)) if v_col != "None" else "")
+                    u_keys = df['m_key'].unique()
+                    sku_map = {}
+                    masters = master_skus['name'].tolist() if not master_skus.empty else []
+                    for k in u_keys:
+                        ex = item_map_df[item_map_df['raw_name'] == k]
+                        idx = masters.index(ex['master_name'].iloc[0]) if not ex.empty and ex['master_name'].iloc[0] in masters else 0
+                        sku_map[k] = st.selectbox(f"Map: {k}", masters, index=idx)
+
+                    if st.button("🚀 Sync to Cloud"):
+                        for k, v in sku_map.items():
+                            supabase.table("item_map").upsert({"raw_name": k, "master_name": v}).execute()
+                        f_rows = []
+                        for _, r in df.iterrows():
+                            dt = pd.to_datetime(r[d_col]).strftime("%Y-%m-%d") if d_col != "None" else str(fixed_date)
+                            f_rows.append({"date": dt, "channel": selected_channel, "item_name": sku_map[r['m_key']], "qty_sold": clean_num(r[q_col]), "revenue": clean_num(r[r_col])})
+                        supabase.table("sales").insert(f_rows).execute()
+                        st.success("Uploaded!"); st.rerun()
+
+        with tabs[2]:
+            st.subheader("⚙️ System Configuration")
+            sc1, sc2 = st.columns(2)
+            with sc1:
+                st.markdown("#### 📦 Master SKUs")
+                n_sku = st.text_input("New SKU")
+                if st.button("Add SKU") and n_sku:
+                    supabase.table("master_skus").insert({"name": n_sku.strip()}).execute()
+                    st.rerun()
+                st.dataframe(master_skus, hide_index=True)
+            with sc2:
+                st.markdown("#### 🏢 Sales Channels")
+                n_ch = st.text_input("New Channel")
+                if st.button("Add Channel") and n_ch:
+                    supabase.table("master_channels").insert({"name": n_ch.strip()}).execute()
+                    st.rerun()
+                st.dataframe(master_chans, hide_index=True)
