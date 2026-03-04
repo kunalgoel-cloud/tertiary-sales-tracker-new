@@ -61,7 +61,7 @@ if check_auth():
     master_chans = get_data_safe("master_channels", ["name"])
     item_map_df = get_data_safe("item_map", ["raw_name", "master_name"])
 
-    # --- 3. SIDEBAR ---
+    # --- 3. SIDEBAR (DANGER ZONE + SELECTIVE DELETE) ---
     with st.sidebar:
         st.header(f"👤 {role.upper()}")
         
@@ -94,7 +94,7 @@ if check_auth():
             st.rerun()
         
         st.divider()
-        st.caption("🚀 Version: 1.3.0 (Gemini 404 Fix)")
+        st.caption("🚀 Version: 1.4.0 (Gemini Debug Mode)")
 
     # --- 4. TABS ---
     if role == "admin":
@@ -226,34 +226,31 @@ if check_auth():
                     st.rerun()
                 st.dataframe(master_chans, hide_index=True)
 
-    # --- FINAL TAB: AI INSIGHTS ---
+    # --- FINAL TAB: AI INSIGHTS (DEBUG MODE) ---
     with tabs[-1]:
         st.subheader("🤖 AI Sales Assistant")
         if "GEMINI_API_KEY" not in st.secrets:
             st.info("To enable the AI Assistant, please add your `GEMINI_API_KEY` to the Streamlit Secrets.")
         else:
             genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-            
-            # Use Fallback Logic to avoid 404
-            model_names = ['gemini-1.5-flash-latest', 'gemini-1.5-flash', 'gemini-2.0-flash', 'gemini-pro']
+            model_names = ['gemini-1.5-flash', 'gemini-1.5-flash-latest', 'gemini-1.5-pro', 'gemini-pro']
             
             user_query = st.chat_input("Ask a question about your sales...")
             
             if user_query:
-                with st.spinner("Gemini is analyzing data..."):
-                    context_summary = history_df.tail(200).to_string()
+                with st.spinner("Analyzing data..."):
+                    context_summary = history_df.tail(100).to_string()
                     prompt = f"""
                     You are the Mamanourish Sales Analyst. Answer based on this table: [date, channel, item_name, qty_sold, revenue].
                     Today's Date: {datetime.now().date()}
-                    Available Channels: {master_chans['name'].tolist()}
-                    Available Products: {master_skus['name'].tolist()}
-                    Recent Data Summary: {context_summary}
-                    Total Stats: {history_df.describe().to_string()}
+                    Recent Data: {context_summary}
+                    Stats: {history_df.describe().to_string()}
                     Question: {user_query}
-                    Instructions: Be professional and concise. Calculate totals if requested.
+                    Instructions: Be professional and concise.
                     """
                     
                     response_received = False
+                    last_err = ""
                     for m_name in model_names:
                         try:
                             model = genai.GenerativeModel(m_name)
@@ -261,8 +258,10 @@ if check_auth():
                             st.markdown(f"**AI Response ({m_name}):**\n\n{response.text}")
                             response_received = True
                             break
-                        except Exception:
+                        except Exception as e:
+                            last_err = str(e)
                             continue
                     
                     if not response_received:
-                        st.error("Could not connect to any Gemini models. Please check your API key settings.")
+                        st.error("❌ Connection Failed.")
+                        st.warning(f"**Technical Detail:** {last_err}")
