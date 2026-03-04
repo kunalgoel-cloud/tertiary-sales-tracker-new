@@ -5,7 +5,7 @@ from supabase import create_client, Client
 import re
 import plotly.express as px
 from datetime import datetime, timedelta
-import google.generativeai as genai  # NEW IMPORT
+import google.generativeai as genai 
 
 # --- 1. CONFIG & PERMANENT DB CONNECTION ---
 st.set_page_config(page_title="Mamanourish Executive Tracker", layout="wide")
@@ -61,7 +61,7 @@ if check_auth():
     master_chans = get_data_safe("master_channels", ["name"])
     item_map_df = get_data_safe("item_map", ["raw_name", "master_name"])
 
-    # --- 3. SIDEBAR (DANGER ZONE + SELECTIVE DELETE) ---
+    # --- 3. SIDEBAR ---
     with st.sidebar:
         st.header(f"👤 {role.upper()}")
         
@@ -92,6 +92,9 @@ if check_auth():
         if st.button("Logout"):
             del st.session_state["authenticated"]
             st.rerun()
+        
+        st.divider()
+        st.caption("🚀 Version: 1.3.0 (Gemini 404 Fix)")
 
     # --- 4. TABS ---
     if role == "admin":
@@ -223,47 +226,43 @@ if check_auth():
                     st.rerun()
                 st.dataframe(master_chans, hide_index=True)
 
-    # --- FINAL TAB: AI INSIGHTS (SHARED - USING GEMINI) ---
+    # --- FINAL TAB: AI INSIGHTS ---
     with tabs[-1]:
         st.subheader("🤖 AI Sales Assistant")
         if "GEMINI_API_KEY" not in st.secrets:
             st.info("To enable the AI Assistant, please add your `GEMINI_API_KEY` to the Streamlit Secrets.")
         else:
             genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-            model = genai.GenerativeModel('gemini-1.5-flash')
             
-            user_query = st.chat_input("Ask a question about your sales (e.g. 'Which channel had the best sales this month?')")
+            # Use Fallback Logic to avoid 404
+            model_names = ['gemini-1.5-flash-latest', 'gemini-1.5-flash', 'gemini-2.0-flash', 'gemini-pro']
+            
+            user_query = st.chat_input("Ask a question about your sales...")
             
             if user_query:
                 with st.spinner("Gemini is analyzing data..."):
-                    # Summarize historical data for the AI context
-                    # We limit the data context to stay within token limits and maintain speed
-                    context_summary = history_df.tail(200).to_string() # Context of recent 200 records
-                    
+                    context_summary = history_df.tail(200).to_string()
                     prompt = f"""
-                    You are the Mamanourish Sales Analyst. Answer based on this table structure:
-                    Columns: [date, channel, item_name, qty_sold, revenue].
+                    You are the Mamanourish Sales Analyst. Answer based on this table: [date, channel, item_name, qty_sold, revenue].
                     Today's Date: {datetime.now().date()}
-                    
                     Available Channels: {master_chans['name'].tolist()}
                     Available Products: {master_skus['name'].tolist()}
-                    
-                    Data Summary (Recent/Sample):
-                    {context_summary}
-                    
-                    Total Database Stats:
-                    {history_df.describe().to_string()}
-                    
+                    Recent Data Summary: {context_summary}
+                    Total Stats: {history_df.describe().to_string()}
                     Question: {user_query}
-                    
-                    Instructions:
-                    1. Be concise and professional.
-                    2. Use the data above to calculate answers if needed.
-                    3. If the data is insufficient, tell the user what's missing.
+                    Instructions: Be professional and concise. Calculate totals if requested.
                     """
                     
-                    try:
-                        response = model.generate_content(prompt)
-                        st.markdown(f"**AI Response:**\n\n{response.text}")
-                    except Exception as e:
-                        st.error(f"Gemini Error: {e}")
+                    response_received = False
+                    for m_name in model_names:
+                        try:
+                            model = genai.GenerativeModel(m_name)
+                            response = model.generate_content(prompt)
+                            st.markdown(f"**AI Response ({m_name}):**\n\n{response.text}")
+                            response_received = True
+                            break
+                        except Exception:
+                            continue
+                    
+                    if not response_received:
+                        st.error("Could not connect to any Gemini models. Please check your API key settings.")
