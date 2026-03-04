@@ -5,7 +5,9 @@ from supabase import create_client, Client
 import re
 import plotly.express as px
 from datetime import datetime, timedelta
-import google.generativeai as genai 
+# UPDATE: Using the new 2026 GenAI SDK
+from google import genai 
+from google.genai import types
 
 # --- 1. CONFIG & PERMANENT DB CONNECTION ---
 st.set_page_config(page_title="Mamanourish Executive Tracker", layout="wide")
@@ -61,40 +63,34 @@ if check_auth():
     master_chans = get_data_safe("master_channels", ["name"])
     item_map_df = get_data_safe("item_map", ["raw_name", "master_name"])
 
-    # --- 3. SIDEBAR (DANGER ZONE + SELECTIVE DELETE) ---
+    # --- 3. SIDEBAR ---
     with st.sidebar:
         st.header(f"👤 {role.upper()}")
-        
         if role == "admin":
             st.divider()
             st.subheader("🛠 Data Correction")
             with st.expander("Delete Specific Entry"):
-                del_date = st.date_input("Select Date to Clear", value=datetime.now().date())
-                del_chan = st.selectbox("Select Channel to Clear", ["Select..."] + master_chans['name'].tolist())
+                del_date = st.date_input("Select Date", value=datetime.now().date())
+                del_chan = st.selectbox("Select Channel", ["Select..."] + master_chans['name'].tolist())
                 if st.button("🗑️ Delete Selection"):
                     if del_chan != "Select...":
                         supabase.table("sales").delete().eq("date", str(del_date)).eq("channel", del_chan).execute()
-                        st.success(f"Deleted {del_chan} data for {del_date}")
-                        st.rerun()
-                    else:
-                        st.error("Please select a channel")
+                        st.success(f"Deleted {del_chan} data for {del_date}"); st.rerun()
+                    else: st.error("Please select a channel")
 
             st.divider()
             if st.checkbox("Unlock Global Danger Zone"):
                 if st.button("💥 Flush Entire History"):
-                    supabase.table("sales").delete().neq("id", -1).execute()
-                    st.rerun()
+                    supabase.table("sales").delete().neq("id", -1).execute(); st.rerun()
                 if st.button("🔄 Reset All Mappings"):
-                    supabase.table("item_map").delete().neq("raw_name", "dummy").execute()
-                    st.rerun()
+                    supabase.table("item_map").delete().neq("raw_name", "dummy").execute(); st.rerun()
         
         st.divider()
         if st.button("Logout"):
-            del st.session_state["authenticated"]
-            st.rerun()
+            del st.session_state["authenticated"]; st.rerun()
         
         st.divider()
-        st.caption("🚀 Version: 1.4.0 (Gemini Debug Mode)")
+        st.caption("🚀 Version: 1.5.0 (Gemini 3.1 Update)")
 
     # --- 4. TABS ---
     if role == "admin":
@@ -114,14 +110,11 @@ if check_auth():
                 target_col = "revenue" if "Revenue" in view_metric else "qty_sold"
                 metric_label = "Revenue" if "Revenue" in view_metric else "Qty"
                 currency_prefix = "₹" if "Revenue" in view_metric else ""
-            with v2:
-                show_labels = st.checkbox("Show Data Labels", value=True)
+            with v2: show_labels = st.checkbox("Show Data Labels", value=True)
 
             st.subheader("Time Filters")
             today = datetime.now().date()
-            t_col1, t_col2 = st.columns([3, 1])
-            with t_col1:
-                time_preset = st.radio("Period:", ["Last 7 Days", "Last 30 Days", "Month to Date", "All Time", "Custom"], horizontal=True, index=3)
+            time_preset = st.radio("Period:", ["Last 7 Days", "Last 30 Days", "Month to Date", "All Time", "Custom"], horizontal=True, index=3)
             
             if time_preset == "Last 7 Days": start_date, end_date = today - timedelta(days=6), today
             elif time_preset == "Last 30 Days": start_date, end_date = today - timedelta(days=29), today
@@ -151,21 +144,18 @@ if check_auth():
 
             m1, m2 = st.columns(2)
             m1.metric(f"Total {metric_label}", f"{currency_prefix}{total_val:,.2f}")
-            m2.metric("Daily Run Rate (DRR)", f"{currency_prefix}{avg_drr:,.2f}", help=f"Total over {num_days} days")
+            m2.metric("Daily Run Rate (DRR)", f"{currency_prefix}{avg_drr:,.2f}")
 
             if not filtered.empty:
                 color_theme = "item_name" if sel_item else "channel"
                 plot_df = filtered.groupby(['date', color_theme])[target_col].sum().reset_index().sort_values('date')
                 fig = px.bar(plot_df, x="date", y=target_col, color=color_theme, barmode="stack", height=500)
-                fig.add_hline(y=avg_drr, line_dash="dash", line_color="red", annotation_text=f"Avg DRR")
+                fig.add_hline(y=avg_drr, line_dash="dash", line_color="red")
                 if show_labels:
                     fig.update_traces(texttemplate='%{y:.2s}', textposition='inside')
-                    totals = plot_df.groupby('date')[target_col].sum().reset_index()
-                    fig.add_scatter(x=totals['date'], y=totals[target_col], text=totals[target_col].apply(lambda x: f'{x:,.0f}'), mode='text', textposition='top center', showlegend=False)
                 st.plotly_chart(fig, use_container_width=True)
-                st.dataframe(filtered.drop(columns=['date_dt', 'id']), hide_index=True)
 
-    # --- ADMIN ONLY TABS (UPLOAD & CONFIG) ---
+    # --- ADMIN ONLY TABS ---
     if role == "admin":
         with tabs[1]:
             st.subheader("Upload Sales Report")
@@ -193,20 +183,17 @@ if check_auth():
                         sku_map[k] = st.selectbox(f"Map: {k}", masters, index=idx)
 
                     if st.button("🚀 Sync to Cloud"):
-                        with st.spinner("Deduplicating & Syncing..."):
-                            for k, v in sku_map.items():
-                                supabase.table("item_map").upsert({"raw_name": k, "master_name": v}).execute()
-                            
-                            raw_rows = []
-                            for _, r in df.iterrows():
-                                if str(r[p_col]).lower() in ["total", "grand total"]: continue
-                                dt = pd.to_datetime(r[d_col]).strftime("%Y-%m-%d") if d_col != "None" else str(fixed_date)
-                                raw_rows.append({"date": dt, "channel": selected_channel, "item_name": sku_map[r['m_key']], "qty_sold": clean_num(r[q_col]), "revenue": clean_num(r[r_col])})
-                            
-                            if raw_rows:
-                                final_df = pd.DataFrame(raw_rows).groupby(['date', 'channel', 'item_name']).agg({'qty_sold': 'sum', 'revenue': 'sum'}).reset_index()
-                                supabase.table("sales").upsert(final_df.to_dict(orient='records'), on_conflict="date,channel,item_name").execute()
-                                st.success(f"Synced {len(final_df)} unique master records!"); st.rerun()
+                        for k, v in sku_map.items():
+                            supabase.table("item_map").upsert({"raw_name": k, "master_name": v}).execute()
+                        raw_rows = []
+                        for _, r in df.iterrows():
+                            if str(r[p_col]).lower() in ["total", "grand total"]: continue
+                            dt = pd.to_datetime(r[d_col]).strftime("%Y-%m-%d") if d_col != "None" else str(fixed_date)
+                            raw_rows.append({"date": dt, "channel": selected_channel, "item_name": sku_map[r['m_key']], "qty_sold": clean_num(r[q_col]), "revenue": clean_num(r[r_col])})
+                        if raw_rows:
+                            final_df = pd.DataFrame(raw_rows).groupby(['date', 'channel', 'item_name']).agg({'qty_sold': 'sum', 'revenue': 'sum'}).reset_index()
+                            supabase.table("sales").upsert(final_df.to_dict(orient='records'), on_conflict="date,channel,item_name").execute()
+                            st.success(f"Synced {len(final_df)} records!"); st.rerun()
 
         with tabs[2]:
             st.subheader("⚙️ System Configuration")
@@ -215,46 +202,39 @@ if check_auth():
                 st.markdown("#### 📦 Master SKUs")
                 n_sku = st.text_input("New SKU")
                 if st.button("Add SKU") and n_sku:
-                    supabase.table("master_skus").insert({"name": n_sku.strip()}).execute()
-                    st.rerun()
+                    supabase.table("master_skus").insert({"name": n_sku.strip()}).execute(); st.rerun()
                 st.dataframe(master_skus, hide_index=True)
             with sc2:
                 st.markdown("#### 🏢 Sales Channels")
                 n_ch = st.text_input("New Channel")
                 if st.button("Add Channel") and n_ch:
-                    supabase.table("master_channels").insert({"name": n_ch.strip()}).execute()
-                    st.rerun()
+                    supabase.table("master_channels").insert({"name": n_ch.strip()}).execute(); st.rerun()
                 st.dataframe(master_chans, hide_index=True)
 
-    # --- FINAL TAB: AI INSIGHTS (DEBUG MODE) ---
+    # --- FINAL TAB: AI INSIGHTS (NEW 2026 SDK VERSION) ---
     with tabs[-1]:
         st.subheader("🤖 AI Sales Assistant")
         if "GEMINI_API_KEY" not in st.secrets:
-            st.info("To enable the AI Assistant, please add your `GEMINI_API_KEY` to the Streamlit Secrets.")
+            st.info("Please add `GEMINI_API_KEY` to Streamlit Secrets.")
         else:
-            genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-            model_names = ['gemini-1.5-flash', 'gemini-1.5-flash-latest', 'gemini-1.5-pro', 'gemini-pro']
+            # NEW 2026 CLIENT INITIALIZATION
+            client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
+            # Modern 2026 Model List
+            model_names = ['gemini-3.1-pro', 'gemini-3-flash', 'gemini-2.5-pro']
             
-            user_query = st.chat_input("Ask a question about your sales...")
+            user_query = st.chat_input("Ask about your sales trends...")
             
             if user_query:
-                with st.spinner("Analyzing data..."):
-                    context_summary = history_df.tail(100).to_string()
-                    prompt = f"""
-                    You are the Mamanourish Sales Analyst. Answer based on this table: [date, channel, item_name, qty_sold, revenue].
-                    Today's Date: {datetime.now().date()}
-                    Recent Data: {context_summary}
-                    Stats: {history_df.describe().to_string()}
-                    Question: {user_query}
-                    Instructions: Be professional and concise.
-                    """
+                with st.spinner("Gemini 3.1 is analyzing..."):
+                    context = history_df.tail(100).to_string()
+                    prompt = f"Data: {context}. Question: {user_query}"
                     
                     response_received = False
                     last_err = ""
                     for m_name in model_names:
                         try:
-                            model = genai.GenerativeModel(m_name)
-                            response = model.generate_content(prompt)
+                            # NEW 2026 CALL SYNTAX
+                            response = client.models.generate_content(model=m_name, contents=prompt)
                             st.markdown(f"**AI Response ({m_name}):**\n\n{response.text}")
                             response_received = True
                             break
@@ -263,5 +243,6 @@ if check_auth():
                             continue
                     
                     if not response_received:
-                        st.error("❌ Connection Failed.")
-                        st.warning(f"**Technical Detail:** {last_err}")
+                        st.error("❌ Model Access Failed.")
+                        st.warning(f"Technical Detail: {last_err}")
+                        st.info("Check if your API Key supports Gemini 3.1 in Google AI Studio.")
