@@ -19,7 +19,6 @@ except Exception:
 
 def clean_num(val):
     if pd.isna(val) or val == "": return 0.0
-    # Strip currency, commas, and handle negative numbers for refunds
     s = str(val).strip().replace(',', '')
     if s.startswith('(') and s.endswith(')'): s = '-' + s[1:-1]
     res = re.sub(r'[^-0-9.]', '', s)
@@ -55,16 +54,13 @@ if check_auth():
             return df if not df.empty else pd.DataFrame(columns=default_cols)
         except: return pd.DataFrame(columns=default_cols)
 
-    # Load Global Data
     history_df = get_data_safe("sales", ["id", "date", "channel", "item_name", "qty_sold", "revenue"])
     master_skus = get_data_safe("master_skus", ["name"])
     master_chans = get_data_safe("master_channels", ["name"])
     item_map_df = get_data_safe("item_map", ["raw_name", "master_name"])
 
-    # --- 3. SIDEBAR (DANGER ZONE + SELECTIVE DELETE) ---
     with st.sidebar:
         st.header(f"👤 {role.upper()}")
-        
         if role == "admin":
             st.divider()
             st.subheader("🛠 Data Correction")
@@ -74,26 +70,20 @@ if check_auth():
                 if st.button("🗑️ Delete Selection"):
                     if del_chan != "Select...":
                         supabase.table("sales").delete().eq("date", str(del_date)).eq("channel", del_chan).execute()
-                        st.success(f"Deleted {del_chan} data for {del_date}")
-                        st.rerun()
-                    else:
-                        st.error("Please select a channel")
+                        st.success(f"Deleted {del_chan} data for {del_date}"); st.rerun()
+                    else: st.error("Please select a channel")
 
             st.divider()
             if st.checkbox("Unlock Global Danger Zone"):
                 if st.button("💥 Flush Entire History"):
-                    supabase.table("sales").delete().neq("id", -1).execute()
-                    st.rerun()
+                    supabase.table("sales").delete().neq("id", -1).execute(); st.rerun()
                 if st.button("🔄 Reset All Mappings"):
-                    supabase.table("item_map").delete().neq("raw_name", "dummy").execute()
-                    st.rerun()
+                    supabase.table("item_map").delete().neq("raw_name", "dummy").execute(); st.rerun()
         
         st.divider()
         if st.button("Logout"):
-            del st.session_state["authenticated"]
-            st.rerun()
+            del st.session_state["authenticated"]; st.rerun()
 
-    # --- 4. TABS ---
     tabs = st.tabs(["📊 Trend Analytics", "📤 Smart Upload", "🛠 Configuration"]) if role == "admin" else st.tabs(["📊 Analytics"])
     
     # --- TAB 1: ANALYTICS ---
@@ -125,7 +115,6 @@ if check_auth():
                 dr = st.date_input("Range", value=(history_df['date_dt'].min().date(), today))
                 start_date, end_date = (dr[0], dr[1]) if len(dr) == 2 else (today, today)
 
-            num_days = (end_date - start_date).days + 1
             mask = (history_df['date_dt'].dt.date >= start_date) & (history_df['date_dt'].dt.date <= end_date)
             range_df = history_df[mask].copy()
 
@@ -140,12 +129,22 @@ if check_auth():
             if sel_item: final_mask &= range_df['item_name'].isin(sel_item)
             filtered = range_df[final_mask].copy()
 
+            # --- FIXED DRR CALCULATION LOGIC ---
             total_val = filtered[target_col].sum()
-            avg_drr = total_val / num_days if num_days > 0 else 0
+            # Count unique days actually present in the filtered data
+            active_days = filtered['date_dt'].dt.date.nunique()
+            
+            # Fallback to the selected date range if data is sparse or specific presets are used
+            # This ensures DRR is calculated over the full intended window
+            intended_days = (end_date - start_date).days + 1
+            days_to_use = intended_days if intended_days > 0 else 1
+            
+            avg_drr = total_val / days_to_use
+            # -----------------------------------
 
             m1, m2 = st.columns(2)
             m1.metric(f"Total {metric_label}", f"{currency_prefix}{total_val:,.2f}")
-            m2.metric("Daily Run Rate (DRR)", f"{currency_prefix}{avg_drr:,.2f}", help=f"Total over {num_days} days")
+            m2.metric("Daily Run Rate (DRR)", f"{currency_prefix}{avg_drr:,.2f}", help=f"Calculated as Total / {days_to_use} days in the selected period.")
 
             if not filtered.empty:
                 color_theme = "item_name" if sel_item else "channel"
@@ -181,7 +180,6 @@ if check_auth():
                     sku_map = {}
                     masters = master_skus['name'].tolist() if not master_skus.empty else []
                     for k in u_keys:
-                        # Skip summary rows if found in Shopify files
                         if str(k).lower() in ["total", "grand total"]: continue
                         ex = item_map_df[item_map_df['raw_name'] == k]
                         idx = masters.index(ex['master_name'].iloc[0]) if not ex.empty and ex['master_name'].iloc[0] in masters else 0
@@ -189,11 +187,9 @@ if check_auth():
 
                     if st.button("🚀 Sync to Cloud"):
                         with st.spinner("Deduplicating & Syncing..."):
-                            # 1. Update mappings
                             for k, v in sku_map.items():
                                 supabase.table("item_map").upsert({"raw_name": k, "master_name": v}).execute()
                             
-                            # 2. Collect rows from file
                             raw_rows = []
                             for _, r in df.iterrows():
                                 if str(r[p_col]).lower() in ["total", "grand total"]: continue
@@ -207,13 +203,11 @@ if check_auth():
                                 })
                             
                             if raw_rows:
-                                # 3. AGGREGATE (Sum up same items on same day - critical for Big Basket/Shopify)
                                 final_df = pd.DataFrame(raw_rows).groupby(['date', 'channel', 'item_name']).agg({
                                     'qty_sold': 'sum', 
                                     'revenue': 'sum'
                                 }).reset_index()
 
-                                # 4. UPSERT (Update existing, Insert new - prevents API error)
                                 res = supabase.table("sales").upsert(
                                     final_df.to_dict(orient='records'),
                                     on_conflict="date,channel,item_name"
@@ -228,13 +222,11 @@ if check_auth():
                 st.markdown("#### 📦 Master SKUs")
                 n_sku = st.text_input("New SKU")
                 if st.button("Add SKU") and n_sku:
-                    supabase.table("master_skus").insert({"name": n_sku.strip()}).execute()
-                    st.rerun()
+                    supabase.table("master_skus").insert({"name": n_sku.strip()}).execute(); st.rerun()
                 st.dataframe(master_skus, hide_index=True)
             with sc2:
                 st.markdown("#### 🏢 Sales Channels")
                 n_ch = st.text_input("New Channel")
                 if st.button("Add Channel") and n_ch:
-                    supabase.table("master_channels").insert({"name": n_ch.strip()}).execute()
-                    st.rerun()
+                    supabase.table("master_channels").insert({"name": n_ch.strip()}).execute(); st.rerun()
                 st.dataframe(master_chans, hide_index=True)
