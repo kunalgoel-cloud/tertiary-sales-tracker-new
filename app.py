@@ -42,21 +42,34 @@ def sanitize(text: str) -> str:
     """Strip dangerous characters from user-supplied names."""
     return re.sub(r"[<>\"'%;()&+]", "", str(text)).strip()[:200]
 
-def get_table(table: str, default_cols: list) -> pd.DataFrame:
-    """Fetch a Supabase table; return empty DataFrame on failure."""
+@st.cache_data(ttl=30)
+def get_table(table: str, default_cols: tuple) -> pd.DataFrame:
+    """Fetch a Supabase table with pagination; return empty DataFrame on failure."""
     try:
-        res = supabase.table(table).select("*").execute()
-        df = pd.DataFrame(res.data)
-        if df.empty:
-            return pd.DataFrame(columns=default_cols)
-        # Cast numeric columns that Supabase may return as strings/objects
+        all_rows = []
+        page = 0
+        PAGE_SIZE = 1000
+        while True:
+            res = supabase.table(table).select("*").range(page * PAGE_SIZE, (page + 1) * PAGE_SIZE - 1).execute()
+            if not res.data:
+                break
+            all_rows.extend(res.data)
+            if len(res.data) < PAGE_SIZE:
+                break
+            page += 1
+        if not all_rows:
+            return pd.DataFrame(columns=list(default_cols))
+        df = pd.DataFrame(all_rows)
         for col in ["qty_sold", "revenue"]:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
         return df
     except Exception as e:
         st.warning(f"Could not load '{table}': {e}")
-        return pd.DataFrame(columns=default_cols)
+        return pd.DataFrame(columns=list(default_cols))
+
+def invalidate_data_cache():
+    get_table.clear()
 
 # ─────────────────────────────────────────────
 # 3. AUTHENTICATION  (passwords via secrets only)
@@ -100,10 +113,10 @@ if not check_auth():
 
 role: str = st.session_state["role"]
 
-history_df   = get_table("sales",           ["id", "date", "channel", "item_name", "qty_sold", "revenue"])
-master_skus  = get_table("master_skus",     ["name"])
-master_chans = get_table("master_channels", ["name"])
-item_map_df  = get_table("item_map",        ["raw_name", "master_name"])
+history_df   = get_table("sales",           ("id", "date", "channel", "item_name", "qty_sold", "revenue"))
+master_skus  = get_table("master_skus",     ("name",))
+master_chans = get_table("master_channels", ("name",))
+item_map_df  = get_table("item_map",        ("raw_name", "master_name"))
 
 # ─────────────────────────────────────────────
 # SIDEBAR
@@ -127,6 +140,7 @@ with st.sidebar:
                             .eq("channel", del_chan)\
                             .execute()
                         st.success(f"Deleted {del_chan} data for {del_date}")
+                        invalidate_data_cache()
                         st.rerun()
                     except Exception as e:
                         st.error(f"Delete failed: {e}")
@@ -139,6 +153,7 @@ with st.sidebar:
                 try:
                     supabase.table("sales").delete().neq("id", -1).execute()
                     st.success("All history flushed.")
+                    invalidate_data_cache()
                     st.rerun()
                 except Exception as e:
                     st.error(f"Flush failed: {e}")
@@ -146,6 +161,7 @@ with st.sidebar:
                 try:
                     supabase.table("item_map").delete().neq("raw_name", "dummy").execute()
                     st.success("Mappings reset.")
+                    invalidate_data_cache()
                     st.rerun()
                 except Exception as e:
                     st.error(f"Reset failed: {e}")
@@ -458,9 +474,8 @@ if role == "admin":
                     )
                 else:
                     st.success(f"✅ Synced {len(final_df)} unique records for '{selected_channel}'!")
-                    st.info("Refresh the Analytics tab to see the updated data.")
-                    # Clear upload-related cache so analytics re-fetches fresh data
-                    st.cache_resource.clear()
+                    invalidate_data_cache()
+                    st.rerun()
 
     # ══════════════════════════════════════════
     # TAB 3 – CONFIGURATION  (admin only)
