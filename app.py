@@ -365,6 +365,23 @@ if role == "admin":
                     key=f"sku_{k}",
                 )
 
+            # ── Date Preview ────────────────────────────────────────────────
+            if d_col != "None":
+                def preview_date(val):
+                    s = str(val).strip()
+                    if " - " in s:
+                        s = s.split(" - ")[0].strip()
+                    try:
+                        return pd.to_datetime(s).strftime("%Y-%m-%d")
+                    except Exception:
+                        return f"⚠️ unparseable: {val}"
+
+                sample_dates = work_df[d_col].dropna().unique()[:5]
+                parsed_preview = [preview_date(d) for d in sample_dates]
+                st.info(f"📅 **Date column preview** — raw: `{sample_dates[0]}` → parsed as: `{parsed_preview[0]}`")
+                if any("unparseable" in str(p) for p in parsed_preview):
+                    st.warning("Some dates couldn't be parsed — those rows will use the Manual Date instead.")
+
             # ── Sync Button ─────────────────────────────────────────────────
             if st.button("🚀 Sync to Cloud"):
                 errors: list[str] = []
@@ -382,10 +399,14 @@ if role == "admin":
                 with st.spinner("Processing rows…"):
                     raw_rows = []
                     for _, r in work_df.iterrows():
-                        # Resolve date
+                        # Resolve date — handles plain dates AND range strings like "20260402 - 20260402"
                         if d_col != "None":
+                            raw_date_val = str(r[d_col]).strip()
+                            # If it looks like a range (contains " - "), extract the start date
+                            if " - " in raw_date_val:
+                                raw_date_val = raw_date_val.split(" - ")[0].strip()
                             try:
-                                dt_str = pd.to_datetime(r[d_col]).strftime("%Y-%m-%d")
+                                dt_str = pd.to_datetime(raw_date_val).strftime("%Y-%m-%d")
                             except Exception:
                                 dt_str = str(fixed_date)
                         else:
