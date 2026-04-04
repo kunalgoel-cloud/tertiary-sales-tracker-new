@@ -28,6 +28,16 @@ from supabase import create_client, Client
 # SUPABASE CLIENTS
 # ─────────────────────────────────────────────────────────────
 
+def _fmt_err(e: Exception) -> str:
+    """Return a short, readable error message — strips HTML 502 bodies etc."""
+    msg = str(e)
+    if len(msg) > 300 or "<html" in msg.lower() or "<!doctype" in msg.lower():
+        # Supabase returned an HTML error page (502, 503 etc.)
+        code = "502" if "502" in msg else ("503" if "503" in msg else "server error")
+        return f"Supabase {code} — server temporarily unavailable. Try again in a moment."
+    return msg[:300]
+
+
 @st.cache_resource
 def _get_marketing_supabase() -> Client:
     try:
@@ -128,7 +138,7 @@ def _get_performance(sb) -> pd.DataFrame:
                 df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
         return df
     except Exception as e:
-        st.error(f"Error fetching performance data: {e}")
+        st.error(f"Error fetching performance data: {_fmt_err(e)}")
         return pd.DataFrame()
 
 
@@ -298,7 +308,7 @@ def _get_sales_data() -> pd.DataFrame:
         df["date"]     = pd.to_datetime(df["date"])
         return df
     except Exception as e:
-        st.warning(f"Could not load sales data for TACOS: {e}")
+        st.warning(f"Could not load sales data for TACOS: {_fmt_err(e)}")
         return pd.DataFrame()
 
 
