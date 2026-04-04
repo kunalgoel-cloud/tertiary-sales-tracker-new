@@ -644,7 +644,7 @@ with tabs[1]:
 # TAB 3 – PERFORMANCE MARKETING (all roles, index 2)
 # ══════════════════════════════════════════════
 with tabs[2]:
-    render_marketing_tab(supabase, role)
+    render_marketing_tab(role)
 
 # ══════════════════════════════════════════════
 # TAB 4 – SMART UPLOAD  (admin only)
