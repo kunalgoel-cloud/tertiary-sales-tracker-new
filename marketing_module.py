@@ -168,6 +168,70 @@ def _delete_performance(sb, channel: str, date: str) -> int:
 
 
 # ─────────────────────────────────────────────────────────────
+# CHANNEL MAP HELPERS  (marketing channel -> sales channels)
+# ─────────────────────────────────────────────────────────────
+
+def _get_channel_map(sb) -> dict[str, list[str]]:
+    """
+    Returns {marketing_channel: [sales_channel, ...]} from the channel_map table.
+    Example: {"Amazon": ["Amazon RKW", "Amazon Seller"], "Blinkit": ["Blinkit"]}
+    Falls back to identity mapping (channel maps to itself) if table missing or empty.
+    """
+    try:
+        r = sb.table("channel_map").select("mkt_channel,sales_channel").execute()
+        result: dict[str, list[str]] = {}
+        for row in r.data:
+            result.setdefault(row["mkt_channel"], []).append(row["sales_channel"])
+        return result
+    except Exception:
+        return {}
+
+
+def _save_channel_map_entry(sb, mkt_channel: str, sales_channel: str) -> bool:
+    try:
+        sb.table("channel_map").upsert(
+            {"mkt_channel": mkt_channel, "sales_channel": sales_channel},
+            on_conflict="mkt_channel,sales_channel",
+        ).execute()
+        return True
+    except Exception as e:
+        st.error(f"Error saving channel map: {e}")
+        return False
+
+
+def _delete_channel_map_entry(sb, mkt_channel: str, sales_channel: str) -> bool:
+    try:
+        sb.table("channel_map").delete()\
+            .eq("mkt_channel", mkt_channel)\
+            .eq("sales_channel", sales_channel).execute()
+        return True
+    except Exception as e:
+        st.error(f"Error deleting channel map: {e}")
+        return False
+
+
+def _apply_channel_map(sales_df: pd.DataFrame, channel_map: dict[str, list[str]]) -> pd.DataFrame:
+    """
+    Adds a 'mkt_channel' column to sales_df by reversing the channel_map.
+    Sales rows whose channel is not in any mapping are mapped to themselves (identity).
+    Multiple sales channels that map to the same marketing channel are summed correctly
+    downstream when grouping by mkt_channel.
+    """
+    if sales_df.empty:
+        return sales_df
+
+    # Build reverse map: sales_channel -> mkt_channel
+    reverse: dict[str, str] = {}
+    for mkt_ch, sales_chs in channel_map.items():
+        for sc in sales_chs:
+            reverse[sc] = mkt_ch
+
+    df = sales_df.copy()
+    df["mkt_channel"] = df["channel"].map(reverse).fillna(df["channel"])
+    return df
+
+
+# ─────────────────────────────────────────────────────────────
 # DATABASE HELPERS — SALES DB  (for TACOS cross-join)
 # ─────────────────────────────────────────────────────────────
 
@@ -698,6 +762,9 @@ def _render_acos_tacos(sb):
 
     df_mkt["date"] = pd.to_datetime(df_mkt["date"])
 
+    # Load channel map and sales data
+    channel_map = _get_channel_map(sb)
+
     with st.spinner("Loading total sales data…"):
         df_sales = _get_sales_data()
 
@@ -706,6 +773,19 @@ def _render_acos_tacos(sb):
         st.warning(
             "⚠️ Could not load sales data from the sales DB. "
             "TACOS and Organic Revenue columns will not be shown — displaying ACOS only."
+        )
+
+    # Show channel mapping status banner
+    if has_sales and channel_map:
+        mapped_lines = [f"**{mk}** → {', '.join(sv)}" for mk, sv in channel_map.items()]
+        with st.expander("🔗 Active channel mapping (edit in ⚙️ Settings → Channel Map)", expanded=False):
+            for line in mapped_lines:
+                st.markdown(f"• {line}")
+    elif has_sales and not channel_map:
+        st.info(
+            "ℹ️ No channel mapping configured. Each marketing channel is matched directly "
+            "to the same-named sales channel. Go to **⚙️ Settings → Channel Map** to set up "
+            "multi-channel mappings (e.g. Amazon → Amazon RKW + Amazon Seller)."
         )
 
     # Filters
@@ -729,12 +809,18 @@ def _render_acos_tacos(sb):
         st.warning("No marketing data for selected filters.")
         return
 
+    # Apply channel map to sales data: adds mkt_channel column, filters to selected mkt channels
     if has_sales:
-        sales_f = df_sales.copy()
+        sales_mapped = _apply_channel_map(df_sales, channel_map)
+        sales_f = sales_mapped.copy()
         if len(dr) == 2:
-            sales_f = sales_f[(sales_f["date"] >= pd.to_datetime(dr[0])) & (sales_f["date"] <= pd.to_datetime(dr[1]))]
+            sales_f = sales_f[
+                (sales_f["date"] >= pd.to_datetime(dr[0])) &
+                (sales_f["date"] <= pd.to_datetime(dr[1]))
+            ]
+        # Filter by selected marketing channels (using the mapped column)
         if ch_sel:
-            sales_f = sales_f[sales_f["channel"].isin(ch_sel)]
+            sales_f = sales_f[sales_f["mkt_channel"].isin(ch_sel)]
 
     # Grand KPIs
     total_spend  = mkt_f["spend"].sum()
@@ -780,6 +866,7 @@ def _render_acos_tacos(sb):
     ))
 
     if has_sales:
+        # Group sales by week using the mapped channel (already filtered to ch_sel via mkt_channel)
         sales_f["week"] = sales_f["date"].dt.to_period("W").apply(lambda p: str(p.start_time.date()))
         sales_weekly    = sales_f.groupby("week")["revenue"].sum().reset_index()
         combined        = mkt_weekly.merge(sales_weekly, on="week", how="left").fillna(0)
@@ -819,19 +906,20 @@ def _render_acos_tacos(sb):
     st.plotly_chart(fig_trend, use_container_width=True)
     st.divider()
 
-    # By Channel
+    # By Channel — join on mkt_channel so "Amazon" picks up both RKW + Seller
     st.markdown("#### 🏢 By Channel")
     ch_mkt = mkt_f.groupby("channel").agg(spend=("spend","sum"), ad_rev=("sales","sum")).reset_index()
     ch_mkt["ACOS"] = (ch_mkt["spend"] / ch_mkt["ad_rev"] * 100).round(1)
     ch_mkt["ROAS"] = (ch_mkt["ad_rev"] / ch_mkt["spend"]).round(2)
 
     if has_sales:
-        ch_sales = sales_f.groupby("channel")["revenue"].sum().reset_index()\
-                          .rename(columns={"revenue":"total_gmv"})
+        # Group sales by mkt_channel — this correctly sums Amazon RKW + Amazon Seller → Amazon
+        ch_sales = sales_f.groupby("mkt_channel")["revenue"].sum().reset_index()\
+                          .rename(columns={"mkt_channel":"channel","revenue":"total_gmv"})
         ch_comb = ch_mkt.merge(ch_sales, on="channel", how="left").fillna(0)
-        ch_comb["TACOS"]     = (ch_comb["spend"] / ch_comb["total_gmv"] * 100).round(1)
-        ch_comb["Organic%"]  = ((ch_comb["total_gmv"] - ch_comb["ad_rev"]).clip(lower=0)
-                                / ch_comb["total_gmv"] * 100).round(1)
+        ch_comb["TACOS"]    = (ch_comb["spend"] / ch_comb["total_gmv"] * 100).round(1)
+        ch_comb["Organic%"] = ((ch_comb["total_gmv"] - ch_comb["ad_rev"]).clip(lower=0)
+                               / ch_comb["total_gmv"] * 100).round(1)
         disp = ch_comb.rename(columns={
             "channel":"Channel","spend":"Ad Spend (₹)","ad_rev":"Ad Revenue (₹)",
             "total_gmv":"Total GMV (₹)","ACOS":"ACOS %","TACOS":"TACOS %",
@@ -850,7 +938,7 @@ def _render_acos_tacos(sb):
     st.dataframe(disp.style.format(fmt), hide_index=True, use_container_width=True)
     st.divider()
 
-    # By Product
+    # By Product — join on item_name = product (unchanged, product names are consistent across DBs)
     st.markdown("#### 📦 By Product")
     pr_mkt = mkt_f.groupby("product").agg(spend=("spend","sum"), ad_rev=("sales","sum")).reset_index()
     pr_mkt["ACOS"] = (pr_mkt["spend"] / pr_mkt["ad_rev"] * 100).round(1)
@@ -1018,7 +1106,7 @@ def _render_history(sb):
 
 def _render_settings(sb):
     st.subheader("⚙️ Marketing Settings")
-    s1, s2, s3 = st.tabs(["Master Data", "Mapping Manager", "Data Cleanup"])
+    s1, s2, s3, s4 = st.tabs(["Master Data", "Mapping Manager", "Channel Map", "Data Cleanup"])
 
     with s1:
         col1, col2 = st.columns(2)
@@ -1061,6 +1149,78 @@ def _render_settings(sb):
                         st.rerun()
 
     with s3:
+        st.markdown("##### 🔗 Channel Map — Marketing → Sales Channels")
+        st.caption(
+            "Map each **marketing channel** (as it appears in ad reports) to one or more "
+            "**sales channels** (as they appear in the sales dashboard).  \n"
+            "Example: **Amazon** → Amazon RKW + Amazon Seller"
+        )
+
+        # Fetch current map and available channels from both sides
+        channel_map = _get_channel_map(sb)
+        mkt_channels  = _get_channels(sb)
+        sales_sb      = _get_sales_supabase()
+
+        # Fetch sales channel names from sales DB
+        try:
+            sc_r = sales_sb.table("master_channels").select("name").execute()
+            sales_channels = sorted([x["name"] for x in sc_r.data])
+        except Exception:
+            sales_channels = []
+            st.warning("Could not load sales channels from sales DB.")
+
+        # Display current mappings
+        if channel_map:
+            st.markdown("**Current mappings:**")
+            for mkt_ch, sales_chs in sorted(channel_map.items()):
+                for sc in sales_chs:
+                    row_c1, row_c2 = st.columns([4, 1])
+                    row_c1.write(f"**{mkt_ch}** → {sc}")
+                    if row_c2.button("Remove", key=f"cmap_del_{mkt_ch}_{sc}"):
+                        if _delete_channel_map_entry(sb, mkt_ch, sc):
+                            st.success(f"Removed: {mkt_ch} → {sc}")
+                            st.rerun()
+        else:
+            st.info("No channel mappings yet. Add one below.")
+
+        st.divider()
+        st.markdown("**Add a mapping:**")
+        if not mkt_channels:
+            st.warning("No marketing channels found. Add them in the Master Data tab first.")
+        elif not sales_channels:
+            st.warning("No sales channels found in the sales DB.")
+        else:
+            cm1, cm2 = st.columns(2)
+            with cm1:
+                new_mkt_ch = st.selectbox(
+                    "Marketing channel (ad side)",
+                    mkt_channels, key="cmap_mkt_ch",
+                )
+            with cm2:
+                new_sales_ch = st.selectbox(
+                    "Sales channel (revenue side)",
+                    sales_channels, key="cmap_sales_ch",
+                )
+            if st.button("➕ Add Mapping", key="cmap_add"):
+                if _save_channel_map_entry(sb, new_mkt_ch, new_sales_ch):
+                    st.success(f"Added: **{new_mkt_ch}** → {new_sales_ch}")
+                    st.rerun()
+
+        # Preview what current map does to sales data
+        if channel_map and sales_channels:
+            with st.expander("🔍 Preview: how sales channels roll up"):
+                preview_rows = []
+                for mkt_ch, sales_chs in sorted(channel_map.items()):
+                    for sc in sales_chs:
+                        preview_rows.append({"Sales Channel": sc, "Rolls up to → ": mkt_ch})
+                # Any sales channel not in map → maps to itself
+                mapped_sales = {sc for scs in channel_map.values() for sc in scs}
+                for sc in sales_channels:
+                    if sc not in mapped_sales:
+                        preview_rows.append({"Sales Channel": sc, "Rolls up to → ": sc + " (identity)"})
+                st.dataframe(pd.DataFrame(preview_rows), hide_index=True, use_container_width=True)
+
+    with s4:
         st.markdown("##### 🗑️ Delete Performance Records")
         st.warning("This permanently removes data. Use with caution.")
         dc1, dc2 = st.columns(2)
