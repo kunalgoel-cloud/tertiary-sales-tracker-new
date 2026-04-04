@@ -7,6 +7,14 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta
 from marketing_module import render_marketing_tab
 
+def _fmt_err(e: Exception) -> str:
+    """Short readable error — strips 502 HTML bodies."""
+    msg = str(e)
+    if len(msg) > 300 or "<html" in msg.lower() or "<!doctype" in msg.lower():
+        code = "502" if "502" in msg else ("503" if "503" in msg else "server error")
+        return f"Supabase {code} — temporarily unavailable. Retry in a moment."
+    return msg[:300]
+
 # ─────────────────────────────────────────────
 # 1. CONFIG & DB CONNECTION
 # ─────────────────────────────────────────────
@@ -67,7 +75,7 @@ def get_table(table: str, default_cols: tuple) -> pd.DataFrame:
                 df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
         return df
     except Exception as e:
-        st.warning(f"Could not load '{table}': {e}")
+        st.warning(f"Could not load '{table}': {_fmt_err(e)}")
         return pd.DataFrame(columns=list(default_cols))
 
 def invalidate_data_cache():
