@@ -488,7 +488,7 @@ with tabs[1]:
             wow_pivot.style.format(
                 {c: f"{wow_prefix}{{:,.0f}}" for c in weeks_sorted}
                 | ({"WoW Change": f"{wow_prefix}{{:+,.0f}}", "WoW %": "{:+.1f}%"} if len(weeks_sorted) >= 2 else {})
-            ).applymap(
+            ).map(
                 lambda v: "color: green" if isinstance(v, (int, float)) and v > 0
                 else ("color: red" if isinstance(v, (int, float)) and v < 0 else ""),
                 subset=["WoW %", "WoW Change"] if len(weeks_sorted) >= 2 else [],
