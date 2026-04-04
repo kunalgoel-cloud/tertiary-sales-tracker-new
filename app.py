@@ -394,7 +394,7 @@ with tabs[1]:
         chan_summary = chan_rev.merge(chan_qty, on="channel")
         chan_summary["rev_%"]       = (chan_summary["revenue"] / chan_summary["revenue"].sum() * 100).round(1)
         chan_summary["avg_rev/day"] = (chan_summary["revenue"] / dd_days).round(0)
-        chan_summary["avg_price"]   = (chan_summary["revenue"] / chan_summary["qty_sold"].where(chan_summary["qty_sold"] > 0)).round(1)
+        chan_summary["avg_price"]   = pd.to_numeric(chan_summary["revenue"] / chan_summary["qty_sold"].where(chan_summary["qty_sold"] > 0), errors="coerce").round(1)
         chan_summary.columns        = ["Channel", "Revenue (₹)", "Units Sold", "Rev Share %", "DRR (₹)", "Avg Price (₹)"]
         st.dataframe(
             chan_summary.style.format({
@@ -420,7 +420,7 @@ with tabs[1]:
             .sort_values("revenue", ascending=False)
         )
         sku_perf["rev_%"]       = (sku_perf["revenue"] / sku_perf["revenue"].sum() * 100).round(1)
-        sku_perf["avg_price"]   = (sku_perf["revenue"] / sku_perf["qty_sold"].where(sku_perf["qty_sold"] > 0)).round(1)
+        sku_perf["avg_price"]   = pd.to_numeric(sku_perf["revenue"] / sku_perf["qty_sold"].where(sku_perf["qty_sold"] > 0), errors="coerce").round(1)
         sku_perf["drr"]         = (sku_perf["revenue"] / dd_days).round(0)
         sku_perf["status"]      = sku_perf["revenue"].apply(
             lambda r: "🔴 Dead" if r == 0 else ("🟡 Slow" if r < sku_perf["revenue"].mean() * 0.3 else "🟢 Active")
