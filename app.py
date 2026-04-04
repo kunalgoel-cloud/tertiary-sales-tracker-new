@@ -212,18 +212,23 @@ with tabs[0]:
             index=3,
         )
 
+        # Cap end_date at the latest date with actual data to avoid
+        # diluting DRR with today (which has no sales data yet)
+        last_data_date = history_df["date_dt"].max().date()
+        effective_end  = min(today, last_data_date)
+
         if time_preset == "Last 7 Days":
-            start_date, end_date = today - timedelta(days=6), today
+            start_date, end_date = effective_end - timedelta(days=6), effective_end
         elif time_preset == "Last 30 Days":
-            start_date, end_date = today - timedelta(days=29), today
+            start_date, end_date = effective_end - timedelta(days=29), effective_end
         elif time_preset == "Month to Date":
-            start_date, end_date = today.replace(day=1), today
+            start_date, end_date = effective_end.replace(day=1), effective_end
         elif time_preset == "All Time":
             start_date = history_df["date_dt"].min().date()
-            end_date   = history_df["date_dt"].max().date()
+            end_date   = last_data_date
         else:
-            dr = st.date_input("Range", value=(history_df["date_dt"].min().date(), today))
-            start_date, end_date = (dr[0], dr[1]) if len(dr) == 2 else (today, today)
+            dr = st.date_input("Range", value=(history_df["date_dt"].min().date(), effective_end))
+            start_date, end_date = (dr[0], dr[1]) if len(dr) == 2 else (effective_end, effective_end)
 
         mask     = (history_df["date_dt"].dt.date >= start_date) & (history_df["date_dt"].dt.date <= end_date)
         range_df = history_df[mask].copy()
@@ -312,18 +317,21 @@ with tabs[1]:
                 index=3,
                 key="dd_period",
             )
+        last_data_date_dd = history_df["date_dt"].max().date()
+        effective_end_dd  = min(today_dd, last_data_date_dd)
+
         if dd_preset == "Last 7 Days":
-            dd_start, dd_end = today_dd - timedelta(days=6), today_dd
+            dd_start, dd_end = effective_end_dd - timedelta(days=6), effective_end_dd
         elif dd_preset == "Last 30 Days":
-            dd_start, dd_end = today_dd - timedelta(days=29), today_dd
+            dd_start, dd_end = effective_end_dd - timedelta(days=29), effective_end_dd
         elif dd_preset == "Month to Date":
-            dd_start, dd_end = today_dd.replace(day=1), today_dd
+            dd_start, dd_end = effective_end_dd.replace(day=1), effective_end_dd
         elif dd_preset == "All Time":
             dd_start = history_df["date_dt"].min().date()
-            dd_end   = history_df["date_dt"].max().date()
+            dd_end   = last_data_date_dd
         else:
-            dd_dr = st.date_input("Custom Range", value=(history_df["date_dt"].min().date(), today_dd), key="dd_range")
-            dd_start, dd_end = (dd_dr[0], dd_dr[1]) if len(dd_dr) == 2 else (today_dd, today_dd)
+            dd_dr = st.date_input("Custom Range", value=(history_df["date_dt"].min().date(), effective_end_dd), key="dd_range")
+            dd_start, dd_end = (dd_dr[0], dd_dr[1]) if len(dd_dr) == 2 else (effective_end_dd, effective_end_dd)
 
         dd_mask = (history_df["date_dt"].dt.date >= dd_start) & (history_df["date_dt"].dt.date <= dd_end)
         dd_df   = history_df[dd_mask].copy()
@@ -386,7 +394,7 @@ with tabs[1]:
         chan_summary = chan_rev.merge(chan_qty, on="channel")
         chan_summary["rev_%"]       = (chan_summary["revenue"] / chan_summary["revenue"].sum() * 100).round(1)
         chan_summary["avg_rev/day"] = (chan_summary["revenue"] / dd_days).round(0)
-        chan_summary["avg_price"]   = (chan_summary["revenue"] / chan_summary["qty_sold"].replace(0, pd.NA)).round(1)
+        chan_summary["avg_price"]   = (chan_summary["revenue"] / chan_summary["qty_sold"].where(chan_summary["qty_sold"] > 0)).round(1)
         chan_summary.columns        = ["Channel", "Revenue (₹)", "Units Sold", "Rev Share %", "DRR (₹)", "Avg Price (₹)"]
         st.dataframe(
             chan_summary.style.format({
@@ -412,7 +420,7 @@ with tabs[1]:
             .sort_values("revenue", ascending=False)
         )
         sku_perf["rev_%"]       = (sku_perf["revenue"] / sku_perf["revenue"].sum() * 100).round(1)
-        sku_perf["avg_price"]   = (sku_perf["revenue"] / sku_perf["qty_sold"].replace(0, pd.NA)).round(1)
+        sku_perf["avg_price"]   = (sku_perf["revenue"] / sku_perf["qty_sold"].where(sku_perf["qty_sold"] > 0)).round(1)
         sku_perf["drr"]         = (sku_perf["revenue"] / dd_days).round(0)
         sku_perf["status"]      = sku_perf["revenue"].apply(
             lambda r: "🔴 Dead" if r == 0 else ("🟡 Slow" if r < sku_perf["revenue"].mean() * 0.3 else "🟢 Active")
@@ -481,7 +489,7 @@ with tabs[1]:
             prev_w  = weeks_sorted[-2]
             wow_pivot["WoW Change"] = wow_pivot[last_w] - wow_pivot[prev_w]
             wow_pivot["WoW %"]      = (
-                (wow_pivot["WoW Change"] / wow_pivot[prev_w].replace(0, pd.NA)) * 100
+                (wow_pivot["WoW Change"] / wow_pivot[prev_w].where(wow_pivot[prev_w] != 0)) * 100
             ).round(1)
 
         st.dataframe(
