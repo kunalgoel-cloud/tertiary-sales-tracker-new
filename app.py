@@ -3,6 +3,7 @@ import pandas as pd
 from supabase import create_client, Client
 import re
 import plotly.express as px
+import plotly.graph_objects as go
 from datetime import datetime, timedelta
 
 # ─────────────────────────────────────────────
@@ -72,13 +73,9 @@ def invalidate_data_cache():
     get_table.clear()
 
 # ─────────────────────────────────────────────
-# 3. AUTHENTICATION  (passwords via secrets only)
+# 3. AUTHENTICATION
 # ─────────────────────────────────────────────
 def check_auth() -> bool:
-    """
-    Passwords are read from st.secrets to avoid hardcoding credentials.
-    Expected secrets keys: ADMIN_PASSWORD, VIEWER_PASSWORD
-    """
     if "authenticated" not in st.session_state:
         st.title("🔐 Mamanourish Sales Portal")
         role_choice = st.selectbox("I am a…", ["Select Role", "Admin (Full Access)", "Viewer (View Only)"])
@@ -86,7 +83,7 @@ def check_auth() -> bool:
 
         if st.button("Login"):
             try:
-                admin_pw = st.secrets["ADMIN_PASSWORD"]
+                admin_pw  = st.secrets["ADMIN_PASSWORD"]
                 viewer_pw = st.secrets["VIEWER_PASSWORD"]
             except KeyError:
                 st.error("ADMIN_PASSWORD / VIEWER_PASSWORD not set in Streamlit Secrets.")
@@ -113,10 +110,10 @@ if not check_auth():
 
 role: str = st.session_state["role"]
 
-history_df   = get_table("sales",           ("id", "date", "channel", "item_name", "qty_sold", "revenue"))
-master_skus  = get_table("master_skus",     ("name",))
-master_chans = get_table("master_channels", ("name",))
-item_map_df  = get_table("item_map",        ("raw_name", "master_name"))
+history_df  = get_table("sales",           ("id", "date", "channel", "item_name", "qty_sold", "revenue"))
+master_skus  = get_table("master_skus",    ("name",))
+master_chans = get_table("master_channels",("name",))
+item_map_df  = get_table("item_map",       ("raw_name", "master_name"))
 
 # ─────────────────────────────────────────────
 # SIDEBAR
@@ -176,12 +173,12 @@ with st.sidebar:
 # TABS
 # ─────────────────────────────────────────────
 if role == "admin":
-    tabs = st.tabs(["📊 Trend Analytics", "📤 Smart Upload", "🛠 Configuration"])
+    tabs = st.tabs(["📊 Trend Analytics", "🔬 Deep Dive", "📤 Smart Upload", "🛠 Configuration"])
 else:
-    tabs = st.tabs(["📊 Analytics"])
+    tabs = st.tabs(["📊 Trend Analytics", "🔬 Deep Dive"])
 
 # ══════════════════════════════════════════════
-# TAB 1 – ANALYTICS
+# TAB 1 – TREND ANALYTICS  (unchanged)
 # ══════════════════════════════════════════════
 with tabs[0]:
     if history_df.empty:
@@ -290,10 +287,363 @@ with tabs[0]:
             st.dataframe(filtered[display_cols], hide_index=True)
 
 # ══════════════════════════════════════════════
-# TAB 2 – SMART UPLOAD  (admin only)
+# TAB 2 – DEEP DIVE  (new)
+# ══════════════════════════════════════════════
+with tabs[1]:
+    if history_df.empty:
+        st.info("No data found. Admin must upload sales data first.")
+    else:
+        # Ensure date column is parsed (re-do in case tab 1 was skipped)
+        if "date_dt" not in history_df.columns:
+            history_df["date_dt"] = pd.to_datetime(history_df["date"], errors="coerce")
+            history_df = history_df.dropna(subset=["date_dt"])
+
+        st.subheader("🔬 Deep Dive Analytics")
+
+        # ── Shared filters for this tab ───────────────────────────────
+        today_dd = datetime.now().date()
+        dd_col1, dd_col2 = st.columns([3, 1])
+        with dd_col1:
+            dd_preset = st.radio(
+                "Period:",
+                ["Last 7 Days", "Last 30 Days", "Month to Date", "All Time", "Custom"],
+                horizontal=True,
+                index=3,
+                key="dd_period",
+            )
+        if dd_preset == "Last 7 Days":
+            dd_start, dd_end = today_dd - timedelta(days=6), today_dd
+        elif dd_preset == "Last 30 Days":
+            dd_start, dd_end = today_dd - timedelta(days=29), today_dd
+        elif dd_preset == "Month to Date":
+            dd_start, dd_end = today_dd.replace(day=1), today_dd
+        elif dd_preset == "All Time":
+            dd_start = history_df["date_dt"].min().date()
+            dd_end   = history_df["date_dt"].max().date()
+        else:
+            dd_dr = st.date_input("Custom Range", value=(history_df["date_dt"].min().date(), today_dd), key="dd_range")
+            dd_start, dd_end = (dd_dr[0], dd_dr[1]) if len(dd_dr) == 2 else (today_dd, today_dd)
+
+        dd_mask = (history_df["date_dt"].dt.date >= dd_start) & (history_df["date_dt"].dt.date <= dd_end)
+        dd_df   = history_df[dd_mask].copy()
+
+        if dd_df.empty:
+            st.warning("No data in the selected period.")
+            st.stop()
+
+        dd_days = max((dd_end - dd_start).days + 1, 1)
+        dd_df["week_label"] = dd_df["date_dt"].dt.to_period("W").apply(lambda p: str(p.start_time.date()))
+        dd_df["dow"]        = dd_df["date_dt"].dt.day_name()
+
+        st.divider()
+
+        # ════════════════════════════════
+        # VIEW 1 — Channel Mix Donut
+        # ════════════════════════════════
+        st.markdown("### 🍩 Channel Revenue Mix")
+        st.caption("What % of total revenue comes from each platform — spot platform concentration risk at a glance.")
+
+        chan_rev = dd_df.groupby("channel")["revenue"].sum().reset_index().sort_values("revenue", ascending=False)
+        chan_qty = dd_df.groupby("channel")["qty_sold"].sum().reset_index().sort_values("qty_sold", ascending=False)
+
+        donut_c1, donut_c2 = st.columns(2)
+
+        with donut_c1:
+            fig_donut_rev = px.pie(
+                chan_rev, values="revenue", names="channel",
+                hole=0.55, height=380,
+                title="By Revenue (₹)",
+                color_discrete_sequence=px.colors.qualitative.Bold,
+            )
+            fig_donut_rev.update_traces(textinfo="label+percent", textposition="outside")
+            fig_donut_rev.update_layout(showlegend=False, margin=dict(t=50, b=10, l=10, r=10))
+            # Centre annotation
+            total_rev = chan_rev["revenue"].sum()
+            fig_donut_rev.add_annotation(
+                text=f"₹{total_rev/1000:.1f}K", x=0.5, y=0.5,
+                font=dict(size=18, color="black"), showarrow=False,
+            )
+            st.plotly_chart(fig_donut_rev, use_container_width=True)
+
+        with donut_c2:
+            fig_donut_qty = px.pie(
+                chan_qty, values="qty_sold", names="channel",
+                hole=0.55, height=380,
+                title="By Units Sold",
+                color_discrete_sequence=px.colors.qualitative.Bold,
+            )
+            fig_donut_qty.update_traces(textinfo="label+percent", textposition="outside")
+            fig_donut_qty.update_layout(showlegend=False, margin=dict(t=50, b=10, l=10, r=10))
+            total_qty = chan_qty["qty_sold"].sum()
+            fig_donut_qty.add_annotation(
+                text=f"{total_qty:,.0f} units", x=0.5, y=0.5,
+                font=dict(size=14, color="black"), showarrow=False,
+            )
+            st.plotly_chart(fig_donut_qty, use_container_width=True)
+
+        # Channel mix summary table
+        chan_summary = chan_rev.merge(chan_qty, on="channel")
+        chan_summary["rev_%"]       = (chan_summary["revenue"] / chan_summary["revenue"].sum() * 100).round(1)
+        chan_summary["avg_rev/day"] = (chan_summary["revenue"] / dd_days).round(0)
+        chan_summary["avg_price"]   = (chan_summary["revenue"] / chan_summary["qty_sold"].replace(0, pd.NA)).round(1)
+        chan_summary.columns        = ["Channel", "Revenue (₹)", "Units Sold", "Rev Share %", "DRR (₹)", "Avg Price (₹)"]
+        st.dataframe(
+            chan_summary.style.format({
+                "Revenue (₹)": "₹{:,.0f}", "Units Sold": "{:,.0f}",
+                "Rev Share %": "{:.1f}%",  "DRR (₹)": "₹{:,.0f}",
+                "Avg Price (₹)": "₹{:.1f}",
+            }),
+            hide_index=True, use_container_width=True,
+        )
+
+        st.divider()
+
+        # ════════════════════════════════
+        # VIEW 2 — SKU Performance Table
+        # ════════════════════════════════
+        st.markdown("### 🏆 SKU Performance Ranking")
+        st.caption("Which products are driving the business — and which need attention.")
+
+        sku_perf = (
+            dd_df.groupby("item_name")
+            .agg(revenue=("revenue", "sum"), qty_sold=("qty_sold", "sum"))
+            .reset_index()
+            .sort_values("revenue", ascending=False)
+        )
+        sku_perf["rev_%"]       = (sku_perf["revenue"] / sku_perf["revenue"].sum() * 100).round(1)
+        sku_perf["avg_price"]   = (sku_perf["revenue"] / sku_perf["qty_sold"].replace(0, pd.NA)).round(1)
+        sku_perf["drr"]         = (sku_perf["revenue"] / dd_days).round(0)
+        sku_perf["status"]      = sku_perf["revenue"].apply(
+            lambda r: "🔴 Dead" if r == 0 else ("🟡 Slow" if r < sku_perf["revenue"].mean() * 0.3 else "🟢 Active")
+        )
+
+        # Horizontal bar chart
+        fig_sku = px.bar(
+            sku_perf.sort_values("revenue"),
+            x="revenue", y="item_name",
+            orientation="h", height=max(350, len(sku_perf) * 45),
+            color="rev_%",
+            color_continuous_scale="Blues",
+            labels={"revenue": "Revenue (₹)", "item_name": ""},
+            text=sku_perf.sort_values("revenue")["revenue"].apply(lambda x: f"₹{x:,.0f}"),
+        )
+        fig_sku.update_traces(textposition="outside")
+        fig_sku.update_layout(coloraxis_showscale=False, margin=dict(l=10, r=80, t=20, b=20))
+        st.plotly_chart(fig_sku, use_container_width=True)
+
+        sku_perf.columns = ["SKU", "Revenue (₹)", "Units", "Rev Share %", "Avg Price (₹)", "DRR (₹)", "Status"]
+        st.dataframe(
+            sku_perf.style.format({
+                "Revenue (₹)": "₹{:,.0f}", "Units": "{:,.0f}",
+                "Rev Share %": "{:.1f}%",   "Avg Price (₹)": "₹{:.1f}",
+                "DRR (₹)":     "₹{:,.0f}",
+            }),
+            hide_index=True, use_container_width=True,
+        )
+
+        st.divider()
+
+        # ════════════════════════════════
+        # VIEW 3 — Week-over-Week Trend
+        # ════════════════════════════════
+        st.markdown("### 📈 Week-over-Week Performance")
+        st.caption("Are we growing or declining? WoW change per channel reveals momentum shifts.")
+
+        wow_metric = st.radio("WoW Metric:", ["Revenue (₹)", "Quantity (Units)"], horizontal=True, key="wow_metric")
+        wow_col    = "revenue" if "Revenue" in wow_metric else "qty_sold"
+        wow_prefix = "₹" if "Revenue" in wow_metric else ""
+
+        weekly = (
+            dd_df.groupby(["week_label", "channel"])[wow_col]
+            .sum()
+            .reset_index()
+            .sort_values("week_label")
+        )
+
+        fig_wow = px.line(
+            weekly, x="week_label", y=wow_col, color="channel",
+            markers=True, height=420,
+            labels={"week_label": "Week Starting", wow_col: wow_metric},
+            color_discrete_sequence=px.colors.qualitative.Bold,
+        )
+        fig_wow.update_traces(line_width=2.5, marker_size=8)
+        fig_wow.update_layout(xaxis_title="Week", hovermode="x unified")
+        st.plotly_chart(fig_wow, use_container_width=True)
+
+        # WoW change table — pivot weeks as columns
+        wow_pivot = weekly.pivot_table(index="channel", columns="week_label", values=wow_col, aggfunc="sum").fillna(0)
+        weeks_sorted = sorted(wow_pivot.columns)
+        wow_pivot    = wow_pivot[weeks_sorted]
+
+        if len(weeks_sorted) >= 2:
+            last_w  = weeks_sorted[-1]
+            prev_w  = weeks_sorted[-2]
+            wow_pivot["WoW Change"] = wow_pivot[last_w] - wow_pivot[prev_w]
+            wow_pivot["WoW %"]      = (
+                (wow_pivot["WoW Change"] / wow_pivot[prev_w].replace(0, pd.NA)) * 100
+            ).round(1)
+
+        st.dataframe(
+            wow_pivot.style.format(
+                {c: f"{wow_prefix}{{:,.0f}}" for c in weeks_sorted}
+                | ({"WoW Change": f"{wow_prefix}{{:+,.0f}}", "WoW %": "{:+.1f}%"} if len(weeks_sorted) >= 2 else {})
+            ).applymap(
+                lambda v: "color: green" if isinstance(v, (int, float)) and v > 0
+                else ("color: red" if isinstance(v, (int, float)) and v < 0 else ""),
+                subset=["WoW %", "WoW Change"] if len(weeks_sorted) >= 2 else [],
+            ),
+            use_container_width=True,
+        )
+
+        st.divider()
+
+        # ════════════════════════════════
+        # VIEW 4 — Day-of-Week Heatmap
+        # ════════════════════════════════
+        st.markdown("### 🗓️ Day-of-Week Revenue Heatmap")
+        st.caption("When do customers buy? Use this to time promotions and ensure stock is ready on peak days.")
+
+        dow_metric = st.radio("Heatmap Metric:", ["Revenue (₹)", "Quantity (Units)"], horizontal=True, key="dow_metric")
+        dow_col    = "revenue" if "Revenue" in dow_metric else "qty_sold"
+
+        dow_order  = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+        avail_chans_dd = sorted(dd_df["channel"].unique())
+        dow_chan_sel   = st.multiselect(
+            "Channels to include:", avail_chans_dd, default=avail_chans_dd, key="dow_chan"
+        )
+
+        dow_filtered = dd_df[dd_df["channel"].isin(dow_chan_sel)]
+        dow_pivot    = (
+            dow_filtered.groupby(["channel", "dow"])[dow_col]
+            .sum()
+            .reset_index()
+            .pivot(index="channel", columns="dow", values=dow_col)
+            .reindex(columns=[d for d in dow_order if d in dd_df["dow"].unique()])
+            .fillna(0)
+        )
+
+        fig_heat = go.Figure(
+            data=go.Heatmap(
+                z=dow_pivot.values,
+                x=dow_pivot.columns.tolist(),
+                y=dow_pivot.index.tolist(),
+                colorscale="Blues",
+                text=[[f"{'₹' if dow_col=='revenue' else ''}{v:,.0f}" for v in row] for row in dow_pivot.values],
+                texttemplate="%{text}",
+                showscale=True,
+            )
+        )
+        fig_heat.update_layout(
+            height=max(250, len(dow_pivot) * 60 + 100),
+            xaxis_title="Day of Week",
+            yaxis_title="Channel",
+            margin=dict(l=10, r=10, t=20, b=20),
+        )
+        st.plotly_chart(fig_heat, use_container_width=True)
+
+        # Best/worst day callout
+        if not dow_pivot.empty:
+            day_totals  = dow_pivot.sum()
+            best_day    = day_totals.idxmax()
+            worst_day   = day_totals.idxmin()
+            hw1, hw2    = st.columns(2)
+            hw1.success(f"📈 **Best day:** {best_day} — avg {'₹' if dow_col=='revenue' else ''}{day_totals[best_day]/max(len(dd_df['date_dt'].dt.isocalendar().week.unique()),1):,.0f}/week")
+            hw2.warning(f"📉 **Weakest day:** {worst_day} — avg {'₹' if dow_col=='revenue' else ''}{day_totals[worst_day]/max(len(dd_df['date_dt'].dt.isocalendar().week.unique()),1):,.0f}/week")
+
+        st.divider()
+
+        # ════════════════════════════════
+        # VIEW 5 — SKU × Channel Matrix
+        # ════════════════════════════════
+        st.markdown("### 📦 SKU × Channel Revenue Matrix")
+        st.caption("Where is each product actually selling? Blank cells = not listed or zero sales on that platform.")
+
+        matrix_metric = st.radio("Matrix Metric:", ["Revenue (₹)", "Quantity (Units)"], horizontal=True, key="matrix_metric")
+        mat_col       = "revenue" if "Revenue" in matrix_metric else "qty_sold"
+
+        sku_chan = (
+            dd_df.groupby(["item_name", "channel"])[mat_col]
+            .sum()
+            .reset_index()
+            .pivot(index="item_name", columns="channel", values=mat_col)
+            .fillna(0)
+        )
+        sku_chan["TOTAL"] = sku_chan.sum(axis=1)
+        sku_chan = sku_chan.sort_values("TOTAL", ascending=False)
+
+        fig_matrix = go.Figure(
+            data=go.Heatmap(
+                z=sku_chan.drop(columns="TOTAL").values,
+                x=sku_chan.drop(columns="TOTAL").columns.tolist(),
+                y=sku_chan.index.tolist(),
+                colorscale="Greens",
+                text=[[f"{'₹' if mat_col=='revenue' else ''}{v:,.0f}" if v > 0 else "—" for v in row]
+                      for row in sku_chan.drop(columns="TOTAL").values],
+                texttemplate="%{text}",
+                showscale=True,
+            )
+        )
+        fig_matrix.update_layout(
+            height=max(300, len(sku_chan) * 50 + 100),
+            xaxis_title="Channel",
+            yaxis_title="",
+            margin=dict(l=10, r=10, t=20, b=20),
+        )
+        st.plotly_chart(fig_matrix, use_container_width=True)
+
+        # Distribution gap alert
+        zero_combos = []
+        for sku in sku_chan.index:
+            for chan in sku_chan.drop(columns="TOTAL").columns:
+                if sku_chan.loc[sku, chan] == 0:
+                    zero_combos.append(f"**{sku}** on {chan}")
+        if zero_combos:
+            with st.expander(f"⚠️ {len(zero_combos)} distribution gaps (zero sales combos)"):
+                for z in zero_combos:
+                    st.write(f"• {z}")
+
+        st.divider()
+
+        # ════════════════════════════════
+        # VIEW 6 — Zero-Sales Alert Panel
+        # ════════════════════════════════
+        st.markdown("### ⚠️ Ops Health Check")
+        st.caption("SKUs with no sales in the last 7 days, and channels with no recent data uploads.")
+
+        alert_cutoff   = today_dd - timedelta(days=7)
+        recent_df      = history_df[history_df["date_dt"].dt.date >= alert_cutoff]
+
+        alert_col1, alert_col2 = st.columns(2)
+
+        with alert_col1:
+            st.markdown("**🔴 SKUs with zero sales (last 7 days)**")
+            all_skus       = set(history_df["item_name"].unique())
+            active_skus    = set(recent_df[recent_df["revenue"] > 0]["item_name"].unique())
+            dead_skus      = sorted(all_skus - active_skus)
+            if dead_skus:
+                for sku in dead_skus:
+                    st.error(f"• {sku}")
+            else:
+                st.success("All SKUs had sales in the last 7 days ✅")
+
+        with alert_col2:
+            st.markdown("**🟡 Channels with no data in last 3 days**")
+            stale_cutoff   = today_dd - timedelta(days=3)
+            all_channels   = set(history_df["channel"].unique())
+            fresh_channels = set(history_df[history_df["date_dt"].dt.date >= stale_cutoff]["channel"].unique())
+            stale_channels = sorted(all_channels - fresh_channels)
+            if stale_channels:
+                for ch in stale_channels:
+                    last_seen = history_df[history_df["channel"] == ch]["date_dt"].max().date()
+                    st.warning(f"• {ch} — last data: {last_seen}")
+            else:
+                st.success("All channels have recent data ✅")
+
+# ══════════════════════════════════════════════
+# TAB 3 – SMART UPLOAD  (admin only, index shifts by 1)
 # ══════════════════════════════════════════════
 if role == "admin":
-    with tabs[1]:
+    with tabs[2]:
         st.subheader("Upload Sales Report")
 
         channels = master_chans["name"].tolist() if not master_chans.empty else []
@@ -328,7 +678,7 @@ if role == "admin":
                 q_col = st.selectbox("Qty Column *",     cols, key="q_col")
                 r_col = st.selectbox("Revenue Column *", cols, key="r_col")
             with c3:
-                d_col     = st.selectbox("Date Column (or use manual date below)", cols, key="d_col")
+                d_col      = st.selectbox("Date Column (or use manual date below)", cols, key="d_col")
                 fixed_date = st.date_input("Manual Date (used if no date column)", key="fixed_date")
 
             # Validate mandatory column picks
@@ -349,8 +699,8 @@ if role == "admin":
 
             # ── Filter out totals rows ──────────────────────────────────────
             SKIP_LABELS = {"total", "grand total", "subtotal", "nan", ""}
-            valid_mask = ~work_df["__prod__"].str.lower().isin(SKIP_LABELS)
-            work_df    = work_df[valid_mask].copy()
+            valid_mask  = ~work_df["__prod__"].str.lower().isin(SKIP_LABELS)
+            work_df     = work_df[valid_mask].copy()
 
             if work_df.empty:
                 st.error("No valid data rows found after filtering. Check column mapping.")
@@ -366,15 +716,14 @@ if role == "admin":
             unique_keys = sorted(work_df["m_key"].unique())
             sku_map: dict[str, str] = {}
 
-            # Pre-populate from saved mappings
             saved_map: dict[str, str] = {}
             if not item_map_df.empty:
                 saved_map = dict(zip(item_map_df["raw_name"], item_map_df["master_name"]))
 
             for k in unique_keys:
-                saved = saved_map.get(k, "")
+                saved       = saved_map.get(k, "")
                 default_idx = masters.index(saved) if saved in masters else 0
-                sku_map[k] = st.selectbox(
+                sku_map[k]  = st.selectbox(
                     f"Map: `{k}`",
                     masters,
                     index=default_idx,
@@ -392,7 +741,7 @@ if role == "admin":
                     except Exception:
                         return f"⚠️ unparseable: {val}"
 
-                sample_dates = work_df[d_col].dropna().unique()[:5]
+                sample_dates   = work_df[d_col].dropna().unique()[:5]
                 parsed_preview = [preview_date(d) for d in sample_dates]
                 st.info(f"📅 **Date column preview** — raw: `{sample_dates[0]}` → parsed as: `{parsed_preview[0]}`")
                 if any("unparseable" in str(p) for p in parsed_preview):
@@ -415,10 +764,8 @@ if role == "admin":
                 with st.spinner("Processing rows…"):
                     raw_rows = []
                     for _, r in work_df.iterrows():
-                        # Resolve date — handles plain dates AND range strings like "20260402 - 20260402"
                         if d_col != "None":
                             raw_date_val = str(r[d_col]).strip()
-                            # If it looks like a range (contains " - "), extract the start date
                             if " - " in raw_date_val:
                                 raw_date_val = raw_date_val.split(" - ")[0].strip()
                             try:
@@ -449,16 +796,14 @@ if role == "admin":
 
                 with st.spinner(f"Uploading {len(final_df)} records to Supabase…"):
                     try:
-                        # Insert in chunks to avoid request-size limits
-                        CHUNK = 500
+                        CHUNK   = 500
                         records = final_df.to_dict(orient="records")
                         for i in range(0, len(records), CHUNK):
                             chunk = records[i : i + CHUNK]
-                            res = supabase.table("sales").upsert(
+                            res   = supabase.table("sales").upsert(
                                 chunk,
                                 on_conflict="date,channel,item_name",
                             ).execute()
-                            # Supabase SDK raises on HTTP errors; explicit check:
                             if hasattr(res, "error") and res.error:
                                 errors.append(f"Upsert chunk {i//CHUNK+1} error: {res.error}")
                     except Exception as e:
@@ -478,9 +823,9 @@ if role == "admin":
                     st.rerun()
 
     # ══════════════════════════════════════════
-    # TAB 3 – CONFIGURATION  (admin only)
+    # TAB 4 – CONFIGURATION  (admin only)
     # ══════════════════════════════════════════
-    with tabs[2]:
+    with tabs[3]:
         st.subheader("⚙️ System Configuration")
         sc1, sc2 = st.columns(2)
 
