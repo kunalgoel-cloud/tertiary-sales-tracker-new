@@ -461,7 +461,7 @@ def _render_dashboard(sb):
         ch_sum = (
             f_df.groupby("channel").agg(spend=("spend","sum"), sales=("sales","sum"))
             .assign(ROAS=lambda x: x.sales / x.spend,
-                    ACOS=lambda x: (x.spend / x.sales * 100).round(1))
+                    ACOS=lambda x: pd.to_numeric(x.spend / x.sales.where(x.sales > 0) * 100, errors="coerce").round(1))
             .sort_values("spend", ascending=False)
         )
         st.dataframe(ch_sum.style.format({"spend":"₹{:,.2f}", "sales":"₹{:,.2f}",
@@ -472,7 +472,7 @@ def _render_dashboard(sb):
         pr_sum = (
             f_df.groupby("product").agg(spend=("spend","sum"), sales=("sales","sum"))
             .assign(ROAS=lambda x: x.sales / x.spend,
-                    ACOS=lambda x: (x.spend / x.sales * 100).round(1))
+                    ACOS=lambda x: pd.to_numeric(x.spend / x.sales.where(x.sales > 0) * 100, errors="coerce").round(1))
             .sort_values("spend", ascending=False)
         )
         st.dataframe(pr_sum.style.format({"spend":"₹{:,.2f}", "sales":"₹{:,.2f}",
@@ -484,7 +484,7 @@ def _render_dashboard(sb):
     cp_tab = (
         f_df.groupby(["channel","campaign"]).agg(spend=("spend","sum"), sales=("sales","sum"))
         .assign(ROAS=lambda x: x.sales / x.spend,
-                ACOS=lambda x: (x.spend / x.sales * 100).round(1))
+                ACOS=lambda x: pd.to_numeric(x.spend / x.sales.where(x.sales > 0) * 100, errors="coerce").round(1))
         .reset_index().sort_values("spend", ascending=False)
     )
     st.dataframe(
@@ -496,8 +496,8 @@ def _render_dashboard(sb):
     st.divider()
     st.markdown("#### 📅 Date-wise Detail")
     detail = f_df[["date","channel","product","campaign","spend","sales"]].copy()
-    detail["ROAS"] = (detail["sales"] / detail["spend"]).round(2)
-    detail["ACOS"] = (detail["spend"] / detail["sales"] * 100).round(1)
+    detail["ROAS"] = pd.to_numeric(detail["sales"] / detail["spend"].where(detail["spend"] > 0), errors="coerce").round(2)
+    detail["ACOS"] = pd.to_numeric(detail["spend"] / detail["sales"].where(detail["sales"] > 0) * 100, errors="coerce").round(1)
     detail["date"] = detail["date"].dt.strftime("%Y-%m-%d")
     detail = detail.sort_values("date", ascending=False)
     detail.columns = ["Date","Channel","Product","Campaign","Spend (₹)","Ad Revenue (₹)","ROAS","ACOS %"]
@@ -588,8 +588,8 @@ def _render_deep_dive(sb):
         prod_sum = (
             f_df.groupby("product").agg(spend=("spend","sum"), ad_revenue=("sales","sum")).reset_index()
         )
-        prod_sum["ROAS"]      = (prod_sum["ad_revenue"] / prod_sum["spend"]).round(2)
-        prod_sum["ACOS%"]     = (prod_sum["spend"] / prod_sum["ad_revenue"] * 100).round(1)
+        prod_sum["ROAS"]      = pd.to_numeric(prod_sum["ad_revenue"] / prod_sum["spend"].where(prod_sum["spend"] > 0), errors="coerce").round(2)
+        prod_sum["ACOS%"]     = pd.to_numeric(prod_sum["spend"] / prod_sum["ad_revenue"].where(prod_sum["ad_revenue"] > 0) * 100, errors="coerce").round(1)
         prod_sum["daily_spend"] = (prod_sum["spend"] / dd_days).round(0)
         prod_sum["status"]    = prod_sum["ROAS"].apply(
             lambda r: "🟢 Efficient" if r >= 3 else ("🟡 Marginal" if r >= 1 else "🔴 Loss-making")
@@ -702,7 +702,7 @@ def _render_deep_dive(sb):
             .agg(spend=("spend","sum"), sales=("sales","sum")).reset_index()
         )
         weekly["ROAS"] = weekly["sales"] / weekly["spend"]
-        weekly["ACOS"] = (weekly["spend"] / weekly["sales"] * 100).round(1)
+        weekly["ACOS"] = pd.to_numeric(weekly["spend"] / weekly["sales"].where(weekly["sales"] > 0) * 100, errors="coerce").round(1)
 
         wow_metric = st.radio("Metric:", ["ROAS", "ACOS %"], horizontal=True, key="dd_wow_metric")
         y_col = "ROAS" if wow_metric == "ROAS" else "ACOS"
@@ -917,7 +917,7 @@ def _render_acos_tacos(sb):
     st.markdown("#### 📈 Weekly ACOS vs TACOS Trend")
     mkt_f["week"] = mkt_f["date"].dt.to_period("W").apply(lambda p: str(p.start_time.date()))
     mkt_weekly = mkt_f.groupby("week").agg(spend=("spend","sum"), ad_rev=("sales","sum")).reset_index()
-    mkt_weekly["ACOS"] = (mkt_weekly["spend"] / mkt_weekly["ad_rev"] * 100).round(1)
+    mkt_weekly["ACOS"] = pd.to_numeric(mkt_weekly["spend"] / mkt_weekly["ad_rev"].where(mkt_weekly["ad_rev"] > 0) * 100, errors="coerce").round(1)
 
     fig_trend = go.Figure()
     fig_trend.add_trace(go.Bar(
@@ -930,9 +930,9 @@ def _render_acos_tacos(sb):
         sales_all["week"]  = sales_all["date"].dt.to_period("W").apply(lambda p: str(p.start_time.date()))
         sales_weekly       = sales_all.groupby("week")["revenue"].sum().reset_index()
         combined           = mkt_weekly.merge(sales_weekly, on="week", how="left").fillna(0)
-        combined["TACOS"]    = (combined["spend"] / combined["revenue"].where(combined["revenue"] > 0) * 100).round(1)
+        combined["TACOS"]    = pd.to_numeric(combined["spend"] / combined["revenue"].where(combined["revenue"] > 0) * 100, errors="coerce").round(1)
         combined["organic"]  = (combined["revenue"] - combined["ad_rev"]).clip(lower=0)
-        combined["organic%"] = (combined["organic"] / combined["revenue"].where(combined["revenue"] > 0) * 100).round(1)
+        combined["organic%"] = pd.to_numeric(combined["organic"] / combined["revenue"].where(combined["revenue"] > 0) * 100, errors="coerce").round(1)
 
         fig_trend.add_trace(go.Scatter(
             x=combined["week"], y=combined["ACOS"],
@@ -969,17 +969,17 @@ def _render_acos_tacos(sb):
     # By Channel — join on mkt_channel so "Amazon" picks up both RKW + Seller
     st.markdown("#### 🏢 By Channel")
     ch_mkt = mkt_f.groupby("channel").agg(spend=("spend","sum"), ad_rev=("sales","sum")).reset_index()
-    ch_mkt["ACOS"] = (ch_mkt["spend"] / ch_mkt["ad_rev"] * 100).round(1)
-    ch_mkt["ROAS"] = (ch_mkt["ad_rev"] / ch_mkt["spend"]).round(2)
+    ch_mkt["ACOS"] = pd.to_numeric(ch_mkt["spend"] / ch_mkt["ad_rev"].where(ch_mkt["ad_rev"] > 0) * 100, errors="coerce").round(1)
+    ch_mkt["ROAS"] = pd.to_numeric(ch_mkt["ad_rev"] / ch_mkt["spend"].where(ch_mkt["spend"] > 0), errors="coerce").round(2)
 
     if has_sales:
         # Group sales by mkt_channel — this correctly sums Amazon RKW + Amazon Seller → Amazon
         ch_sales = sales_f.groupby("mkt_channel")["revenue"].sum().reset_index()\
                           .rename(columns={"mkt_channel":"channel","revenue":"total_gmv"})
         ch_comb = ch_mkt.merge(ch_sales, on="channel", how="left").fillna(0)
-        ch_comb["TACOS"]    = (ch_comb["spend"] / ch_comb["total_gmv"] * 100).round(1)
-        ch_comb["Organic%"] = ((ch_comb["total_gmv"] - ch_comb["ad_rev"]).clip(lower=0)
-                               / ch_comb["total_gmv"] * 100).round(1)
+        ch_comb["TACOS"]    = pd.to_numeric(ch_comb["spend"] / ch_comb["total_gmv"].where(ch_comb["total_gmv"] > 0) * 100, errors="coerce").round(1)
+        ch_comb["Organic%"] = pd.to_numeric(((ch_comb["total_gmv"] - ch_comb["ad_rev"]).clip(lower=0)
+                               / ch_comb["total_gmv"].where(ch_comb["total_gmv"] > 0) * 100), errors="coerce").round(1)
         disp = ch_comb.rename(columns={
             "channel":"Channel","spend":"Ad Spend (₹)","ad_rev":"Ad Revenue (₹)",
             "total_gmv":"Total GMV (₹)","ACOS":"ACOS %","TACOS":"TACOS %",
@@ -1001,8 +1001,8 @@ def _render_acos_tacos(sb):
     # By Product — join via product_map (mkt short name -> sales item_names)
     st.markdown("#### 📦 By Product")
     pr_mkt = mkt_f.groupby("product").agg(spend=("spend","sum"), ad_rev=("sales","sum")).reset_index()
-    pr_mkt["ACOS"] = (pr_mkt["spend"] / pr_mkt["ad_rev"] * 100).round(1)
-    pr_mkt["ROAS"] = (pr_mkt["ad_rev"] / pr_mkt["spend"]).round(2)
+    pr_mkt["ACOS"] = pd.to_numeric(pr_mkt["spend"] / pr_mkt["ad_rev"].where(pr_mkt["ad_rev"] > 0) * 100, errors="coerce").round(1)
+    pr_mkt["ROAS"] = pd.to_numeric(pr_mkt["ad_rev"] / pr_mkt["spend"].where(pr_mkt["spend"] > 0), errors="coerce").round(2)
 
     if has_sales:
         if product_map:
@@ -1017,9 +1017,9 @@ def _render_acos_tacos(sb):
             pr_sales = pd.DataFrame(columns=["product","total_gmv"])
 
         pr_comb = pr_mkt.merge(pr_sales, on="product", how="left").fillna(0)
-        pr_comb["TACOS"]    = (pr_comb["spend"] / pr_comb["total_gmv"].where(pr_comb["total_gmv"] > 0) * 100).round(1)
-        pr_comb["Organic%"] = ((pr_comb["total_gmv"] - pr_comb["ad_rev"]).clip(lower=0)
-                               / pr_comb["total_gmv"].where(pr_comb["total_gmv"] > 0) * 100).round(1)
+        pr_comb["TACOS"]    = pd.to_numeric(pr_comb["spend"] / pr_comb["total_gmv"].where(pr_comb["total_gmv"] > 0) * 100, errors="coerce").round(1)
+        pr_comb["Organic%"] = pd.to_numeric(((pr_comb["total_gmv"] - pr_comb["ad_rev"]).clip(lower=0)
+                               / pr_comb["total_gmv"].where(pr_comb["total_gmv"] > 0) * 100), errors="coerce").round(1)
         pr_disp = pr_comb.rename(columns={
             "product":"Product","spend":"Ad Spend (₹)","ad_rev":"Ad Revenue (₹)",
             "total_gmv":"Total GMV (₹)","ACOS":"ACOS %","TACOS":"TACOS %",
