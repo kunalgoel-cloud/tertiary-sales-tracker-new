@@ -2,11 +2,15 @@
 marketing_module.py
 ───────────────────
 Self-contained performance-marketing logic for Mamanourish dashboard.
-Import render_marketing_tab(supabase, role) and call it inside the
+Import render_marketing_tab(role) and call it inside the
 📣 Performance Marketing tab of the main app.
 
-Keep all marketing-specific changes here; the main app never needs
-to know the internals.
+Uses its OWN Supabase connection via:
+  MARKETING_SUPABASE_URL  — st.secrets key
+  MARKETING_SUPABASE_KEY  — st.secrets key
+
+This keeps the marketing DB fully separate from the sales DB.
+Edit this file independently; the main app never needs to know the internals.
 """
 
 import io
@@ -14,10 +18,35 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from datetime import datetime
+from supabase import create_client, Client
 
 
 # ─────────────────────────────────────────────────────────────
-# DATABASE HELPERS  (use the shared supabase client passed in)
+# OWN SUPABASE CLIENT  (separate from main app sales DB)
+# ─────────────────────────────────────────────────────────────
+
+@st.cache_resource
+def _get_marketing_supabase() -> Client:
+    """
+    Returns a cached Supabase client pointed at the MARKETING database.
+    Secrets required in .streamlit/secrets.toml:
+        MARKETING_SUPABASE_URL = "https://xxxx.supabase.co"
+        MARKETING_SUPABASE_KEY = "your-anon-or-service-key"
+    """
+    try:
+        url = st.secrets["MARKETING_SUPABASE_URL"]
+        key = st.secrets["MARKETING_SUPABASE_KEY"]
+        return create_client(url, key)
+    except KeyError:
+        st.error(
+            "⚠️ Marketing DB not configured. "
+            "Add MARKETING_SUPABASE_URL and MARKETING_SUPABASE_KEY to Streamlit Secrets."
+        )
+        st.stop()
+
+
+# ─────────────────────────────────────────────────────────────
+# DATABASE HELPERS
 # ─────────────────────────────────────────────────────────────
 
 def _get_products(sb) -> list[str]:
@@ -206,7 +235,7 @@ def _render_dashboard(sb):
         dr = st.date_input(
             "Date Range",
             value=(min_date, max_date),
-            min_value=min_date, max_date=max_date,
+            min_value=min_date, max_value=max_date,
             key="mkt_daterange",
         )
     with fc2:
@@ -525,24 +554,26 @@ def _render_settings(sb):
 # PUBLIC ENTRY POINT — called by the main app
 # ─────────────────────────────────────────────────────────────
 
-def render_marketing_tab(supabase_client, role: str):
+def render_marketing_tab(role: str):
     """
     Renders the full Performance Marketing section inside the calling tab.
+    Internally creates/reuses its own Supabase client pointed at the
+    marketing DB (MARKETING_SUPABASE_URL / MARKETING_SUPABASE_KEY in secrets).
 
     Parameters
     ----------
-    supabase_client : supabase.Client
-        The shared, already-authenticated Supabase client from the main app.
     role : str
         "admin" or "viewer" — controls which sub-tabs are shown.
     """
+    sb = _get_marketing_supabase()
+
     if role == "admin":
         sub_tabs = st.tabs(["📊 Dashboard", "📥 Upload", "📚 History", "⚙️ Settings"])
-        with sub_tabs[0]: _render_dashboard(supabase_client)
-        with sub_tabs[1]: _render_upload(supabase_client)
-        with sub_tabs[2]: _render_history(supabase_client)
-        with sub_tabs[3]: _render_settings(supabase_client)
+        with sub_tabs[0]: _render_dashboard(sb)
+        with sub_tabs[1]: _render_upload(sb)
+        with sub_tabs[2]: _render_history(sb)
+        with sub_tabs[3]: _render_settings(sb)
     else:
         sub_tabs = st.tabs(["📊 Dashboard", "📚 History"])
-        with sub_tabs[0]: _render_dashboard(supabase_client)
-        with sub_tabs[1]: _render_history(supabase_client)
+        with sub_tabs[0]: _render_dashboard(sb)
+        with sub_tabs[1]: _render_history(sb)
