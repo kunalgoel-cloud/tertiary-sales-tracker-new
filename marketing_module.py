@@ -211,23 +211,63 @@ def _delete_channel_map_entry(sb, mkt_channel: str, sales_channel: str) -> bool:
 
 
 def _apply_channel_map(sales_df: pd.DataFrame, channel_map: dict[str, list[str]]) -> pd.DataFrame:
+    """Adds mkt_channel column; unmapped channels map to themselves."""
+    if sales_df.empty:
+        return sales_df
+    reverse = {sc: mkt for mkt, scs in channel_map.items() for sc in scs}
+    df = sales_df.copy()
+    df["mkt_channel"] = df["channel"].map(reverse).fillna(df["channel"])
+    return df
+
+
+# ─────────────────────────────────────────────────────────────
+# PRODUCT MAP HELPERS  (marketing product -> sales item_names)
+# ─────────────────────────────────────────────────────────────
+
+def _get_product_map(sb) -> dict[str, list[str]]:
+    """Returns {mkt_product: [sales_item, ...]} from product_map table."""
+    try:
+        r = sb.table("product_map").select("mkt_product,sales_item").execute()
+        result: dict[str, list[str]] = {}
+        for row in r.data:
+            result.setdefault(row["mkt_product"], []).append(row["sales_item"])
+        return result
+    except Exception:
+        return {}
+
+
+def _save_product_map_entry(sb, mkt_product: str, sales_item: str) -> bool:
+    try:
+        sb.table("product_map").upsert(
+            {"mkt_product": mkt_product, "sales_item": sales_item},
+            on_conflict="mkt_product,sales_item",
+        ).execute()
+        return True
+    except Exception as e:
+        st.error(f"Error saving product map: {e}")
+        return False
+
+
+def _delete_product_map_entry(sb, mkt_product: str, sales_item: str) -> bool:
+    try:
+        sb.table("product_map").delete()            .eq("mkt_product", mkt_product)            .eq("sales_item", sales_item).execute()
+        return True
+    except Exception as e:
+        st.error(f"Error deleting product map: {e}")
+        return False
+
+
+def _apply_product_map(sales_df: pd.DataFrame, product_map: dict[str, list[str]]) -> pd.DataFrame:
     """
-    Adds a 'mkt_channel' column to sales_df by reversing the channel_map.
-    Sales rows whose channel is not in any mapping are mapped to themselves (identity).
-    Multiple sales channels that map to the same marketing channel are summed correctly
-    downstream when grouping by mkt_channel.
+    Adds mkt_product column to sales_df by reversing product_map.
+    Combo/unmapped items get NaN mkt_product — excluded from per-product TACOS.
+    This prevents double-counting combos across multiple products.
     """
     if sales_df.empty:
         return sales_df
-
-    # Build reverse map: sales_channel -> mkt_channel
-    reverse: dict[str, str] = {}
-    for mkt_ch, sales_chs in channel_map.items():
-        for sc in sales_chs:
-            reverse[sc] = mkt_ch
-
+    reverse = {si: mkt for mkt, items in product_map.items() for si in items}
     df = sales_df.copy()
-    df["mkt_channel"] = df["channel"].map(reverse).fillna(df["channel"])
+    df["mkt_product"] = df["item_name"].map(reverse)  # NaN for unmapped — intentional
     return df
 
 
@@ -762,8 +802,9 @@ def _render_acos_tacos(sb):
 
     df_mkt["date"] = pd.to_datetime(df_mkt["date"])
 
-    # Load channel map and sales data
+    # Load channel map, product map, and sales data
     channel_map = _get_channel_map(sb)
+    product_map = _get_product_map(sb)
 
     with st.spinner("Loading total sales data…"):
         df_sales = _get_sales_data()
@@ -938,31 +979,40 @@ def _render_acos_tacos(sb):
     st.dataframe(disp.style.format(fmt), hide_index=True, use_container_width=True)
     st.divider()
 
-    # By Product — join on item_name = product (unchanged, product names are consistent across DBs)
+    # By Product — join via product_map (mkt short name -> sales item_names)
     st.markdown("#### 📦 By Product")
     pr_mkt = mkt_f.groupby("product").agg(spend=("spend","sum"), ad_rev=("sales","sum")).reset_index()
     pr_mkt["ACOS"] = (pr_mkt["spend"] / pr_mkt["ad_rev"] * 100).round(1)
     pr_mkt["ROAS"] = (pr_mkt["ad_rev"] / pr_mkt["spend"]).round(2)
 
     if has_sales:
-        pr_sales = sales_f.groupby("item_name")["revenue"].sum().reset_index()\
-                          .rename(columns={"item_name":"product","revenue":"total_gmv"})
+        if product_map:
+            sales_prod = _apply_product_map(sales_f, product_map)
+            sales_prod = sales_prod.dropna(subset=["mkt_product"])
+            pr_sales = sales_prod.groupby("mkt_product")["revenue"].sum().reset_index()                                 .rename(columns={"mkt_product":"product","revenue":"total_gmv"})
+        else:
+            st.warning(
+                "Product map not configured. Go to **Settings → Product Map** to map "
+                "marketing product names to sales SKUs for per-product TACOS."
+            )
+            pr_sales = pd.DataFrame(columns=["product","total_gmv"])
+
         pr_comb = pr_mkt.merge(pr_sales, on="product", how="left").fillna(0)
-        pr_comb["TACOS"]    = (pr_comb["spend"] / pr_comb["total_gmv"] * 100).round(1)
+        pr_comb["TACOS"]    = (pr_comb["spend"] / pr_comb["total_gmv"].replace(0, pd.NA) * 100).round(1)
         pr_comb["Organic%"] = ((pr_comb["total_gmv"] - pr_comb["ad_rev"]).clip(lower=0)
-                               / pr_comb["total_gmv"] * 100).round(1)
+                               / pr_comb["total_gmv"].replace(0, pd.NA) * 100).round(1)
         pr_disp = pr_comb.rename(columns={
             "product":"Product","spend":"Ad Spend (₹)","ad_rev":"Ad Revenue (₹)",
             "total_gmv":"Total GMV (₹)","ACOS":"ACOS %","TACOS":"TACOS %",
             "ROAS":"ROAS","Organic%":"Organic %",
-        }).sort_values("TACOS %", ascending=False)
+        }).sort_values("Ad Spend (₹)", ascending=False)
         pr_fmt = {"Ad Spend (₹)":"₹{:,.0f}","Ad Revenue (₹)":"₹{:,.0f}","Total GMV (₹)":"₹{:,.0f}",
                   "ACOS %":"{:.1f}%","TACOS %":"{:.1f}%","ROAS":"{:.2f}x","Organic %":"{:.1f}%"}
     else:
         pr_disp = pr_mkt.rename(columns={
             "product":"Product","spend":"Ad Spend (₹)","ad_rev":"Ad Revenue (₹)",
             "ACOS":"ACOS %","ROAS":"ROAS",
-        }).sort_values("ACOS %", ascending=False)
+        }).sort_values("Ad Spend (₹)", ascending=False)
         pr_fmt = {"Ad Spend (₹)":"₹{:,.0f}","Ad Revenue (₹)":"₹{:,.0f}",
                   "ACOS %":"{:.1f}%","ROAS":"{:.2f}x"}
 
@@ -1106,7 +1156,7 @@ def _render_history(sb):
 
 def _render_settings(sb):
     st.subheader("⚙️ Marketing Settings")
-    s1, s2, s3, s4 = st.tabs(["Master Data", "Mapping Manager", "Channel Map", "Data Cleanup"])
+    s1, s2, s3, s4, s5 = st.tabs(["Master Data", "Mapping Manager", "Channel Map", "Product Map", "Data Cleanup"])
 
     with s1:
         col1, col2 = st.columns(2)
@@ -1221,6 +1271,73 @@ def _render_settings(sb):
                 st.dataframe(pd.DataFrame(preview_rows), hide_index=True, use_container_width=True)
 
     with s4:
+        st.markdown("##### 🗺️ Product Map — Marketing Product → Sales SKUs")
+        st.caption(
+            "Map each **marketing product** (short name from ad reports) to all its **sales SKUs** "
+            "(as they appear in the sales dashboard). Multi-pack and combo items are handled automatically.  \n"
+            "Example: **Patal** → Patal Poha 100g, Patal Poha 37g, Patal Poha 100g x 2 …"
+        )
+
+        product_map_data = _get_product_map(sb)
+        mkt_products = _get_products(sb)
+
+        # Fetch sales item names from sales DB
+        sales_sb2 = _get_sales_supabase()
+        try:
+            si_r = sales_sb2.table("sales").select("item_name").execute()
+            all_sales_items = sorted(set(x["item_name"] for x in si_r.data))
+        except Exception:
+            all_sales_items = []
+            st.warning("Could not load sales items from sales DB.")
+
+        # Show current mappings
+        if product_map_data:
+            st.markdown("**Current mappings:**")
+            for mkt_prod, sales_items in sorted(product_map_data.items()):
+                st.markdown(f"**{mkt_prod}** ({len(sales_items)} SKUs)")
+                for si in sorted(sales_items):
+                    pc1, pc2 = st.columns([5, 1])
+                    pc1.write(f"  → {si}")
+                    if pc2.button("✕", key=f"pmap_del_{mkt_prod}_{si}"):
+                        if _delete_product_map_entry(sb, mkt_prod, si):
+                            st.success(f"Removed: {mkt_prod} → {si}")
+                            st.rerun()
+        else:
+            st.info("No product mappings yet. Add them below or run the SQL setup script.")
+
+        st.divider()
+        st.markdown("**Add a mapping:**")
+        if not mkt_products:
+            st.warning("No marketing products configured. Add them in Master Data first.")
+        elif not all_sales_items:
+            st.warning("No sales items found in the sales DB.")
+        else:
+            pm1, pm2 = st.columns(2)
+            with pm1:
+                new_mkt_prod = st.selectbox(
+                    "Marketing product", mkt_products, key="pmap_mkt_prod"
+                )
+            with pm2:
+                new_sales_item = st.selectbox(
+                    "Sales SKU", all_sales_items, key="pmap_sales_item"
+                )
+            if st.button("➕ Add Product Mapping", key="pmap_add"):
+                if _save_product_map_entry(sb, new_mkt_prod, new_sales_item):
+                    st.success(f"Added: **{new_mkt_prod}** → {new_sales_item}")
+                    st.rerun()
+
+        # Coverage summary
+        if product_map_data and all_sales_items:
+            with st.expander("📊 Coverage — which sales SKUs are mapped vs unmapped"):
+                mapped_items = {si for items in product_map_data.values() for si in items}
+                unmapped_items = [x for x in all_sales_items if x not in mapped_items]
+                st.markdown(f"**Mapped:** {len(mapped_items)} SKUs | **Unmapped:** {len(unmapped_items)} SKUs")
+                if unmapped_items:
+                    st.markdown("*Unmapped SKUs (excluded from per-product TACOS — counted in total GMV only):*")
+                    for u in unmapped_items:
+                        st.write(f"  • {u}")
+
+    with s5:
         st.markdown("##### 🗑️ Delete Performance Records")
         st.warning("This permanently removes data. Use with caution.")
         dc1, dc2 = st.columns(2)
