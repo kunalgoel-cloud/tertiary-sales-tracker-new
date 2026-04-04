@@ -5,6 +5,7 @@ import re
 import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
+from marketing_module import render_marketing_tab
 
 # ─────────────────────────────────────────────
 # 1. CONFIG & DB CONNECTION
@@ -173,9 +174,9 @@ with st.sidebar:
 # TABS
 # ─────────────────────────────────────────────
 if role == "admin":
-    tabs = st.tabs(["📊 Trend Analytics", "🔬 Deep Dive", "📤 Smart Upload", "🛠 Configuration"])
+    tabs = st.tabs(["📊 Trend Analytics", "🔬 Deep Dive", "📣 Performance Marketing", "📤 Smart Upload", "🛠 Configuration"])
 else:
-    tabs = st.tabs(["📊 Trend Analytics", "🔬 Deep Dive"])
+    tabs = st.tabs(["📊 Trend Analytics", "🔬 Deep Dive", "📣 Performance Marketing"])
 
 # ══════════════════════════════════════════════
 # TAB 1 – TREND ANALYTICS  (unchanged)
@@ -640,10 +641,16 @@ with tabs[1]:
                 st.success("All channels have recent data ✅")
 
 # ══════════════════════════════════════════════
-# TAB 3 – SMART UPLOAD  (admin only, index shifts by 1)
+# TAB 3 – PERFORMANCE MARKETING (all roles, index 2)
+# ══════════════════════════════════════════════
+with tabs[2]:
+    render_marketing_tab(supabase, role)
+
+# ══════════════════════════════════════════════
+# TAB 4 – SMART UPLOAD  (admin only)
 # ══════════════════════════════════════════════
 if role == "admin":
-    with tabs[2]:
+    with tabs[3]:
         st.subheader("Upload Sales Report")
 
         channels = master_chans["name"].tolist() if not master_chans.empty else []
@@ -825,7 +832,7 @@ if role == "admin":
     # ══════════════════════════════════════════
     # TAB 4 – CONFIGURATION  (admin only)
     # ══════════════════════════════════════════
-    with tabs[3]:
+    with tabs[4]:
         st.subheader("⚙️ System Configuration")
         sc1, sc2 = st.columns(2)
 
