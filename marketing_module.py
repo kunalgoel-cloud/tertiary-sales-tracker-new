@@ -721,7 +721,7 @@ def _render_deep_dive(sb):
         if len(weeks) >= 2:
             wow_pivot["WoW Change"] = wow_pivot[weeks[-1]] - wow_pivot[weeks[-2]]
             wow_pivot["WoW %"] = (
-                wow_pivot["WoW Change"] / wow_pivot[weeks[-2]].replace(0, pd.NA) * 100
+                wow_pivot["WoW Change"] / wow_pivot[weeks[-2]].where(wow_pivot[weeks[-2]] != 0) * 100
             ).round(1)
         fmt = {w: "{:.2f}x" if y_col == "ROAS" else "{:.1f}%" for w in weeks}
         if len(weeks) >= 2:
@@ -853,13 +853,15 @@ def _render_acos_tacos(sb):
     # Apply channel map to sales data: adds mkt_channel column, filters to selected mkt channels
     if has_sales:
         sales_mapped = _apply_channel_map(df_sales, channel_map)
-        sales_f = sales_mapped.copy()
+        # Date-filtered ALL sales (for company-level TACOS — includes channels with no ad spend)
+        sales_all = sales_mapped.copy()
         if len(dr) == 2:
-            sales_f = sales_f[
-                (sales_f["date"] >= pd.to_datetime(dr[0])) &
-                (sales_f["date"] <= pd.to_datetime(dr[1]))
+            sales_all = sales_all[
+                (sales_all["date"] >= pd.to_datetime(dr[0])) &
+                (sales_all["date"] <= pd.to_datetime(dr[1]))
             ]
-        # Filter by selected marketing channels (using the mapped column)
+        # Channel-filtered sales (for per-channel TACOS — only channels where we advertise)
+        sales_f = sales_all.copy()
         if ch_sel:
             sales_f = sales_f[sales_f["mkt_channel"].isin(ch_sel)]
 
@@ -870,21 +872,38 @@ def _render_acos_tacos(sb):
     roas_overall = (total_ad_rev / total_spend) if total_spend > 0 else 0
 
     if has_sales:
-        total_gmv     = sales_f["revenue"].sum()
-        tacos_overall = (total_spend / total_gmv * 100) if total_gmv > 0 else 0
-        organic_rev   = max(total_gmv - total_ad_rev, 0)
-        organic_pct   = (organic_rev / total_gmv * 100) if total_gmv > 0 else 0
+        # Channel TACOS: spend vs GMV only on channels where we advertise
+        ch_gmv        = sales_f["revenue"].sum()
+        ch_tacos      = (total_spend / ch_gmv * 100) if ch_gmv > 0 else 0
+        # Company TACOS: spend vs ALL company GMV (every channel, organic included)
+        co_gmv        = sales_all["revenue"].sum()
+        co_tacos      = (total_spend / co_gmv * 100) if co_gmv > 0 else 0
+        organic_rev   = max(co_gmv - total_ad_rev, 0)
+        organic_pct   = (organic_rev / co_gmv * 100) if co_gmv > 0 else 0
 
-        k1, k2, k3, k4, k5, k6 = st.columns(6)
+        st.markdown("##### 📊 Key Metrics")
+        k1, k2, k3, k4 = st.columns(4)
         k1.metric("Ad Spend",        f"₹{total_spend:,.0f}")
         k2.metric("Ad Revenue",      f"₹{total_ad_rev:,.0f}")
-        k3.metric("Total GMV",       f"₹{total_gmv:,.0f}")
-        k4.metric("ACOS",            f"{acos_overall:.1f}%",
+        k3.metric("ACOS",            f"{acos_overall:.1f}%",
                   help="Ad Spend ÷ Ad-Attributed Revenue × 100")
-        k5.metric("TACOS",           f"{tacos_overall:.1f}%",
-                  help="Ad Spend ÷ Total GMV × 100")
-        k6.metric("Organic Revenue", f"{organic_pct:.1f}% of GMV",
-                  help="(Total GMV − Ad Revenue) ÷ Total GMV")
+        k4.metric("ROAS",            f"{roas_overall:.2f}x")
+
+        st.markdown("##### 🏢 TACOS View")
+        t1, t2, t3, t4 = st.columns(4)
+        t1.metric("Channel GMV",     f"₹{ch_gmv:,.0f}",
+                  help="Total GMV on channels where marketing spend exists")
+        t2.metric("Channel TACOS",   f"{ch_tacos:.1f}%",
+                  help="Ad Spend ÷ GMV on advertised channels only")
+        t3.metric("Company GMV",     f"₹{co_gmv:,.0f}",
+                  help="Total GMV across ALL channels (full business view)")
+        t4.metric("Company TACOS",   f"{co_tacos:.1f}%",
+                  help="Ad Spend ÷ Total Company GMV — true cost of advertising to the business")
+
+        st.caption(
+            f"🌱 Organic Revenue: ₹{organic_rev:,.0f} ({organic_pct:.1f}% of company GMV) "
+            f"— revenue not attributed to ad spend"
+        )
     else:
         k1, k2, k3, k4 = st.columns(4)
         k1.metric("Ad Spend",   f"₹{total_spend:,.0f}")
@@ -907,13 +926,13 @@ def _render_acos_tacos(sb):
     ))
 
     if has_sales:
-        # Group sales by week using the mapped channel (already filtered to ch_sel via mkt_channel)
-        sales_f["week"] = sales_f["date"].dt.to_period("W").apply(lambda p: str(p.start_time.date()))
-        sales_weekly    = sales_f.groupby("week")["revenue"].sum().reset_index()
-        combined        = mkt_weekly.merge(sales_weekly, on="week", how="left").fillna(0)
-        combined["TACOS"]    = (combined["spend"] / combined["revenue"] * 100).round(1)
+        # Weekly trend uses company-wide GMV (sales_all) for true TACOS picture
+        sales_all["week"]  = sales_all["date"].dt.to_period("W").apply(lambda p: str(p.start_time.date()))
+        sales_weekly       = sales_all.groupby("week")["revenue"].sum().reset_index()
+        combined           = mkt_weekly.merge(sales_weekly, on="week", how="left").fillna(0)
+        combined["TACOS"]    = (combined["spend"] / combined["revenue"].where(combined["revenue"] > 0) * 100).round(1)
         combined["organic"]  = (combined["revenue"] - combined["ad_rev"]).clip(lower=0)
-        combined["organic%"] = (combined["organic"] / combined["revenue"] * 100).round(1)
+        combined["organic%"] = (combined["organic"] / combined["revenue"].where(combined["revenue"] > 0) * 100).round(1)
 
         fig_trend.add_trace(go.Scatter(
             x=combined["week"], y=combined["ACOS"],
@@ -998,9 +1017,9 @@ def _render_acos_tacos(sb):
             pr_sales = pd.DataFrame(columns=["product","total_gmv"])
 
         pr_comb = pr_mkt.merge(pr_sales, on="product", how="left").fillna(0)
-        pr_comb["TACOS"]    = (pr_comb["spend"] / pr_comb["total_gmv"].replace(0, pd.NA) * 100).round(1)
+        pr_comb["TACOS"]    = (pr_comb["spend"] / pr_comb["total_gmv"].where(pr_comb["total_gmv"] > 0) * 100).round(1)
         pr_comb["Organic%"] = ((pr_comb["total_gmv"] - pr_comb["ad_rev"]).clip(lower=0)
-                               / pr_comb["total_gmv"].replace(0, pd.NA) * 100).round(1)
+                               / pr_comb["total_gmv"].where(pr_comb["total_gmv"] > 0) * 100).round(1)
         pr_disp = pr_comb.rename(columns={
             "product":"Product","spend":"Ad Spend (₹)","ad_rev":"Ad Revenue (₹)",
             "total_gmv":"Total GMV (₹)","ACOS":"ACOS %","TACOS":"TACOS %",
