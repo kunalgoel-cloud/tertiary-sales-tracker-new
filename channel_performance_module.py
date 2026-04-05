@@ -25,11 +25,16 @@ from datetime import datetime, timedelta
 # PostgreSQL helpers — SKU mapping persistence
 # ─────────────────────────────────────────────────────────────────────────────
 
-@st.cache_resource
 def _get_pg_engine():
     """Returns a psycopg2 connection URL string, or None if not configured."""
     try:
-        return st.secrets["connections"]["postgresql"]["url"]
+        url = st.secrets.get("connections", {})
+        if not url:
+            return None
+        url = url.get("postgresql", {})
+        if not url:
+            return None
+        return url.get("url", None)
     except Exception:
         return None
 
