@@ -135,6 +135,77 @@ def _channel_sales(sales_df: pd.DataFrame, channel_keyword: str) -> pd.DataFrame
 # File loader
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Inventory snapshot helpers — persist parsed inventory to Supabase
+# ─────────────────────────────────────────────────────────────────────────────
+
+SNAPSHOT_COLS = ["channel", "channel_sku", "inventory", "str", "doc",
+                 "drr", "units_sold", "n_days", "location"]
+
+def _save_snapshot(supabase_client, parsed_df: pd.DataFrame, channel: str):
+    """
+    Save parsed inventory rows for a channel to channel_inventory_snapshots.
+    Deletes existing rows for this channel first, then inserts fresh ones.
+    """
+    try:
+        # Delete old snapshot for this channel
+        supabase_client.table("channel_inventory_snapshots")             .delete().eq("channel", channel).execute()
+
+        # Insert new rows
+        from datetime import timezone
+        now = datetime.now(timezone.utc).isoformat()
+        rows = []
+        for _, r in parsed_df.iterrows():
+            rows.append({
+                "channel":     channel,
+                "uploaded_at": now,
+                "channel_sku": str(r.get("channel_sku", "")),
+                "inventory":   float(r.get("inventory", 0)),
+                "str":         float(r.get("str", 0)),
+                "doc":         float(r.get("doc", 0)),
+                "drr":         float(r.get("drr", 0)),
+                "units_sold":  float(r.get("units_sold", 0)),
+                "n_days":      int(r.get("n_days", 30)),
+                "location":    str(r.get("location", "")),
+            })
+        # Insert in chunks
+        CHUNK = 500
+        for i in range(0, len(rows), CHUNK):
+            supabase_client.table("channel_inventory_snapshots")                 .insert(rows[i:i+CHUNK]).execute()
+    except Exception as e:
+        st.warning(f"Could not save inventory snapshot for {channel}: {e}")
+
+
+def _load_snapshots(supabase_client) -> dict:
+    """
+    Load latest saved inventory snapshots from Supabase.
+    Returns dict: { channel_name -> (uploaded_at str, DataFrame) }
+    """
+    try:
+        res = supabase_client.table("channel_inventory_snapshots")             .select("*").execute()
+        if not res.data:
+            return {}
+        df = pd.DataFrame(res.data)
+        result = {}
+        for channel, grp in df.groupby("channel"):
+            uploaded_at = grp["uploaded_at"].iloc[0]
+            # Parse uploaded_at to a readable string
+            try:
+                dt = pd.to_datetime(uploaded_at)
+                uploaded_at_str = dt.strftime("%-d %b %Y, %I:%M %p")
+            except Exception:
+                uploaded_at_str = str(uploaded_at)
+            snap_df = grp[SNAPSHOT_COLS].copy()
+            for col in ["inventory", "str", "doc", "drr", "units_sold"]:
+                snap_df[col] = pd.to_numeric(snap_df[col], errors="coerce").fillna(0)
+            snap_df["n_days"] = pd.to_numeric(snap_df["n_days"], errors="coerce").fillna(30).astype(int)
+            result[channel] = (uploaded_at_str, snap_df)
+        return result
+    except Exception as e:
+        st.warning(f"Could not load inventory snapshots: {e}")
+        return {}
+
+
 def _load_file(uploaded_file, skiprows: int = 0) -> pd.DataFrame:
     name = uploaded_file.name.lower()
     if name.endswith(".csv"):
@@ -373,6 +444,91 @@ def _parse_bigbasket(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: int, 
 # ─────────────────────────────────────────────────────────────────────────────
 # Dashboard renderer — identical output to app_25
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _reapply_sales(snap_df: pd.DataFrame, raw_sales: pd.DataFrame,
+                   channel: str, db_mappings: pd.DataFrame, n_days: int) -> pd.DataFrame:
+    """
+    When loading a saved inventory snapshot, re-compute DRR / STR / DOC
+    using the current sales window instead of the stale values in the snapshot.
+    This keeps metrics fresh even when the inventory file hasn't changed.
+    """
+    snap_df = snap_df.copy()
+
+    if raw_sales.empty:
+        return snap_df
+
+    keyword_map = {
+        "Amazon":     "amazon",
+        "Blinkit":    "blinkit",
+        "Swiggy":     "swiggy",
+        "Big Basket": "big basket",
+    }
+    keyword = keyword_map.get(channel, channel.lower())
+    sales_df = _channel_sales(raw_sales, keyword)
+
+    if sales_df.empty:
+        return snap_df
+
+    # Build master_sku → city → qty lookup from current sales
+    city_sales = sales_df[sales_df["city"] != "__national__"].copy()
+
+    # Translate channel_sku → master_sku using db_mappings
+    if db_mappings is not None and not db_mappings.empty:
+        ch_map = db_mappings[db_mappings["channel"] == channel].set_index("channel_sku")["master_sku"].to_dict()
+        snap_df["master_sku_tmp"] = snap_df["channel_sku"].map(ch_map).fillna(snap_df["channel_sku"]).astype(str)
+    else:
+        snap_df["master_sku_tmp"] = snap_df["channel_sku"].astype(str)
+
+    if not city_sales.empty and channel != "Amazon":
+        # City-level join for Blinkit / Swiggy / BigBasket
+        # Normalise city keys the same way parsers do
+        if channel == "Swiggy":
+            city_sales["_ckey"] = city_sales["city"].astype(str).str.strip().str.upper()
+            snap_df["_ckey"]    = snap_df["location"].astype(str).str.split(" (").str[0].str.strip().str.upper()
+        else:
+            city_sales["_ckey"] = city_sales["city"].astype(str).str.strip()
+            snap_df["_ckey"]    = snap_df["location"].astype(str).str.strip()
+
+        merged = snap_df.merge(
+            city_sales[["item_name", "_ckey", "qty_sold"]].rename(columns={"qty_sold": "fresh_units"}),
+            left_on=["master_sku_tmp", "_ckey"],
+            right_on=["item_name", "_ckey"],
+            how="left",
+        ).fillna(0)
+        fresh_units = pd.to_numeric(merged["fresh_units"], errors="coerce").fillna(0)
+        snap_df = merged.drop(columns=["item_name", "_ckey", "fresh_units"], errors="ignore")
+    else:
+        # Amazon — national aggregate
+        nat = (
+            sales_df[sales_df["city"] == "__national__"]
+            .groupby("item_name")["qty_sold"].sum()
+            .reset_index().rename(columns={"qty_sold": "fresh_units"})
+        )
+        merged = snap_df.merge(nat, left_on="master_sku_tmp", right_on="item_name", how="left").fillna(0)
+        fresh_units = pd.to_numeric(merged["fresh_units"], errors="coerce").fillna(0)
+        snap_df = merged.drop(columns=["item_name", "fresh_units"], errors="ignore")
+
+    # Re-compute DRR / DOC / STR where we have fresh sales
+    old_drr  = snap_df["drr"].copy()
+    old_doc  = snap_df["doc"].copy()
+
+    new_drr = (fresh_units / n_days).round(2)
+    new_doc = (snap_df["inventory"] / new_drr.replace(0, 0.001)).round(1)
+
+    sales_30d = fresh_units * (30 / n_days)
+    new_str   = sales_30d / (sales_30d + snap_df["inventory"]).replace(0, 1)
+
+    has_sales = fresh_units > 0
+    snap_df["drr"]        = new_drr.where(has_sales, old_drr)
+    snap_df["doc"]        = new_doc.where(has_sales, old_doc)
+    snap_df["str"]        = new_str.where(has_sales, snap_df["str"])
+    snap_df["units_sold"] = fresh_units.where(has_sales, snap_df["units_sold"])
+    snap_df["n_days"]     = n_days
+
+    # Clean up temp columns
+    snap_df = snap_df.drop(columns=["master_sku_tmp", "_ckey"], errors="ignore")
+    return snap_df
+
 
 def _render_dashboard(merged: pd.DataFrame):
 
@@ -630,72 +786,105 @@ def render_channel_performance_tab(supabase_client, master_skus_df: pd.DataFrame
             f"**{len(city_rows):,} city-tagged**, {len(no_city_rows):,} national/legacy"
         )
 
+    # ── Load saved snapshots ──────────────────────────────────────────────────
+    saved_snapshots = _load_snapshots(supabase_client)
+
     # ── Inventory file uploads ────────────────────────────────────────────────
     st.divider()
     st.markdown("#### 📥 Upload Inventory Reports")
-    st.caption("Upload the inventory export for each channel. Sales data is matched automatically.")
+    st.caption(
+        "Upload a fresh inventory export to refresh a channel. "
+        "If no file is uploaded, the last saved snapshot is used automatically."
+    )
 
     f_types = ["csv", "xlsx", "xls"]
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        st.info("**Amazon**")
-        amz_inv = st.file_uploader("Amazon Inventory", type=f_types, key="cp_amz_i")
-    with c2:
-        st.info("**Blinkit**")
-        blk_inv = st.file_uploader("Blinkit Inventory", type=f_types, key="cp_blk_i")
-    with c3:
-        st.info("**Swiggy**")
-        swg_inv = st.file_uploader("Swiggy Inventory", type=f_types, key="cp_swg_i")
-    with c4:
-        st.info("**Big Basket**")
-        bb_inv  = st.file_uploader("Big Basket Inventory", type=f_types, key="cp_bb_i")
 
-    if not any([amz_inv, blk_inv, swg_inv, bb_inv]):
-        st.info("Upload at least one inventory file to generate the dashboard.")
-        return
+    CHANNELS = [
+        ("Amazon",     "cp_amz_i", 1),
+        ("Blinkit",    "cp_blk_i", 2),
+        ("Swiggy",     "cp_swg_i", 0),
+        ("Big Basket", "cp_bb_i",  0),
+    ]
 
-    # ── Parse ─────────────────────────────────────────────────────────────────
+    cols = st.columns(4)
+    uploaders = {}
+    for i, (ch_name, key, _) in enumerate(CHANNELS):
+        with cols[i]:
+            snap_info = saved_snapshots.get(ch_name)
+            if snap_info:
+                st.success(f"**{ch_name}**")
+                st.caption(f"Last upload: {snap_info[0]}")
+            else:
+                st.info(f"**{ch_name}**")
+                st.caption("No snapshot saved yet")
+            uploaders[ch_name] = st.file_uploader(
+                f"{ch_name} Inventory", type=f_types, key=key
+            )
+
+    # ── Parse freshly uploaded files ──────────────────────────────────────────
+    freshly_parsed = {}   # channel → parsed DataFrame (from new upload)
+
+    ch_parse_config = {
+        "Amazon":     (lambda f: _parse_amazon(
+                            _load_file(f, skiprows=1),
+                            _channel_sales(raw_sales, "amazon"), n_days, db_mappings)),
+        "Blinkit":    (lambda f: _parse_blinkit(
+                            _load_file(f, skiprows=2),
+                            _channel_sales(raw_sales, "blinkit"), n_days, db_mappings)),
+        "Swiggy":     (lambda f: _parse_swiggy(
+                            _load_file(f),
+                            _channel_sales(raw_sales, "swiggy"), n_days, db_mappings)),
+        "Big Basket": (lambda f: _parse_bigbasket(
+                            _load_file(f),
+                            _channel_sales(raw_sales, "big basket"), n_days, db_mappings)),
+    }
+
+    for ch_name, up_file in uploaders.items():
+        if up_file:
+            try:
+                parsed = ch_parse_config[ch_name](up_file)
+                parsed["channel"] = ch_name
+                freshly_parsed[ch_name] = parsed
+                # Save snapshot to Supabase immediately after successful parse
+                _save_snapshot(supabase_client, parsed, ch_name)
+                st.toast(f"✅ {ch_name} snapshot saved", icon="💾")
+            except Exception as e:
+                st.error(f"{ch_name} parse error: {e}")
+
+    # ── Combine: fresh uploads + snapshots for channels not uploaded ──────────
     uploaded_data = []
+    snapshot_channels_used = []
 
-    if amz_inv:
-        try:
-            parsed = _parse_amazon(_load_file(amz_inv, skiprows=1),
-                                   _channel_sales(raw_sales, "amazon"), n_days, db_mappings)
-            parsed["channel"] = "Amazon"
-            uploaded_data.append(parsed)
-        except Exception as e:
-            st.error(f"Amazon parse error: {e}")
-
-    if blk_inv:
-        try:
-            parsed = _parse_blinkit(_load_file(blk_inv, skiprows=2),
-                                    _channel_sales(raw_sales, "blinkit"), n_days, db_mappings)
-            parsed["channel"] = "Blinkit"
-            uploaded_data.append(parsed)
-        except Exception as e:
-            st.error(f"Blinkit parse error: {e}")
-
-    if swg_inv:
-        try:
-            parsed = _parse_swiggy(_load_file(swg_inv),
-                                   _channel_sales(raw_sales, "swiggy"), n_days, db_mappings)
-            parsed["channel"] = "Swiggy"
-            uploaded_data.append(parsed)
-        except Exception as e:
-            st.error(f"Swiggy parse error: {e}")
-
-    if bb_inv:
-        try:
-            parsed = _parse_bigbasket(_load_file(bb_inv),
-                                      _channel_sales(raw_sales, "big basket"), n_days, db_mappings)
-            parsed["channel"] = "Big Basket"
-            uploaded_data.append(parsed)
-        except Exception as e:
-            st.error(f"Big Basket parse error: {e}")
+    for ch_name in [c[0] for c in CHANNELS]:
+        if ch_name in freshly_parsed:
+            # Fresh upload takes priority
+            uploaded_data.append(freshly_parsed[ch_name])
+        elif ch_name in saved_snapshots:
+            # Use saved snapshot — re-apply current sales data to it
+            _, snap_df = saved_snapshots[ch_name]
+            snap_df = snap_df.copy()
+            snap_df["channel"] = ch_name
+            # Re-compute DRR/DOC/STR from current sales window against saved inventory
+            snap_df = _reapply_sales(snap_df, raw_sales, ch_name, db_mappings, n_days)
+            uploaded_data.append(snap_df)
+            snapshot_channels_used.append(ch_name)
 
     if not uploaded_data:
-        st.error("No data could be parsed. Check file formats.")
+        st.info(
+            "No inventory data available. "
+            "Upload at least one inventory file to generate the dashboard."
+        )
         return
+
+    # Show which channels are using saved snapshots
+    if snapshot_channels_used:
+        snap_dates = []
+        for ch in snapshot_channels_used:
+            snap_dates.append(f"**{ch}** ({saved_snapshots[ch][0]})")
+        st.info(
+            f"📦 Using saved snapshots for: {', '.join(snap_dates)}. "
+            "Upload a new file above to refresh any channel."
+        )
 
     # ── SKU mapping ───────────────────────────────────────────────────────────
     combined              = pd.concat(uploaded_data, ignore_index=True)
