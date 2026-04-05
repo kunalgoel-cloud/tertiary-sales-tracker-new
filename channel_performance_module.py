@@ -153,7 +153,7 @@ def _find_col(df: pd.DataFrame, options: list):
 # Channel parsers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _parse_amazon(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: int) -> pd.DataFrame:
+def _parse_amazon(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: int, db_mappings: pd.DataFrame = None) -> pd.DataFrame:
     inv_df = inv_df.copy()
     sku_c  = _find_col(inv_df, ["ASIN", "asin", "sku"])
     inv_df["channel_sku"] = inv_df[sku_c].astype(str).str.strip() if sku_c else ""
@@ -168,6 +168,13 @@ def _parse_amazon(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: int) -> 
             ).fillna(0) / 100
         )
 
+    # Translate channel_sku → master_sku for sales join
+    if db_mappings is not None and not db_mappings.empty:
+        amz_map = db_mappings[db_mappings["channel"] == "Amazon"].set_index("channel_sku")["master_sku"].to_dict()
+        inv_df["master_sku"] = inv_df["channel_sku"].map(amz_map)
+    else:
+        inv_df["master_sku"] = inv_df["channel_sku"]
+
     if not sales_df.empty:
         nat = (
             sales_df[sales_df["city"] == "__national__"]
@@ -176,7 +183,7 @@ def _parse_amazon(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: int) -> 
             .reset_index()
             .rename(columns={"qty_sold": "units_sold"})
         )
-        inv_df = inv_df.merge(nat, left_on="channel_sku", right_on="item_name", how="left").fillna(0)
+        inv_df = inv_df.merge(nat, left_on="master_sku", right_on="item_name", how="left").fillna(0)
         sales_val = pd.to_numeric(inv_df["units_sold"], errors="coerce").fillna(0)
     else:
         sales_val = pd.Series(0.0, index=inv_df.index)
@@ -188,7 +195,7 @@ def _parse_amazon(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: int) -> 
     return inv_df[["channel_sku", "inventory", "str", "doc", "drr", "units_sold", "n_days", "location"]]
 
 
-def _parse_blinkit(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: int) -> pd.DataFrame:
+def _parse_blinkit(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: int, db_mappings: pd.DataFrame = None) -> pd.DataFrame:
     inv_df = inv_df.copy()
     inv_df["channel_sku"] = inv_df["Item ID"].astype(str).str.strip()
     f_col  = _find_col(inv_df, ["Warehouse Facility Name", "Facility Name", "Store"])
@@ -211,12 +218,19 @@ def _parse_blinkit(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: int) ->
         inv_df.get("Last 30 days", pd.Series(0, index=inv_df.index)), errors="coerce"
     ).fillna(0)
 
+    # Translate channel_sku → master_sku for sales join
+    if db_mappings is not None and not db_mappings.empty:
+        blk_map = db_mappings[db_mappings["channel"] == "Blinkit"].set_index("channel_sku")["master_sku"].to_dict()
+        inv_df["master_sku"] = inv_df["channel_sku"].map(blk_map)
+    else:
+        inv_df["master_sku"] = inv_df["channel_sku"]
+
     if not sales_df.empty:
         city_sales = sales_df[sales_df["city"] != "__national__"].copy()
         if not city_sales.empty:
             inv_df = inv_df.merge(
                 city_sales[["item_name", "city", "qty_sold"]].rename(columns={"qty_sold": "units_sold"}),
-                left_on=["channel_sku", "_city_key"],
+                left_on=["master_sku", "_city_key"],
                 right_on=["item_name", "city"],
                 how="left",
             ).fillna(0)
@@ -242,7 +256,7 @@ def _parse_blinkit(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: int) ->
     return inv_df[["channel_sku", "inventory", "str", "doc", "drr", "units_sold", "n_days", "location"]]
 
 
-def _parse_swiggy(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: int) -> pd.DataFrame:
+def _parse_swiggy(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: int, db_mappings: pd.DataFrame = None) -> pd.DataFrame:
     inv_df = inv_df.copy()
     inv_df["channel_sku"] = inv_df["SkuCode"].astype(str).str.strip()
     inv_df["location"]    = inv_df["City"] + " (" + inv_df["FacilityName"] + ")"
@@ -255,6 +269,13 @@ def _parse_swiggy(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: int) -> 
         if "DaysOnHand" in inv_df.columns else pd.Series(0.0, index=inv_df.index)
     )
 
+    # Translate channel_sku → master_sku for sales join
+    if db_mappings is not None and not db_mappings.empty:
+        swg_map = db_mappings[db_mappings["channel"] == "Swiggy"].set_index("channel_sku")["master_sku"].to_dict()
+        inv_df["master_sku"] = inv_df["channel_sku"].map(swg_map)
+    else:
+        inv_df["master_sku"] = inv_df["channel_sku"]
+
     if not sales_df.empty:
         city_sales = sales_df[sales_df["city"] != "__national__"].copy()
         city_sales["_city_upper"] = city_sales["city"].astype(str).str.strip().str.upper()
@@ -262,7 +283,7 @@ def _parse_swiggy(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: int) -> 
         if not city_sales.empty:
             inv_df = inv_df.merge(
                 city_sales[["item_name", "_city_upper", "qty_sold"]].rename(columns={"qty_sold": "units_sold"}),
-                left_on=["channel_sku", "_city_key"],
+                left_on=["master_sku", "_city_key"],
                 right_on=["item_name", "_city_upper"],
                 how="left",
             ).fillna(0)
@@ -288,7 +309,7 @@ def _parse_swiggy(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: int) -> 
     return inv_df[["channel_sku", "inventory", "str", "doc", "drr", "units_sold", "n_days", "location"]]
 
 
-def _parse_bigbasket(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: int) -> pd.DataFrame:
+def _parse_bigbasket(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: int, db_mappings: pd.DataFrame = None) -> pd.DataFrame:
     inv_df = inv_df.copy()
     inv_df["channel_sku"] = inv_df["SKU_Id"].astype(str).str.strip()
     inv_df["location"]    = inv_df["DC"].astype(str).str.strip() if "DC" in inv_df.columns else "Unknown"
@@ -311,12 +332,19 @@ def _parse_bigbasket(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: int) 
 
     inv_df["_city_key"] = inv_df["location"].apply(dc_to_city)
 
+    # Translate channel_sku → master_sku for sales join
+    if db_mappings is not None and not db_mappings.empty:
+        bb_map = db_mappings[db_mappings["channel"] == "Big Basket"].set_index("channel_sku")["master_sku"].to_dict()
+        inv_df["master_sku"] = inv_df["channel_sku"].map(bb_map)
+    else:
+        inv_df["master_sku"] = inv_df["channel_sku"]
+
     if not sales_df.empty:
         city_sales = sales_df[sales_df["city"] != "__national__"].copy()
         if not city_sales.empty:
             inv_df = inv_df.merge(
                 city_sales[["item_name", "city", "qty_sold"]].rename(columns={"qty_sold": "units_sold"}),
-                left_on=["channel_sku", "_city_key"],
+                left_on=["master_sku", "_city_key"],
                 right_on=["item_name", "city"],
                 how="left",
             ).fillna(0)
@@ -632,7 +660,7 @@ def render_channel_performance_tab(supabase_client, master_skus_df: pd.DataFrame
     if amz_inv:
         try:
             parsed = _parse_amazon(_load_file(amz_inv, skiprows=1),
-                                   _channel_sales(raw_sales, "amazon"), n_days)
+                                   _channel_sales(raw_sales, "amazon"), n_days, db_mappings)
             parsed["channel"] = "Amazon"
             uploaded_data.append(parsed)
         except Exception as e:
@@ -641,7 +669,7 @@ def render_channel_performance_tab(supabase_client, master_skus_df: pd.DataFrame
     if blk_inv:
         try:
             parsed = _parse_blinkit(_load_file(blk_inv, skiprows=2),
-                                    _channel_sales(raw_sales, "blinkit"), n_days)
+                                    _channel_sales(raw_sales, "blinkit"), n_days, db_mappings)
             parsed["channel"] = "Blinkit"
             uploaded_data.append(parsed)
         except Exception as e:
@@ -650,7 +678,7 @@ def render_channel_performance_tab(supabase_client, master_skus_df: pd.DataFrame
     if swg_inv:
         try:
             parsed = _parse_swiggy(_load_file(swg_inv),
-                                   _channel_sales(raw_sales, "swiggy"), n_days)
+                                   _channel_sales(raw_sales, "swiggy"), n_days, db_mappings)
             parsed["channel"] = "Swiggy"
             uploaded_data.append(parsed)
         except Exception as e:
@@ -659,7 +687,7 @@ def render_channel_performance_tab(supabase_client, master_skus_df: pd.DataFrame
     if bb_inv:
         try:
             parsed = _parse_bigbasket(_load_file(bb_inv),
-                                      _channel_sales(raw_sales, "big basket"), n_days)
+                                      _channel_sales(raw_sales, "big basket"), n_days, db_mappings)
             parsed["channel"] = "Big Basket"
             uploaded_data.append(parsed)
         except Exception as e:
