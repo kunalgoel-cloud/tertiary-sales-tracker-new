@@ -6,6 +6,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
 from marketing_module import render_marketing_tab
+from channel_performance_module import render_channel_performance_tab
 
 def _fmt_err(e: Exception) -> str:
     """Short readable error — strips 502 HTML bodies."""
@@ -182,9 +183,9 @@ with st.sidebar:
 # TABS
 # ─────────────────────────────────────────────
 if role == "admin":
-    tabs = st.tabs(["📊 Trend Analytics", "🔬 Deep Dive", "📣 Performance Marketing", "📤 Smart Upload", "🛠 Configuration"])
+    tabs = st.tabs(["📊 Trend Analytics", "🔬 Deep Dive", "📣 Performance Marketing", "📤 Smart Upload", "🛠 Configuration", "📦 Channel Performance"])
 else:
-    tabs = st.tabs(["📊 Trend Analytics", "🔬 Deep Dive", "📣 Performance Marketing"])
+    tabs = st.tabs(["📊 Trend Analytics", "🔬 Deep Dive", "📣 Performance Marketing", "📦 Channel Performance"])
 
 # ══════════════════════════════════════════════
 # TAB 1 – TREND ANALYTICS  (unchanged)
@@ -692,6 +693,11 @@ if role == "admin":
             st.dataframe(raw_df.head(5), hide_index=True)
 
             cols = ["None"] + raw_df.columns.tolist()
+
+            # Channels that carry city-level sales data
+            CITY_CHANNELS = {"Blinkit", "Swiggy", "Big Basket"}
+            needs_city = selected_channel in CITY_CHANNELS
+
             c1, c2, c3 = st.columns(3)
 
             with c1:
@@ -703,9 +709,20 @@ if role == "admin":
             with c3:
                 d_col      = st.selectbox("Date Column (or use manual date below)", cols, key="d_col")
                 fixed_date = st.date_input("Manual Date (used if no date column)", key="fixed_date")
+                if needs_city:
+                    city_col = st.selectbox(
+                        "City Column *", cols, key="city_col",
+                        help="Required for city-level inventory tracking "
+                             "(Blinkit=Supply City, Swiggy=CITY, BigBasket=DC)",
+                    )
+                else:
+                    city_col = "None"  # Amazon and others — city not applicable
 
             # Validate mandatory column picks
-            missing = [name for name, col in [("Product", p_col), ("Qty", q_col), ("Revenue", r_col)] if col == "None"]
+            mandatory = [("Product", p_col), ("Qty", q_col), ("Revenue", r_col)]
+            if needs_city:
+                mandatory.append(("City", city_col))
+            missing = [name for name, col in mandatory if col == "None"]
             if missing:
                 st.info(f"Please select columns for: {', '.join(missing)}")
                 st.stop()
@@ -798,21 +815,28 @@ if role == "admin":
                         else:
                             dt_str = str(fixed_date)
 
+                        row_city = (
+                            str(r[city_col]).strip()
+                            if city_col != "None" and city_col in r.index
+                            else None
+                        )
                         raw_rows.append({
                             "date":      dt_str,
                             "channel":   selected_channel,
                             "item_name": sku_map[r["m_key"]],
                             "qty_sold":  clean_num(r[q_col]),
                             "revenue":   clean_num(r[r_col]),
+                            "city":      row_city,
                         })
 
                     if not raw_rows:
                         st.error("No rows to upload after processing.")
                         st.stop()
 
+                    group_cols = ["date", "channel", "item_name", "city"]
                     final_df = (
                         pd.DataFrame(raw_rows)
-                        .groupby(["date", "channel", "item_name"])
+                        .groupby(group_cols, dropna=False)
                         .agg({"qty_sold": "sum", "revenue": "sum"})
                         .reset_index()
                     )
@@ -825,7 +849,7 @@ if role == "admin":
                             chunk = records[i : i + CHUNK]
                             res   = supabase.table("sales").upsert(
                                 chunk,
-                                on_conflict="date,channel,item_name",
+                                on_conflict="date,channel,item_name,city",
                             ).execute()
                             if hasattr(res, "error") and res.error:
                                 errors.append(f"Upsert chunk {i//CHUNK+1} error: {res.error}")
@@ -838,7 +862,7 @@ if role == "admin":
                     st.warning(
                         "⚠️ Some records may not have synced. "
                         "Check that your `sales` table has a UNIQUE constraint on "
-                        "(date, channel, item_name) in Supabase."
+                        "(date, channel, item_name, city) in Supabase."
                     )
                 else:
                     st.success(f"✅ Synced {len(final_df)} unique records for '{selected_channel}'!")
@@ -888,3 +912,11 @@ if role == "admin":
             st.dataframe(item_map_df, hide_index=True)
         else:
             st.info("No mappings saved yet.")
+
+# ══════════════════════════════════════════════
+# TAB – CHANNEL PERFORMANCE (admin + viewer, last tab)
+# ══════════════════════════════════════════════
+# Admin: tabs[5]  |  Viewer: tabs[3]
+_cp_tab_index = 5 if role == "admin" else 3
+with tabs[_cp_tab_index]:
+    render_channel_performance_tab(supabase, master_skus, role)
