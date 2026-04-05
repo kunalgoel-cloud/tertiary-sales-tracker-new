@@ -448,7 +448,7 @@ def _render_dashboard(merged: pd.DataFrame):
     if group_by == "None":
         st.dataframe(
             table_df[display_cols].sort_values("inventory", ascending=False)
-            .style.format(fmt).applymap(color_doc, subset=["doc"]),
+            .style.format(fmt).map(color_doc, subset=["doc"]),
             use_container_width=True,
         )
     else:
@@ -483,7 +483,7 @@ def _render_dashboard(merged: pd.DataFrame):
         )
         st.dataframe(
             agg_df.style.format({**fmt, "units_sold": "{:,.1f}"})
-            .applymap(color_doc, subset=["doc"]),
+            .map(color_doc, subset=["doc"]),
             use_container_width=True,
         )
 
@@ -550,7 +550,7 @@ def _render_dashboard(merged: pd.DataFrame):
                 c3.metric("Avg DOC", f"{avg_doc:.1f} days")
                 st.dataframe(
                     qdf[qdcols].reset_index(drop=True)
-                    .style.format(fmt).applymap(color_doc, subset=["doc"]),
+                    .style.format(fmt).map(color_doc, subset=["doc"]),
                     use_container_width=True,
                 )
                 _download(qdf, label, fname)
