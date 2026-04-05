@@ -547,11 +547,107 @@ def _render_dashboard(sb):
 
 
 # ─────────────────────────────────────────────────────────────
-# DEEP DIVE
+# DEEP DIVE  — Investment Decision Engine
 # ─────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────
+# DEEP DIVE  — Investment Decision Engine
+# ─────────────────────────────────────────────────────────────
+
+def _score_campaign(grp: pd.DataFrame, window_days: int) -> dict:
+    """
+    Score a campaign's performance over a given window.
+    Returns metrics used for investment decisions.
+    """
+    import numpy as np
+    grp = grp.sort_values("date")
+    daily = grp.groupby("date").agg(spend=("spend","sum"), sales=("sales","sum")).reset_index()
+    daily["roas"] = daily["sales"] / daily["spend"].where(daily["spend"] > 0)
+
+    total_spend  = daily["spend"].sum()
+    total_sales  = daily["sales"].sum()
+    avg_roas     = total_sales / total_spend if total_spend > 0 else 0
+    active_days  = len(daily)
+
+    # Volatility: coefficient of variation of daily ROAS (lower = more consistent)
+    roas_vals = daily["roas"].dropna()
+    if len(roas_vals) >= 2 and roas_vals.mean() > 0:
+        volatility = roas_vals.std() / roas_vals.mean()
+    else:
+        volatility = float("nan")
+
+    # Trend: slope of ROAS over time (positive = improving)
+    if len(roas_vals) >= 3:
+        x = np.arange(len(roas_vals))
+        slope = np.polyfit(x, roas_vals.values, 1)[0]
+        trend_pct = (slope * len(roas_vals) / max(roas_vals.mean(), 0.01)) * 100
+    else:
+        trend_pct = 0.0
+
+    # Consistency: % of active days with ROAS > 1
+    consistency = (roas_vals > 1).mean() * 100 if len(roas_vals) > 0 else 0
+
+    # Investment verdict
+    if avg_roas >= 2.0 and (pd.isna(volatility) or volatility < 0.5):
+        verdict = "SCALE"
+    elif avg_roas >= 1.5 and (pd.isna(volatility) or volatility < 0.7):
+        verdict = "SCALE"
+    elif avg_roas >= 1.0 and (pd.isna(volatility) or volatility < 0.8):
+        verdict = "MAINTAIN"
+    elif avg_roas >= 1.0 and not pd.isna(volatility) and volatility >= 0.8:
+        verdict = "MONITOR"
+    elif avg_roas < 1.0 and trend_pct > 15:
+        verdict = "WATCH"
+    elif avg_roas < 1.0 and trend_pct <= 15 and avg_roas >= 0.7:
+        verdict = "PAUSE"
+    else:
+        verdict = "CUT"
+
+    return {
+        "total_spend": total_spend,
+        "total_sales": total_sales,
+        "avg_roas": avg_roas,
+        "volatility": volatility,
+        "trend_pct": trend_pct,
+        "active_days": active_days,
+        "consistency": consistency,
+        "verdict": verdict,
+        "daily": daily,
+    }
+
+
+VERDICT_COLOR = {
+    "SCALE":    "#16a34a",  # green
+    "MAINTAIN": "#2563eb",  # blue
+    "MONITOR":  "#d97706",  # amber
+    "WATCH":    "#7c3aed",  # purple
+    "PAUSE":    "#dc2626",  # red
+    "CUT":      "#6b7280",  # grey
+}
+VERDICT_BG = {
+    "SCALE":    "#f0fdf4",
+    "MAINTAIN": "#eff6ff",
+    "MONITOR":  "#fffbeb",
+    "WATCH":    "#f5f3ff",
+    "PAUSE":    "#fef2f2",
+    "CUT":      "#f9fafb",
+}
+VERDICT_DESC = {
+    "SCALE":    "High ROAS + consistent → Increase budget",
+    "MAINTAIN": "Profitable + stable → Keep current spend",
+    "MONITOR":  "Profitable but volatile → Watch closely, don't increase",
+    "WATCH":    "Below break-even but improving → Give it 1 more week",
+    "PAUSE":    "Below break-even, not improving → Pause spend now",
+    "CUT":      "Consistently loss-making → Stop immediately",
+}
+
+
 def _render_deep_dive(sb):
-    st.subheader("🔬 Marketing Deep Dive")
+    st.subheader("🔬 Campaign Investment Intelligence")
+    st.caption(
+        "Every campaign is scored like a stock: **return** (ROAS), **risk** (volatility), "
+        "**trend** (direction) and **consistency**. The verdict tells you exactly what to do with the budget."
+    )
 
     df_p = _get_performance(sb)
     if df_p.empty:
@@ -560,235 +656,585 @@ def _render_deep_dive(sb):
 
     df_p = df_p.drop(columns=["id","created_at"], errors="ignore")
     df_p["date"] = pd.to_datetime(df_p["date"])
+    df_p["date_only"] = df_p["date"].dt.date
 
-    f_df, dd_start, dd_end = _apply_filters(df_p, "dd")
-    if f_df.empty:
-        st.warning("No data matches filters.")
+    # ── Global controls ──────────────────────────────────────
+    ctrl1, ctrl2, ctrl3 = st.columns([2, 2, 1])
+    with ctrl1:
+        all_channels = sorted(df_p["channel"].unique())
+        sel_channels = st.multiselect("Channels", all_channels, default=all_channels, key="dd_ch")
+    with ctrl2:
+        window = st.radio(
+            "Performance Window",
+            ["2 Weeks", "4 Weeks", "All Time"],
+            horizontal=True, index=1, key="dd_window",
+        )
+    with ctrl3:
+        min_spend = st.number_input("Min spend filter (₹)", value=0, step=100, key="dd_min_spend")
+
+    if sel_channels:
+        df_p = df_p[df_p["channel"].isin(sel_channels)]
+
+    # Apply window
+    max_date = df_p["date"].max()
+    if window == "2 Weeks":
+        cutoff = max_date - pd.Timedelta(days=13)
+    elif window == "4 Weeks":
+        cutoff = max_date - pd.Timedelta(days=27)
+    else:
+        cutoff = df_p["date"].min()
+    win_df = df_p[df_p["date"] >= cutoff].copy()
+
+    if win_df.empty:
+        st.warning("No data in the selected window.")
         return
 
-    dd_days = max((dd_end - dd_start).days + 1, 1)
-    f_df["week"] = f_df["date"].dt.to_period("W").apply(lambda p: str(p.start_time.date()))
+    # Score every campaign
+    import numpy as np
+    records = []
+    for camp, grp in win_df.groupby("campaign"):
+        sc = _score_campaign(grp, (max_date - cutoff).days + 1)
+        if sc["total_spend"] < min_spend:
+            continue
+        records.append({
+            "Campaign":      camp,
+            "Channel":       grp["channel"].iloc[0],
+            "Spend (₹)":     sc["total_spend"],
+            "Ad Revenue (₹)":sc["total_sales"],
+            "ROAS":          round(sc["avg_roas"], 2),
+            "Volatility":    round(sc["volatility"], 2) if not pd.isna(sc["volatility"]) else None,
+            "Trend":         round(sc["trend_pct"], 1),
+            "Active Days":   sc["active_days"],
+            "Consistency %": round(sc["consistency"], 0),
+            "Verdict":       sc["verdict"],
+            "_daily":        sc["daily"],
+        })
 
-    views = st.tabs([
-        "📦 ROAS by Product",
-        "🎯 Spend Efficiency Quadrant",
-        "📊 Budget Concentration",
-        "📈 WoW ROAS",
-        "⏳ Campaign Lifecycle",
+    if not records:
+        st.warning("No campaigns meet the filter criteria.")
+        return
+
+    score_df = pd.DataFrame(records)
+
+    # ── TAB NAVIGATION ───────────────────────────────────────
+    tabs = st.tabs([
+        "📋 Investment Decisions",
+        "📦 Portfolio Buckets",
+        "📈 Campaign Scorecards",
+        "📊 Volatility vs Return",
     ])
 
-    # ── ROAS by Product ──────────────────────────────────────
-    with views[0]:
-        st.markdown("#### 📦 ROAS Trend by Product")
-        st.caption("Which SKUs are efficient to advertise? Declining ROAS over time = potential ad fatigue.")
-
-        prod_daily = (
-            f_df.groupby(["date","product"])
-            .agg(spend=("spend","sum"), sales=("sales","sum")).reset_index()
-        )
-        prod_daily["ROAS"] = prod_daily["sales"] / prod_daily["spend"]
-
-        fig1 = px.line(prod_daily, x="date", y="ROAS", color="product",
-                       markers=True, height=420,
-                       color_discrete_sequence=px.colors.qualitative.Bold)
-        fig1.add_hline(y=1, line_dash="dash", line_color="red", annotation_text="Break-even (1x)")
-        fig1.update_layout(hovermode="x unified", legend=dict(orientation="h", y=-0.2))
-        st.plotly_chart(fig1, use_container_width=True)
-
-        prod_sum = (
-            f_df.groupby("product").agg(spend=("spend","sum"), ad_revenue=("sales","sum")).reset_index()
-        )
-        prod_sum["ROAS"]      = pd.to_numeric(prod_sum["ad_revenue"] / prod_sum["spend"].where(prod_sum["spend"] > 0), errors="coerce").round(2)
-        prod_sum["ACOS%"]     = pd.to_numeric(prod_sum["spend"] / prod_sum["ad_revenue"].where(prod_sum["ad_revenue"] > 0) * 100, errors="coerce").round(1)
-        prod_sum["daily_spend"] = (prod_sum["spend"] / dd_days).round(0)
-        prod_sum["status"]    = prod_sum["ROAS"].apply(
-            lambda r: "🟢 Efficient" if r >= 3 else ("🟡 Marginal" if r >= 1 else "🔴 Loss-making")
-        )
-        prod_sum = prod_sum.sort_values("ROAS", ascending=False)
-        st.dataframe(
-            prod_sum.rename(columns={
-                "product":"Product","spend":"Spend (₹)","ad_revenue":"Ad Revenue (₹)",
-                "ROAS":"ROAS","ACOS%":"ACOS %","daily_spend":"Daily Spend (₹)","status":"Status"
-            }).style.format({
-                "Spend (₹)":"₹{:,.0f}","Ad Revenue (₹)":"₹{:,.0f}",
-                "ROAS":"{:.2f}x","ACOS %":"{:.1f}%","Daily Spend (₹)":"₹{:,.0f}",
-            }),
-            hide_index=True, use_container_width=True,
-        )
-
-    # ── Spend Efficiency Quadrant ─────────────────────────────
-    with views[1]:
-        st.markdown("#### 🎯 Spend Efficiency Quadrant")
+    # ════════════════════════════════════════════════════════
+    # TAB 1 — INVESTMENT DECISION TABLE
+    # ════════════════════════════════════════════════════════
+    with tabs[0]:
+        st.markdown("#### 📋 Campaign Investment Decisions")
         st.caption(
-            "Each bubble = one campaign. Bubble size = spend amount. "
-            "Vertical axis = ROAS. Horizontal axis = total spend."
+            "Every campaign ranked by verdict. "
+            "**Trend** = ROAS direction over the window (positive = improving). "
+            "**Volatility** = coefficient of variation of daily ROAS (lower = more reliable, like a low-beta stock). "
+            "**Consistency** = % of days with ROAS > 1."
         )
 
-        camp_sum = (
-            f_df.groupby(["campaign","channel","product"])
-            .agg(spend=("spend","sum"), sales=("sales","sum")).reset_index()
-        )
-        camp_sum["ROAS"] = camp_sum["sales"] / camp_sum["spend"]
-        camp_sum = camp_sum[camp_sum["spend"] > 0]
-        med_spend = camp_sum["spend"].median()
-        med_roas  = camp_sum["ROAS"].median()
+        verdict_order = ["SCALE","MAINTAIN","MONITOR","WATCH","PAUSE","CUT"]
+        display_df = score_df.drop(columns=["_daily"]).copy()
+        display_df["Verdict_sort"] = display_df["Verdict"].map({v:i for i,v in enumerate(verdict_order)})
+        display_df = display_df.sort_values(["Verdict_sort","Spend (₹)"], ascending=[True, False])\
+                               .drop(columns=["Verdict_sort"])
 
-        fig2 = px.scatter(
-            camp_sum, x="spend", y="ROAS",
-            size="spend", color="channel",
-            hover_name="campaign",
-            hover_data={"product":True,"spend":":.0f","ROAS":":.2f","sales":":.0f"},
-            size_max=60, height=500,
-            labels={"spend":"Total Spend (₹)","ROAS":"ROAS"},
-            color_discrete_sequence=px.colors.qualitative.Bold,
-        )
-        fig2.add_vline(x=med_spend, line_dash="dot", line_color="grey",
-                       annotation_text="Median Spend")
-        fig2.add_hline(y=med_roas, line_dash="dot", line_color="grey",
-                       annotation_text="Median ROAS")
-        fig2.add_hline(y=1, line_dash="dash", line_color="red",
-                       annotation_text="Break-even")
-        st.plotly_chart(fig2, use_container_width=True)
+        # Colour verdict column
+        def colour_verdict(val):
+            bg = VERDICT_BG.get(val, "#ffffff")
+            fg = VERDICT_COLOR.get(val, "#000000")
+            return f"background-color: {bg}; color: {fg}; font-weight: bold"
 
-        q1, q2, q3, q4 = st.columns(4)
-        q1.success("⭐ **Stars**\nHigh spend + High ROAS → Scale up")
-        q2.info("💎 **Gems**\nLow spend + High ROAS → Invest more")
-        q3.error("🚨 **Money Pits**\nHigh spend + Low ROAS → Pause/optimise")
-        q4.warning("🗑️ **Cut**\nLow spend + Low ROAS → Switch off")
+        def colour_roas(val):
+            if not isinstance(val, (int, float)) or pd.isna(val):
+                return ""
+            if val >= 2:   return "color: #16a34a; font-weight: bold"
+            if val >= 1:   return "color: #2563eb"
+            return "color: #dc2626"
 
-    # ── Budget Concentration ──────────────────────────────────
-    with views[2]:
-        st.markdown("#### 📊 Budget Concentration Risk")
-        st.caption("High concentration = fragile. If your top campaign pauses, the whole funnel stalls.")
+        def colour_trend(val):
+            if not isinstance(val, (int, float)) or pd.isna(val):
+                return ""
+            return "color: #16a34a" if val > 5 else ("color: #dc2626" if val < -5 else "color: #6b7280")
 
-        camp_spend = (
-            f_df.groupby("campaign")["spend"].sum()
-            .sort_values(ascending=False).reset_index()
-        )
-        camp_spend["cumulative_%"] = (camp_spend["spend"].cumsum() / camp_spend["spend"].sum() * 100).round(1)
-        camp_spend["spend_%"]      = (camp_spend["spend"] / camp_spend["spend"].sum() * 100).round(1)
+        styled = display_df.style\
+            .format({
+                "Spend (₹)":"₹{:,.0f}", "Ad Revenue (₹)":"₹{:,.0f}",
+                "ROAS":"{:.2f}x", "Trend":"{:+.1f}%",
+                "Consistency %":"{:.0f}%",
+                "Volatility": lambda v: f"{v:.2f}" if v is not None and not (isinstance(v, float) and pd.isna(v)) else "—",
+            })\
+            .map(colour_verdict, subset=["Verdict"])\
+            .map(colour_roas,    subset=["ROAS"])\
+            .map(colour_trend,   subset=["Trend"])
 
-        fig3 = go.Figure()
-        fig3.add_trace(go.Bar(
-            x=camp_spend["campaign"], y=camp_spend["spend_%"],
-            name="Spend Share %",
-            text=camp_spend["spend_%"].apply(lambda x: f"{x:.1f}%"),
-            textposition="outside",
-        ))
-        fig3.add_trace(go.Scatter(
-            x=camp_spend["campaign"], y=camp_spend["cumulative_%"],
-            name="Cumulative %", yaxis="y2",
-            mode="lines+markers", line=dict(color="black", width=2),
-        ))
-        fig3.update_layout(
-            height=420,
-            yaxis=dict(title="Spend Share %"),
-            yaxis2=dict(title="Cumulative %", overlaying="y", side="right", range=[0, 110]),
-            xaxis_tickangle=-30,
-            legend=dict(orientation="h", y=1.15),
-        )
-        st.plotly_chart(fig3, use_container_width=True)
+        st.dataframe(styled, hide_index=True, use_container_width=True, height=500)
 
-        n = len(camp_spend)
-        top1 = camp_spend.iloc[0]["cumulative_%"]          if n >= 1 else 0
-        top3 = camp_spend.iloc[min(2, n-1)]["cumulative_%"] if n >= 1 else 0
-        top5 = camp_spend.iloc[min(4, n-1)]["cumulative_%"] if n >= 1 else 0
-        cc1, cc2, cc3 = st.columns(3)
-        cc1.metric("Top 1 campaign", f"{top1:.1f}% of spend",
-                   delta="⚠️ High risk" if top1 > 60 else "✅ Healthy",
-                   delta_color="inverse" if top1 > 60 else "normal")
-        cc2.metric("Top 3 campaigns", f"{top3:.1f}% of spend",
-                   delta="⚠️ Concentrated" if top3 > 80 else "✅ Diversified",
-                   delta_color="inverse" if top3 > 80 else "normal")
-        cc3.metric("Top 5 campaigns", f"{top5:.1f}% of spend")
-
-    # ── WoW ROAS ─────────────────────────────────────────────
-    with views[3]:
-        st.markdown("#### 📈 Week-over-Week ROAS & ACOS by Channel")
-        st.caption("Downward ROAS trend = declining efficiency. Review bidding strategy or creative.")
-
-        weekly = (
-            f_df.groupby(["week","channel"])
-            .agg(spend=("spend","sum"), sales=("sales","sum")).reset_index()
-        )
-        weekly["ROAS"] = weekly["sales"] / weekly["spend"]
-        weekly["ACOS"] = pd.to_numeric(weekly["spend"] / weekly["sales"].where(weekly["sales"] > 0) * 100, errors="coerce").round(1)
-
-        wow_metric = st.radio("Metric:", ["ROAS", "ACOS %"], horizontal=True, key="dd_wow_metric")
-        y_col = "ROAS" if wow_metric == "ROAS" else "ACOS"
-
-        fig4 = px.line(weekly, x="week", y=y_col, color="channel",
-                       markers=True, height=400,
-                       color_discrete_sequence=px.colors.qualitative.Bold)
-        if y_col == "ROAS":
-            fig4.add_hline(y=1, line_dash="dash", line_color="red", annotation_text="Break-even")
-        fig4.update_layout(hovermode="x unified", legend=dict(orientation="h", y=-0.2))
-        st.plotly_chart(fig4, use_container_width=True)
-
-        wow_pivot = weekly.pivot_table(index="channel", columns="week", values=y_col).fillna(0)
-        weeks = sorted(wow_pivot.columns)
-        wow_pivot = wow_pivot[weeks]
-        if len(weeks) >= 2:
-            wow_pivot["WoW Change"] = wow_pivot[weeks[-1]] - wow_pivot[weeks[-2]]
-            wow_pivot["WoW %"] = (
-                wow_pivot["WoW Change"] / wow_pivot[weeks[-2]].where(wow_pivot[weeks[-2]] != 0) * 100
-            ).round(1)
-        fmt = {w: "{:.2f}x" if y_col == "ROAS" else "{:.1f}%" for w in weeks}
-        if len(weeks) >= 2:
-            fmt["WoW Change"] = "{:+.2f}" if y_col == "ROAS" else "{:+.1f}%"
-            fmt["WoW %"] = "{:+.1f}%"
-        st.dataframe(
-            wow_pivot.style.format(fmt).map(
-                lambda v: "color: green" if isinstance(v, float) and v > 0
-                else ("color: red" if isinstance(v, float) and v < 0 else ""),
-                subset=["WoW %","WoW Change"] if len(weeks) >= 2 else [],
-            ),
-            use_container_width=True,
-        )
-
-    # ── Campaign Lifecycle ────────────────────────────────────
-    with views[4]:
-        st.markdown("#### ⏳ Campaign Lifecycle & Fatigue")
-        st.caption("ROAS declining despite consistent spend = ad fatigue. Refresh creative or reset audience.")
-
-        camp_weekly = (
-            f_df.groupby(["week","campaign","channel"])
-            .agg(spend=("spend","sum"), sales=("sales","sum")).reset_index()
-        )
-        camp_weekly["ROAS"] = camp_weekly["sales"] / camp_weekly["spend"]
-        active_camps = camp_weekly.groupby("campaign")["week"].nunique()
-        multi_week   = active_camps[active_camps >= 2].index.tolist()
-
-        if not multi_week:
-            st.info("Need at least 2 weeks of data per campaign to show lifecycle trends.")
-        else:
-            sel_camps = st.multiselect(
-                "Select campaigns:",
-                sorted(multi_week),
-                default=sorted(multi_week)[:min(5, len(multi_week))],
-                key="dd_lifecycle_camps",
+        # Legend
+        st.markdown("**Verdict guide:**")
+        leg_cols = st.columns(6)
+        for i, v in enumerate(verdict_order):
+            leg_cols[i].markdown(
+                f"<div style='background:{VERDICT_BG[v]};color:{VERDICT_COLOR[v]};"
+                f"border-radius:6px;padding:6px 8px;font-size:12px;font-weight:bold'>"
+                f"{v}<br><span style='font-weight:normal;font-size:11px'>{VERDICT_DESC[v]}</span></div>",
+                unsafe_allow_html=True,
             )
-            if sel_camps:
-                lc_df = camp_weekly[camp_weekly["campaign"].isin(sel_camps)]
-                fig5 = px.line(lc_df, x="week", y="ROAS", color="campaign",
-                               markers=True, height=420)
-                fig5.add_hline(y=1, line_dash="dash", line_color="red", annotation_text="Break-even")
-                fig5.update_layout(hovermode="x unified", legend=dict(orientation="h", y=-0.25))
-                st.plotly_chart(fig5, use_container_width=True)
 
-                st.markdown("**Fatigue Assessment**")
-                for camp in sel_camps:
-                    cd = lc_df[lc_df["campaign"] == camp].sort_values("week")
-                    if len(cd) >= 2:
-                        first_r = cd.iloc[0]["ROAS"]
-                        last_r  = cd.iloc[-1]["ROAS"]
-                        chg     = (last_r - first_r) / first_r * 100 if first_r > 0 else 0
-                        if chg < -20:
-                            st.error(f"🔴 **{camp}** — ROAS dropped {chg:.1f}% since launch → Refresh creative")
-                        elif chg > 10:
-                            st.success(f"🟢 **{camp}** — ROAS improved {chg:+.1f}% → Scaling well")
-                        else:
-                            st.info(f"🟡 **{camp}** — ROAS stable ({chg:+.1f}%)")
+        st.divider()
+        # Download
+        dl_df = display_df.drop(columns=[], errors="ignore")
+        st.download_button(
+            "📥 Download Decision Table",
+            dl_df.to_csv(index=False),
+            file_name=f"campaign_decisions_{datetime.now().strftime('%Y%m%d')}.csv",
+            mime="text/csv",
+        )
+
+    # ════════════════════════════════════════════════════════
+    # TAB 2 — PORTFOLIO BUCKETS
+    # ════════════════════════════════════════════════════════
+    with tabs[1]:
+        st.markdown("#### 📦 Portfolio Buckets")
+        st.caption(
+            "Campaigns grouped by investment verdict. "
+            "Use this to decide total budget per bucket — not per campaign."
+        )
+
+        for verdict in ["SCALE","MAINTAIN","MONITOR","WATCH","PAUSE","CUT"]:
+            bucket = score_df[score_df["Verdict"] == verdict]
+            if bucket.empty:
+                continue
+
+            b_spend  = bucket["Spend (₹)"].sum()
+            b_rev    = bucket["Ad Revenue (₹)"].sum()
+            b_roas   = b_rev / b_spend if b_spend > 0 else 0
+            b_n      = len(bucket)
+
+            with st.expander(
+                f"{verdict} — {b_n} campaigns | ₹{b_spend:,.0f} spend | "
+                f"{b_roas:.2f}x ROAS avg",
+                expanded=(verdict in ["SCALE","MAINTAIN","PAUSE","CUT"]),
+            ):
+                st.markdown(
+                    f"<div style='background:{VERDICT_BG[verdict]};color:{VERDICT_COLOR[verdict]};"
+                    f"border-left:4px solid {VERDICT_COLOR[verdict]};padding:10px;border-radius:4px;"
+                    f"margin-bottom:12px;font-size:13px'>{VERDICT_DESC[verdict]}</div>",
+                    unsafe_allow_html=True,
+                )
+
+                b1, b2, b3, b4 = st.columns(4)
+                b1.metric("Campaigns", b_n)
+                b2.metric("Total Spend", f"₹{b_spend:,.0f}")
+                b3.metric("Total Revenue", f"₹{b_rev:,.0f}")
+                b4.metric("Bucket ROAS", f"{b_roas:.2f}x")
+
+                disp = bucket[["Campaign","Channel","Spend (₹)","ROAS","Volatility","Trend","Active Days"]]\
+                       .sort_values("Spend (₹)", ascending=False)
+                st.dataframe(
+                    disp.style.format({
+                        "Spend (₹)":"₹{:,.0f}", "ROAS":"{:.2f}x", "Trend":"{:+.1f}%",
+                        "Volatility": lambda v: f"{v:.2f}" if v is not None and not (isinstance(v, float) and pd.isna(v)) else "—",
+                    }),
+                    hide_index=True, use_container_width=True,
+                )
+
+    # ════════════════════════════════════════════════════════
+    # TAB 3 — CAMPAIGN SCORECARDS  (stock-market style)
+    # ════════════════════════════════════════════════════════
+    with tabs[2]:
+        st.markdown("#### 📈 Campaign Scorecards")
+        st.caption(
+            "Each card = one campaign. The sparkline is daily ROAS — "
+            "read it like a stock chart. Flat or rising = good. Spikey = volatile."
+        )
+
+        # Filter to top N by spend for readability
+        top_n = st.slider("Show top N campaigns by spend", 5, 50,
+                          min(20, len(score_df)), key="dd_topn")
+        shown = score_df.nlargest(top_n, "Spend (₹)")
+
+        # 3-per-row layout
+        cols_per_row = 3
+        rows = [shown.iloc[i:i+cols_per_row] for i in range(0, len(shown), cols_per_row)]
+
+        for row in rows:
+            cols = st.columns(cols_per_row)
+            for j, (_, camp_row) in enumerate(row.iterrows()):
+                with cols[j]:
+                    verdict = camp_row["Verdict"]
+                    daily   = camp_row["_daily"]
+                    camp    = camp_row["Campaign"]
+                    roas    = camp_row["ROAS"]
+                    vol     = camp_row["Volatility"]
+                    trend   = camp_row["Trend"]
+
+                    # Truncate campaign name
+                    short_name = camp[:28] + "…" if len(camp) > 28 else camp
+
+                    # Sparkline
+                    fig_spark = go.Figure()
+                    fig_spark.add_trace(go.Scatter(
+                        x=daily["date"], y=daily["roas"],
+                        mode="lines", fill="tozeroy",
+                        line=dict(
+                            color=VERDICT_COLOR[verdict], width=2
+                        ),
+                        fillcolor=VERDICT_BG[verdict],
+                    ))
+                    fig_spark.add_hline(y=1, line_dash="dot", line_color="#dc2626", line_width=1)
+                    fig_spark.update_layout(
+                        height=100, margin=dict(l=0,r=0,t=0,b=0),
+                        showlegend=False,
+                        xaxis=dict(visible=False),
+                        yaxis=dict(visible=False, rangemode="tozero"),
+                        paper_bgcolor="rgba(0,0,0,0)",
+                        plot_bgcolor="rgba(0,0,0,0)",
+                    )
+
+                    trend_arrow = "↗" if trend > 5 else ("↘" if trend < -5 else "→")
+                    vol_str = f"{vol:.2f}" if vol is not None and not (isinstance(vol, float) and pd.isna(vol)) else "—"
+
+                    st.markdown(
+                        f"<div style='border:1px solid {VERDICT_COLOR[verdict]};border-radius:8px;"
+                        f"padding:10px;background:{VERDICT_BG[verdict]};margin-bottom:4px'>"
+                        f"<div style='font-size:11px;color:#6b7280;white-space:nowrap;overflow:hidden;"
+                        f"text-overflow:ellipsis'>{short_name}</div>"
+                        f"<div style='font-size:18px;font-weight:bold;color:{VERDICT_COLOR[verdict]}'>{verdict}</div>"
+                        f"<div style='font-size:13px'>ROAS: <b>{roas:.2f}x</b> &nbsp; {trend_arrow} {trend:+.1f}%</div>"
+                        f"<div style='font-size:12px;color:#6b7280'>Vol: {vol_str} | ₹{camp_row['Spend (₹)']:,.0f}</div>"
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
+                    st.plotly_chart(fig_spark, use_container_width=True, config={"displayModeBar": False})
+
+    # ════════════════════════════════════════════════════════
+    # TAB 4 — VOLATILITY vs RETURN (Risk/Return scatter)
+    # ════════════════════════════════════════════════════════
+    with tabs[3]:
+        st.markdown("#### 📊 Risk vs Return — Campaign Portfolio Map")
+        st.caption(
+            "**X-axis = Volatility** (like beta in stocks — lower is more predictable). "
+            "**Y-axis = ROAS** (return). "
+            "**Bubble size = spend**. "
+            "Top-left quadrant = high return, low risk = best campaigns to scale."
+        )
+
+        plot_df = score_df.dropna(subset=["Volatility"]).copy()
+        if plot_df.empty:
+            st.info("Need at least 2 active days per campaign to calculate volatility.")
+        else:
+            fig_rv = px.scatter(
+                plot_df,
+                x="Volatility", y="ROAS",
+                size="Spend (₹)", color="Verdict",
+                hover_name="Campaign",
+                hover_data={"Channel":True,"Spend (₹)":":.0f",
+                            "ROAS":":.2f","Volatility":":.2f","Trend":True},
+                color_discrete_map=VERDICT_COLOR,
+                size_max=50, height=520,
+                labels={"Volatility":"Volatility (lower = more consistent)",
+                        "ROAS":"ROAS (higher = better return)"},
+            )
+
+            # Quadrant lines at median
+            med_vol  = plot_df["Volatility"].median()
+            med_roas = max(plot_df["ROAS"].median(), 0)
+
+            fig_rv.add_vline(x=med_vol,  line_dash="dot", line_color="#9ca3af",
+                             annotation_text="Median Volatility", annotation_position="top")
+            fig_rv.add_hline(y=med_roas, line_dash="dot", line_color="#9ca3af",
+                             annotation_text="Median ROAS", annotation_position="right")
+            fig_rv.add_hline(y=1, line_dash="dash", line_color="#dc2626",
+                             annotation_text="Break-even", annotation_position="right")
+
+            # Quadrant labels
+            x_max = plot_df["Volatility"].max() * 1.1
+            y_max = plot_df["ROAS"].max() * 1.1
+            for txt, x, y, color in [
+                ("⭐ Scale",          med_vol*0.3,  y_max*0.95,  "#16a34a"),
+                ("💎 Gem — Invest",   med_vol*0.3,  med_roas*0.5,"#2563eb"),
+                ("⚠️ Risky High",      x_max*0.8,   y_max*0.95,  "#d97706"),
+                ("🗑️ Cut",             x_max*0.8,   med_roas*0.5,"#6b7280"),
+            ]:
+                fig_rv.add_annotation(x=x, y=y, text=f"<b>{txt}</b>", showarrow=False,
+                                      font=dict(color=color, size=12))
+
+            fig_rv.update_layout(hovermode="closest")
+            st.plotly_chart(fig_rv, use_container_width=True)
+
+            # Summary table sorted by ROAS desc, volatility asc
+            summary = plot_df[["Campaign","Spend (₹)","ROAS","Volatility","Trend","Verdict"]]\
+                      .sort_values(["ROAS","Volatility"], ascending=[False, True])
+            st.dataframe(
+                summary.style.format({
+                    "Spend (₹)":"₹{:,.0f}", "ROAS":"{:.2f}x",
+                    "Volatility":"{:.2f}", "Trend":"{:+.1f}%",
+                }).map(colour_verdict, subset=["Verdict"]),
+                hide_index=True, use_container_width=True,
+            )
+
+
+# ─────────────────────────────────────────────────────────────
+# FORECAST & BUDGET OPTIMIZER
+# ─────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────
+# FORECAST & BUDGET OPTIMIZER
+# ─────────────────────────────────────────────────────────────
+
+def _render_forecast(sb):
+    st.subheader("🎯 Budget Optimizer & Forecast")
+    st.caption(
+        "Enter your total available budget. Set constraints. "
+        "The optimizer allocates budget across campaigns to maximise expected revenue, "
+        "weighted by each campaign's historical ROAS and consistency."
+    )
+
+    df_p = _get_performance(sb)
+    if df_p.empty:
+        st.info("No marketing data yet.")
+        return
+
+    df_p = df_p.drop(columns=["id","created_at"], errors="ignore")
+    df_p["date"] = pd.to_datetime(df_p["date"])
+    import numpy as np
+
+    # ── Inputs ───────────────────────────────────────────────
+    st.markdown("### ⚙️ Constraints")
+    ic1, ic2, ic3 = st.columns(3)
+    with ic1:
+        total_budget   = st.number_input("Total Budget (₹)", value=50000, step=1000,
+                                          min_value=1000, key="fc_budget")
+        perf_window    = st.radio("Base forecasts on:", ["Last 2 Weeks","Last 4 Weeks"],
+                                   horizontal=True, key="fc_window")
+    with ic2:
+        min_roas_thresh = st.number_input("Min ROAS to invest in campaign",
+                                           value=0.8, step=0.1, min_value=0.0, key="fc_min_roas")
+        max_camp_pct   = st.slider("Max % of budget to any single campaign",
+                                    5, 80, 40, key="fc_max_pct")
+    with ic3:
+        min_camp_spend = st.number_input("Min spend per campaign (₹) if included",
+                                          value=500, step=100, key="fc_min_camp")
+        exclude_verdicts = st.multiselect(
+            "Exclude these verdicts from allocation",
+            ["SCALE","MAINTAIN","MONITOR","WATCH","PAUSE","CUT"],
+            default=["PAUSE","CUT"], key="fc_exclude",
+        )
+
+    st.divider()
+
+    # ── Score campaigns ──────────────────────────────────────
+    max_date = df_p["date"].max()
+    days     = 13 if perf_window == "Last 2 Weeks" else 27
+    win_df   = df_p[df_p["date"] >= max_date - pd.Timedelta(days=days)].copy()
+
+    if win_df.empty:
+        st.warning("No data in the selected window.")
+        return
+
+    camp_scores = []
+    for camp, grp in win_df.groupby("campaign"):
+        sc = _score_campaign(grp, days + 1)
+        if sc["avg_roas"] < min_roas_thresh:
+            continue
+        if sc["verdict"] in exclude_verdicts:
+            continue
+        if sc["total_spend"] == 0:
+            continue
+
+        # Risk-adjusted ROAS: penalise volatility
+        # risk_adj_roas = avg_roas / (1 + volatility)
+        vol = sc["volatility"] if not pd.isna(sc["volatility"]) else 1.0
+        risk_adj_roas = sc["avg_roas"] / (1 + vol)
+
+        camp_scores.append({
+            "campaign":       camp,
+            "channel":        grp["channel"].iloc[0],
+            "hist_spend":     sc["total_spend"],
+            "avg_roas":       sc["avg_roas"],
+            "volatility":     vol,
+            "risk_adj_roas":  risk_adj_roas,
+            "verdict":        sc["verdict"],
+            "active_days":    sc["active_days"],
+            "daily_spend_avg": sc["total_spend"] / max(sc["active_days"], 1),
+        })
+
+    if not camp_scores:
+        st.warning(
+            "No campaigns pass the current constraints. "
+            "Try lowering the Min ROAS threshold or removing verdict exclusions."
+        )
+        return
+
+    scores_df = pd.DataFrame(camp_scores).sort_values("risk_adj_roas", ascending=False)
+
+    # ── Budget allocation (proportional to risk-adjusted ROAS) ─
+    max_per_camp = total_budget * max_camp_pct / 100
+    total_weight = scores_df["risk_adj_roas"].sum()
+
+    scores_df["raw_alloc"]   = (scores_df["risk_adj_roas"] / total_weight * total_budget)
+    scores_df["alloc"]       = scores_df["raw_alloc"].clip(upper=max_per_camp)
+
+    # Redistribute surplus from capped campaigns
+    surplus = total_budget - scores_df["alloc"].sum()
+    if surplus > 1:
+        uncapped = scores_df[scores_df["alloc"] < max_per_camp].copy()
+        if not uncapped.empty:
+            uncap_weight = uncapped["risk_adj_roas"].sum()
+            scores_df.loc[uncapped.index, "alloc"] += (
+                uncapped["risk_adj_roas"] / uncap_weight * surplus
+            ).clip(upper=max_per_camp - uncapped["alloc"])
+
+    # Apply minimum spend — remove campaigns below min
+    scores_df = scores_df[scores_df["alloc"] >= min_camp_spend].copy()
+    if scores_df.empty:
+        st.warning("All campaigns allocated below minimum spend. Lower Min spend per campaign.")
+        return
+
+    # Re-normalise to total_budget after removing sub-minimum
+    total_alloc = scores_df["alloc"].sum()
+    scores_df["alloc"] = (scores_df["alloc"] / total_alloc * total_budget).round(0)
+
+    # Forecast expected revenue
+    scores_df["expected_revenue"] = (scores_df["alloc"] * scores_df["avg_roas"]).round(0)
+    scores_df["expected_roas"]    = (scores_df["expected_revenue"] / scores_df["alloc"]).round(2)
+
+    # ── Summary KPIs ─────────────────────────────────────────
+    total_expected = scores_df["expected_revenue"].sum()
+    total_roas_est = total_expected / total_budget if total_budget > 0 else 0
+    n_camps        = len(scores_df)
+
+    st.markdown("### 📊 Allocation Summary")
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Total Budget",        f"₹{total_budget:,.0f}")
+    k2.metric("Campaigns Funded",    n_camps)
+    k3.metric("Expected Revenue",    f"₹{total_expected:,.0f}")
+    k4.metric("Blended ROAS",        f"{total_roas_est:.2f}x")
+
+    st.divider()
+
+    # ── Allocation table ─────────────────────────────────────
+    st.markdown("### 💰 Recommended Budget Allocation")
+
+    disp = scores_df[[
+        "campaign","channel","verdict","avg_roas","volatility",
+        "alloc","expected_revenue","expected_roas"
+    ]].copy()
+    disp.columns = [
+        "Campaign","Channel","Verdict","Hist ROAS","Volatility",
+        "Allocated (₹)","Expected Revenue (₹)","Expected ROAS"
+    ]
+
+    def colour_verdict_fc(val):
+        bg = VERDICT_BG.get(val, "#ffffff")
+        fg = VERDICT_COLOR.get(val, "#000000")
+        return f"background-color: {bg}; color: {fg}; font-weight: bold"
+
+    st.dataframe(
+        disp.style.format({
+            "Hist ROAS":"{:.2f}x",
+            "Volatility":"{:.2f}",
+            "Allocated (₹)":"₹{:,.0f}",
+            "Expected Revenue (₹)":"₹{:,.0f}",
+            "Expected ROAS":"{:.2f}x",
+        }).map(colour_verdict_fc, subset=["Verdict"]),
+        hide_index=True, use_container_width=True, height=450,
+    )
+
+    # ── Allocation bar chart ─────────────────────────────────
+    st.markdown("### 📊 Budget Split Visualisation")
+    fig_alloc = go.Figure()
+    fig_alloc.add_trace(go.Bar(
+        x=scores_df["campaign"],
+        y=scores_df["alloc"],
+        name="Allocated Budget (₹)",
+        marker_color=[VERDICT_COLOR.get(v,"#6b7280") for v in scores_df["verdict"]],
+        text=scores_df["alloc"].apply(lambda x: f"₹{x:,.0f}"),
+        textposition="outside",
+    ))
+    fig_alloc.add_trace(go.Scatter(
+        x=scores_df["campaign"],
+        y=scores_df["expected_revenue"],
+        name="Expected Revenue (₹)",
+        yaxis="y2", mode="markers",
+        marker=dict(symbol="diamond", size=10, color="#1d4ed8"),
+    ))
+    fig_alloc.update_layout(
+        height=430,
+        xaxis_tickangle=-40,
+        yaxis=dict(title="Budget Allocated (₹)"),
+        yaxis2=dict(title="Expected Revenue (₹)", overlaying="y", side="right"),
+        barmode="group",
+        legend=dict(orientation="h", y=1.1),
+        hovermode="x unified",
+    )
+    st.plotly_chart(fig_alloc, use_container_width=True)
+
+    # ── What-if simulator ────────────────────────────────────
+    st.divider()
+    st.markdown("### 🔮 What-If: Budget Scenarios")
+    st.caption("See how expected revenue changes across different total budgets.")
+
+    scenario_budgets = [
+        total_budget * 0.5,
+        total_budget * 0.75,
+        total_budget,
+        total_budget * 1.25,
+        total_budget * 1.5,
+        total_budget * 2.0,
+    ]
+    scenario_rows = []
+    for sb_val in scenario_budgets:
+        # Simple linear scale of allocations
+        scale = sb_val / total_budget
+        exp_rev = (scores_df["expected_revenue"] * scale).sum()
+        exp_roas = exp_rev / sb_val if sb_val > 0 else 0
+        scenario_rows.append({
+            "Budget (₹)": round(sb_val, 0),
+            "Expected Revenue (₹)": round(exp_rev, 0),
+            "Expected ROAS": round(exp_roas, 2),
+            "vs Current": f"{(scale-1)*100:+.0f}%",
+        })
+
+    sc_df = pd.DataFrame(scenario_rows)
+    sc_df["highlight"] = sc_df["Budget (₹)"] == total_budget
+
+    fig_sc = px.line(
+        sc_df, x="Budget (₹)", y="Expected Revenue (₹)",
+        markers=True, height=320,
+        labels={"Budget (₹)":"Budget (₹)","Expected Revenue (₹)":"Expected Revenue (₹)"},
+    )
+    # Mark current budget
+    cur_row = sc_df[sc_df["highlight"]]
+    fig_sc.add_scatter(
+        x=cur_row["Budget (₹)"], y=cur_row["Expected Revenue (₹)"],
+        mode="markers", marker=dict(size=14, color="#dc2626", symbol="star"),
+        name="Current Budget",
+    )
+    fig_sc.update_layout(hovermode="x unified")
+    st.plotly_chart(fig_sc, use_container_width=True)
+
+    st.dataframe(
+        sc_df.drop(columns=["highlight"]).style.format({
+            "Budget (₹)":"₹{:,.0f}",
+            "Expected Revenue (₹)":"₹{:,.0f}",
+            "Expected ROAS":"{:.2f}x",
+        }),
+        hide_index=True, use_container_width=True,
+    )
+
+    # ── Download plan ────────────────────────────────────────
+    st.download_button(
+        "📥 Download Allocation Plan",
+        disp.to_csv(index=False),
+        file_name=f"budget_plan_{datetime.now().strftime('%Y%m%d')}.csv",
+        mime="text/csv",
+    )
+
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1403,6 +1849,7 @@ def render_marketing_tab(role: str):
         sub_tabs = st.tabs([
             "📊 Dashboard",
             "🔬 Deep Dive",
+            "🎯 Budget Optimizer",
             "📐 ACOS & TACOS",
             "📥 Upload",
             "📚 History",
@@ -1410,18 +1857,21 @@ def render_marketing_tab(role: str):
         ])
         with sub_tabs[0]: _render_dashboard(sb)
         with sub_tabs[1]: _render_deep_dive(sb)
-        with sub_tabs[2]: _render_acos_tacos(sb)
-        with sub_tabs[3]: _render_upload(sb)
-        with sub_tabs[4]: _render_history(sb)
-        with sub_tabs[5]: _render_settings(sb)
+        with sub_tabs[2]: _render_forecast(sb)
+        with sub_tabs[3]: _render_acos_tacos(sb)
+        with sub_tabs[4]: _render_upload(sb)
+        with sub_tabs[5]: _render_history(sb)
+        with sub_tabs[6]: _render_settings(sb)
     else:
         sub_tabs = st.tabs([
             "📊 Dashboard",
             "🔬 Deep Dive",
+            "🎯 Budget Optimizer",
             "📐 ACOS & TACOS",
             "📚 History",
         ])
         with sub_tabs[0]: _render_dashboard(sb)
         with sub_tabs[1]: _render_deep_dive(sb)
-        with sub_tabs[2]: _render_acos_tacos(sb)
-        with sub_tabs[3]: _render_history(sb)
+        with sub_tabs[2]: _render_forecast(sb)
+        with sub_tabs[3]: _render_acos_tacos(sb)
+        with sub_tabs[4]: _render_history(sb)
