@@ -100,7 +100,7 @@ def _channel_sales(sales_df: pd.DataFrame, channel_keyword: str) -> pd.DataFrame
     if sales_df.empty:
         return pd.DataFrame(columns=["item_name", "city", "qty_sold", "revenue"])
 
-    mask = sales_df["channel"].str.lower().str.contains(channel_keyword.lower(), na=False)
+    mask = sales_df["channel"].str.lower().str.contains(channel_keyword.lower(), na=False, regex=False)
     ch   = sales_df[mask].copy()
     if ch.empty:
         return pd.DataFrame(columns=["item_name", "city", "qty_sold", "revenue"])
@@ -228,14 +228,14 @@ def _parse_amazon(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: int, db_
     inv_df = inv_df.copy()
     sku_c  = _find_col(inv_df, ["ASIN", "asin", "sku"])
     inv_df["channel_sku"] = inv_df[sku_c].astype(str).str.strip() if sku_c else ""
-    inv_df["inventory"]   = pd.to_numeric(inv_df["Sellable On Hand Units"].astype(str).str.replace(",", ""), errors="coerce").fillna(0)
+    inv_df["inventory"]   = pd.to_numeric(inv_df["Sellable On Hand Units"].astype(str).str.replace(",", "", regex=False), errors="coerce").fillna(0)
     inv_df["location"]    = "National"
 
     inv_df["str"] = 0.0
     if "Sell-Through %" in inv_df.columns:
         inv_df["str"] = (
             pd.to_numeric(
-                inv_df["Sell-Through %"].astype(str).str.replace("%", "").str.replace(",", ""), errors="coerce"
+                inv_df["Sell-Through %"].astype(str).str.replace("%", "", regex=False).str.replace(",", "", regex=False), errors="coerce"
             ).fillna(0) / 100
         )
 
@@ -484,7 +484,7 @@ def _reapply_sales(snap_df: pd.DataFrame, raw_sales: pd.DataFrame,
         # Normalise city keys the same way parsers do
         if channel == "Swiggy":
             city_sales["_ckey"] = city_sales["city"].astype(str).str.strip().str.upper()
-            snap_df["_ckey"]    = snap_df["location"].astype(str).str.split(" (").str[0].str.strip().str.upper()
+            snap_df["_ckey"]    = snap_df["location"].astype(str).str.split(" (", regex=False).str[0].str.strip().str.upper()
         else:
             city_sales["_ckey"] = city_sales["city"].astype(str).str.strip()
             snap_df["_ckey"]    = snap_df["location"].astype(str).str.strip()
