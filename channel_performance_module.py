@@ -892,13 +892,21 @@ def render_channel_performance_tab(supabase_client, master_skus_df: pd.DataFrame
             except Exception as e:
                 st.error(f"{ch_name} parse error: {e}")
 
+    # ── Reload snapshots after saves so combine sees all channels ─────────────
+    # saved_snapshots was loaded at the start of the run (before fresh uploads
+    # were saved). After saving fresh uploads above, we must reload so that the
+    # combine loop below can fall back to freshly-saved snapshots on the next
+    # rerun (when file_uploader widgets reset after st.rerun()).
+    if freshly_parsed:
+        saved_snapshots = _load_snapshots(supabase_client)
+
     # ── Combine: fresh uploads + snapshots for channels not uploaded ──────────
     uploaded_data = []
     snapshot_channels_used = []
 
     for ch_name in [c[0] for c in CHANNELS]:
         if ch_name in freshly_parsed:
-            # Fresh upload takes priority
+            # Fresh upload takes priority — use in-memory parsed data directly
             uploaded_data.append(freshly_parsed[ch_name])
         elif ch_name in saved_snapshots:
             # Use saved snapshot — re-apply current sales data to it
@@ -956,10 +964,30 @@ def render_channel_performance_tab(supabase_client, master_skus_df: pd.DataFrame
                 if new_entries:
                     try:
                         _save_mappings(supabase_client, new_entries)
-                        st.success(f"Saved {len(new_entries)} mappings.")
+                        st.success(
+                            f"✅ Saved {len(new_entries)} mappings. "
+                            "The dashboard will now render with all channels."
+                        )
+                        # Reload mappings in-place so we can continue WITHOUT
+                        # calling st.rerun() — which would clear file_uploader
+                        # widgets and lose the freshly-uploaded inventory files.
+                        db_mappings = _load_mappings(supabase_client)
+                        db_mappings["channel_sku"] = db_mappings["channel_sku"].astype(str)
+                        # Re-merge with fresh mappings
+                        merged   = combined.merge(db_mappings, on=["channel", "channel_sku"], how="left")
+                        unmapped = merged[merged["master_sku"].isna()][["channel", "channel_sku"]].drop_duplicates()
+                        if not unmapped.empty:
+                            st.info(
+                                f"{len(unmapped)} SKUs still unmapped. "
+                                "They will be excluded from the dashboard until mapped."
+                            )
                     except Exception as e:
                         st.error(f"Failed to save mappings: {e}")
-                st.rerun()
-        return
+                        return
+        # Continue with dashboard even if some SKUs remain unmapped — exclude them
+        merged = merged[merged["master_sku"].notna()].copy()
+        if merged.empty:
+            st.info("No mapped SKUs available yet. Map the channel SKUs above to proceed.")
+            return
 
     _render_dashboard(merged)
