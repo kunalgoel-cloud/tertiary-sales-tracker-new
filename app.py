@@ -7,6 +7,7 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta
 from marketing_module import render_marketing_tab
 from channel_performance_module import render_channel_performance_tab
+from deals_promos_module import render_deals_promos_tab
 
 def _fmt_err(e: Exception) -> str:
     """Short readable error — strips 502 HTML bodies."""
@@ -183,9 +184,9 @@ with st.sidebar:
 # TABS
 # ─────────────────────────────────────────────
 if role == "admin":
-    tabs = st.tabs(["📊 Trend Analytics", "🔬 Deep Dive", "📣 Performance Marketing", "📤 Smart Upload", "🛠 Configuration", "📦 Channel Performance"])
+    tabs = st.tabs(["📊 Trend Analytics", "🔬 Deep Dive", "📣 Performance Marketing", "📤 Smart Upload", "🛠 Configuration", "📦 Channel Performance", "🏷️ Deals & Promos"])
 else:
-    tabs = st.tabs(["📊 Trend Analytics", "🔬 Deep Dive", "📣 Performance Marketing", "📦 Channel Performance"])
+    tabs = st.tabs(["📊 Trend Analytics", "🔬 Deep Dive", "📣 Performance Marketing", "📦 Channel Performance", "🏷️ Deals & Promos"])
 
 # ══════════════════════════════════════════════
 # TAB 1 – TREND ANALYTICS  (unchanged)
@@ -920,3 +921,11 @@ if role == "admin":
 _cp_tab_index = 5 if role == "admin" else 3
 with tabs[_cp_tab_index]:
     render_channel_performance_tab(supabase, master_skus, role)
+
+# ══════════════════════════════════════════════
+# TAB – DEALS & PROMOS (admin + viewer)
+# ══════════════════════════════════════════════
+# Admin: tabs[6]  |  Viewer: tabs[4]
+_dp_tab_index = 6 if role == "admin" else 4
+with tabs[_dp_tab_index]:
+    render_deals_promos_tab(history_df, role)
