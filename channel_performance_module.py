@@ -157,23 +157,23 @@ def _parse_amazon(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: int, db_
     inv_df = inv_df.copy()
     sku_c  = _find_col(inv_df, ["ASIN", "asin", "sku"])
     inv_df["channel_sku"] = inv_df[sku_c].astype(str).str.strip() if sku_c else ""
-    inv_df["inventory"]   = pd.to_numeric(inv_df["Sellable On Hand Units"], errors="coerce").fillna(0)
+    inv_df["inventory"]   = pd.to_numeric(inv_df["Sellable On Hand Units"].astype(str).str.replace(",", ""), errors="coerce").fillna(0)
     inv_df["location"]    = "National"
 
     inv_df["str"] = 0.0
     if "Sell-Through %" in inv_df.columns:
         inv_df["str"] = (
             pd.to_numeric(
-                inv_df["Sell-Through %"].astype(str).str.replace("%", ""), errors="coerce"
+                inv_df["Sell-Through %"].astype(str).str.replace("%", "").str.replace(",", ""), errors="coerce"
             ).fillna(0) / 100
         )
 
     # Translate channel_sku → master_sku for sales join
     if db_mappings is not None and not db_mappings.empty:
         amz_map = db_mappings[db_mappings["channel"] == "Amazon"].set_index("channel_sku")["master_sku"].to_dict()
-        inv_df["master_sku"] = inv_df["channel_sku"].map(amz_map)
+        inv_df["master_sku"] = inv_df["channel_sku"].map(amz_map).fillna(inv_df["channel_sku"]).astype(str)
     else:
-        inv_df["master_sku"] = inv_df["channel_sku"]
+        inv_df["master_sku"] = inv_df["channel_sku"].astype(str)
 
     if not sales_df.empty:
         nat = (
@@ -221,9 +221,9 @@ def _parse_blinkit(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: int, db
     # Translate channel_sku → master_sku for sales join
     if db_mappings is not None and not db_mappings.empty:
         blk_map = db_mappings[db_mappings["channel"] == "Blinkit"].set_index("channel_sku")["master_sku"].to_dict()
-        inv_df["master_sku"] = inv_df["channel_sku"].map(blk_map)
+        inv_df["master_sku"] = inv_df["channel_sku"].map(blk_map).fillna(inv_df["channel_sku"]).astype(str)
     else:
-        inv_df["master_sku"] = inv_df["channel_sku"]
+        inv_df["master_sku"] = inv_df["channel_sku"].astype(str)
 
     if not sales_df.empty:
         city_sales = sales_df[sales_df["city"] != "__national__"].copy()
@@ -272,9 +272,9 @@ def _parse_swiggy(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: int, db_
     # Translate channel_sku → master_sku for sales join
     if db_mappings is not None and not db_mappings.empty:
         swg_map = db_mappings[db_mappings["channel"] == "Swiggy"].set_index("channel_sku")["master_sku"].to_dict()
-        inv_df["master_sku"] = inv_df["channel_sku"].map(swg_map)
+        inv_df["master_sku"] = inv_df["channel_sku"].map(swg_map).fillna(inv_df["channel_sku"]).astype(str)
     else:
-        inv_df["master_sku"] = inv_df["channel_sku"]
+        inv_df["master_sku"] = inv_df["channel_sku"].astype(str)
 
     if not sales_df.empty:
         city_sales = sales_df[sales_df["city"] != "__national__"].copy()
@@ -335,9 +335,9 @@ def _parse_bigbasket(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: int, 
     # Translate channel_sku → master_sku for sales join
     if db_mappings is not None and not db_mappings.empty:
         bb_map = db_mappings[db_mappings["channel"] == "Big Basket"].set_index("channel_sku")["master_sku"].to_dict()
-        inv_df["master_sku"] = inv_df["channel_sku"].map(bb_map)
+        inv_df["master_sku"] = inv_df["channel_sku"].map(bb_map).fillna(inv_df["channel_sku"]).astype(str)
     else:
-        inv_df["master_sku"] = inv_df["channel_sku"]
+        inv_df["master_sku"] = inv_df["channel_sku"].astype(str)
 
     if not sales_df.empty:
         city_sales = sales_df[sales_df["city"] != "__national__"].copy()
