@@ -26,12 +26,25 @@ from datetime import datetime, timedelta
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _load_mappings(supabase_client) -> pd.DataFrame:
-    """Load SKU mappings from Supabase channel_sku_mappings table."""
+    """Load SKU mappings from Supabase channel_sku_mappings table (paginated)."""
     try:
-        res = supabase_client.table("channel_sku_mappings").select("*").execute()
-        if not res.data:
+        all_rows, page, PAGE_SIZE = [], 0, 1000
+        while True:
+            res = (
+                supabase_client.table("channel_sku_mappings")
+                .select("*")
+                .range(page * PAGE_SIZE, (page + 1) * PAGE_SIZE - 1)
+                .execute()
+            )
+            if not res.data:
+                break
+            all_rows.extend(res.data)
+            if len(res.data) < PAGE_SIZE:
+                break
+            page += 1
+        if not all_rows:
             return pd.DataFrame(columns=["channel", "channel_sku", "master_sku"])
-        return pd.DataFrame(res.data)[["channel", "channel_sku", "master_sku"]].astype(str)
+        return pd.DataFrame(all_rows)[["channel", "channel_sku", "master_sku"]].astype(str)
     except Exception:
         return pd.DataFrame(columns=["channel", "channel_sku", "master_sku"])
 
@@ -178,23 +191,39 @@ def _save_snapshot(supabase_client, parsed_df: pd.DataFrame, channel: str):
 
 def _load_snapshots(supabase_client) -> dict:
     """
-    Load latest saved inventory snapshots from Supabase.
+    Load latest saved inventory snapshots from Supabase (paginated).
     Returns dict: { channel_name -> (uploaded_at str, DataFrame) }
     """
     try:
-        res = supabase_client.table("channel_inventory_snapshots")             .select("*").execute()
-        if not res.data:
+        all_rows, page, PAGE_SIZE = [], 0, 1000
+        while True:
+            res = (
+                supabase_client.table("channel_inventory_snapshots")
+                .select("*")
+                .range(page * PAGE_SIZE, (page + 1) * PAGE_SIZE - 1)
+                .execute()
+            )
+            if not res.data:
+                break
+            all_rows.extend(res.data)
+            if len(res.data) < PAGE_SIZE:
+                break
+            page += 1
+
+        if not all_rows:
             return {}
-        df = pd.DataFrame(res.data)
+
+        df = pd.DataFrame(all_rows)
         result = {}
         for channel, grp in df.groupby("channel"):
-            uploaded_at = grp["uploaded_at"].iloc[0]
-            # Parse uploaded_at to a readable string
+            # Use the LATEST uploaded_at in case old rows weren't cleaned up
+            latest_ts = grp["uploaded_at"].max()
             try:
-                dt = pd.to_datetime(uploaded_at)
-                uploaded_at_str = dt.strftime("%-d %b %Y, %I:%M %p")
+                dt = pd.to_datetime(latest_ts)
+                # Use strftime format compatible with all platforms
+                uploaded_at_str = dt.strftime("%d %b %Y, %I:%M %p").lstrip("0")
             except Exception:
-                uploaded_at_str = str(uploaded_at)
+                uploaded_at_str = str(latest_ts)
             snap_df = grp[SNAPSHOT_COLS].copy()
             for col in ["inventory", "str", "doc", "drr", "units_sold"]:
                 snap_df[col] = pd.to_numeric(snap_df[col], errors="coerce").fillna(0)
