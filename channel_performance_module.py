@@ -681,17 +681,29 @@ def _render_dashboard(merged: pd.DataFrame):
                 if grp["inventory"].sum() > 0 else 0.0
 
         def _g_drr(grp):
-            u = d = 0
-            for ch, sub in grp.groupby("channel"):
-                u += sub["units_sold"].sum()
-                d  = max(d, sub["n_days"].max())
+            # When grouped by "channel", pandas drops the grouping column from grp.
+            # So we can't groupby("channel") again inside .apply().
+            # Instead: sum units_sold and take max n_days directly from grp.
+            u = grp["units_sold"].sum()
+            d = grp["n_days"].max() if "n_days" in grp.columns else 30
             return u / d if d > 0 else 0.0
+
+        # include_groups=False prevents pandas 2.2+ DeprecationWarning and
+        # ensures the grouping column is available inside the function when needed.
+        apply_kwargs = {"include_groups": False} if hasattr(
+            table_df.groupby(grp_col), "_grouper") else {}
+
+        def _safe_apply(fn):
+            try:
+                return table_df.groupby(grp_col).apply(fn, include_groups=False)
+            except TypeError:
+                return table_df.groupby(grp_col).apply(fn)
 
         agg_df = (
             agg_df
-            .join(table_df.groupby(grp_col).apply(_w_doc).rename("doc"), on=grp_col)
-            .join(table_df.groupby(grp_col).apply(_w_str).rename("str"), on=grp_col)
-            .join(table_df.groupby(grp_col).apply(_g_drr).rename("drr"), on=grp_col)
+            .join(_safe_apply(_w_doc).rename("doc"), on=grp_col)
+            .join(_safe_apply(_w_str).rename("str"), on=grp_col)
+            .join(_safe_apply(_g_drr).rename("drr"), on=grp_col)
             .sort_values("inventory", ascending=False).reset_index(drop=True)
         )
         st.dataframe(
