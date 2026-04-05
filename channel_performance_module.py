@@ -27,52 +27,52 @@ from datetime import datetime, timedelta
 
 @st.cache_resource
 def _get_pg_engine():
-    from sqlalchemy import create_engine
+    """Returns a psycopg2 connection URL string, or None if not configured."""
     try:
-        conn_url = st.secrets["connections"]["postgresql"]["url"]
-        return create_engine(conn_url)
+        return st.secrets["connections"]["postgresql"]["url"]
     except Exception:
         return None
 
 
-def _init_pg(engine):
-    from sqlalchemy import text
-    with engine.connect() as conn:
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS sku_mappings (
-                id SERIAL PRIMARY KEY,
-                channel TEXT NOT NULL,
-                channel_sku TEXT NOT NULL,
-                master_sku TEXT NOT NULL,
-                UNIQUE(channel, channel_sku)
-            );
-        """))
+def _init_pg(conn_url):
+    import psycopg2
+    with psycopg2.connect(conn_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS sku_mappings (
+                    id SERIAL PRIMARY KEY,
+                    channel TEXT NOT NULL,
+                    channel_sku TEXT NOT NULL,
+                    master_sku TEXT NOT NULL,
+                    UNIQUE(channel, channel_sku)
+                );
+            """)
         conn.commit()
 
 
-def _load_mappings(engine) -> pd.DataFrame:
-    from sqlalchemy import text
+def _load_mappings(conn_url) -> pd.DataFrame:
+    import psycopg2
     try:
-        with engine.connect() as conn:
-            result = conn.execute(
-                text("SELECT channel, channel_sku, master_sku FROM sku_mappings")
-            )
-            rows = result.fetchall()
+        with psycopg2.connect(conn_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT channel, channel_sku, master_sku FROM sku_mappings")
+                rows = cur.fetchall()
         return pd.DataFrame(rows, columns=["channel", "channel_sku", "master_sku"]).astype(str)
     except Exception:
         return pd.DataFrame(columns=["channel", "channel_sku", "master_sku"])
 
 
-def _save_mappings(engine, new_entries):
-    from sqlalchemy import text
-    with engine.connect() as conn:
-        for entry in new_entries:
-            conn.execute(text("""
-                INSERT INTO sku_mappings (channel, channel_sku, master_sku)
-                VALUES (:channel, :channel_sku, :master_sku)
-                ON CONFLICT (channel, channel_sku)
-                DO UPDATE SET master_sku = EXCLUDED.master_sku
-            """), entry)
+def _save_mappings(conn_url, new_entries):
+    import psycopg2
+    with psycopg2.connect(conn_url) as conn:
+        with conn.cursor() as cur:
+            for entry in new_entries:
+                cur.execute("""
+                    INSERT INTO sku_mappings (channel, channel_sku, master_sku)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (channel, channel_sku)
+                    DO UPDATE SET master_sku = EXCLUDED.master_sku
+                """, (entry["channel"], entry["channel_sku"], entry["master_sku"]))
         conn.commit()
 
 
@@ -600,8 +600,8 @@ def render_channel_performance_tab(supabase_client, master_skus_df: pd.DataFrame
     )
 
     # ── PostgreSQL for SKU mapping persistence ────────────────────────────────
-    engine       = _get_pg_engine()
-    pg_available = engine is not None
+    pg_url       = _get_pg_engine()  # returns URL string or None
+    pg_available = pg_url is not None
 
     if not pg_available:
         st.warning(
@@ -610,12 +610,12 @@ def render_channel_performance_tab(supabase_client, master_skus_df: pd.DataFrame
         )
     else:
         try:
-            _init_pg(engine)
+            _init_pg(pg_url)
         except Exception as e:
             st.warning(f"Could not initialise mapping table: {e}")
             pg_available = False
 
-    db_mappings = _load_mappings(engine) if pg_available else pd.DataFrame(
+    db_mappings = _load_mappings(pg_url) if pg_available else pd.DataFrame(
         columns=["channel", "channel_sku", "master_sku"]
     )
 
@@ -745,7 +745,7 @@ def render_channel_performance_tab(supabase_client, master_skus_df: pd.DataFrame
             if st.form_submit_button("💾 Save & Sync"):
                 if pg_available and new_entries:
                     try:
-                        _save_mappings(engine, new_entries)
+                        _save_mappings(pg_url, new_entries)
                         st.success(f"Saved {len(new_entries)} mappings.")
                     except Exception as e:
                         st.error(f"Failed to save: {e}")
