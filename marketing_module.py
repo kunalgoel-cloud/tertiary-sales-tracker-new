@@ -282,6 +282,127 @@ def _apply_product_map(sales_df: pd.DataFrame, product_map: dict[str, list[str]]
 
 
 # ─────────────────────────────────────────────────────────────
+# BRAND SPEND DB HELPERS
+# ─────────────────────────────────────────────────────────────
+
+def _get_branding_channels(sb) -> list[str]:
+    """Fetch configured branding channel names."""
+    try:
+        r = sb.table("branding_channels").select("name").order("name").execute()
+        return [x["name"] for x in r.data]
+    except Exception:
+        return []
+
+def _add_branding_channel(sb, name: str) -> bool:
+    try:
+        sb.table("branding_channels").insert({"name": name}).execute()
+        return True
+    except Exception as e:
+        st.error(f"Error adding branding channel: {e}")
+        return False
+
+def _delete_branding_channel(sb, name: str) -> bool:
+    try:
+        sb.table("branding_channels").delete().eq("name", name).execute()
+        return True
+    except Exception as e:
+        st.error(f"Error deleting branding channel: {e}")
+        return False
+
+def _get_brand_spends(sb) -> pd.DataFrame:
+    """Fetch all brand spend records."""
+    try:
+        all_rows, page, PAGE_SIZE = [], 0, 1000
+        while True:
+            r = sb.table("brand_spends").select("*").order("year", desc=True)                .range(page * PAGE_SIZE, (page + 1) * PAGE_SIZE - 1).execute()
+            if not r.data: break
+            all_rows.extend(r.data)
+            if len(r.data) < PAGE_SIZE: break
+            page += 1
+        if not all_rows:
+            return pd.DataFrame(columns=["id","year","month","channel","product","amount"])
+        df = pd.DataFrame(all_rows)
+        df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0)
+        return df
+    except Exception as e:
+        st.warning(f"Could not load brand spends: {_fmt_err(e)}")
+        return pd.DataFrame(columns=["id","year","month","channel","product","amount"])
+
+def _save_brand_spend(sb, year: int, month: int, channel: str,
+                      product: str | None, amount: float) -> bool:
+    try:
+        sb.table("brand_spends").insert({
+            "year": year, "month": month,
+            "channel": channel,
+            "product": product if product else None,
+            "amount": float(amount),
+        }).execute()
+        return True
+    except Exception as e:
+        st.error(f"Error saving brand spend: {e}")
+        return False
+
+def _delete_brand_spend(sb, record_id: int) -> bool:
+    try:
+        sb.table("brand_spends").delete().eq("id", record_id).execute()
+        return True
+    except Exception as e:
+        st.error(f"Error deleting brand spend: {e}")
+        return False
+
+def _expand_brand_spends_daily(brand_df: pd.DataFrame,
+                                start_date, end_date,
+                                product_map: dict) -> pd.DataFrame:
+    """
+    Given brand_spends records, expand into a daily series so they can be
+    added to perf spend in the ACOS/TACOS view.
+
+    Rules:
+    - Each record covers the full calendar month (year, month).
+    - Daily brand spend = monthly amount / days_in_month.
+    - If product is None → split proportionally across products using product_map
+      keys (equal split as proxy; actual revenue-weighted split done at display time).
+    - Returns: date, channel, product (nullable), brand_spend_daily
+    """
+    import calendar
+    rows = []
+    for _, rec in brand_df.iterrows():
+        y, m, ch = int(rec["year"]), int(rec["month"]), rec["channel"]
+        amount    = float(rec["amount"])
+        product   = rec.get("product")
+        if pd.isna(product) or str(product).strip() in ("", "None"):
+            product = None
+
+        days_in_month = calendar.monthrange(y, m)[1]
+        daily_amt     = amount / days_in_month
+
+        # Generate daily rows for days that fall within the requested date range
+        month_start = pd.Timestamp(y, m, 1)
+        month_end   = pd.Timestamp(y, m, days_in_month)
+        window_start = pd.Timestamp(start_date)
+        window_end   = pd.Timestamp(end_date)
+
+        effective_start = max(month_start, window_start)
+        effective_end   = min(month_end, window_end)
+
+        if effective_start > effective_end:
+            continue
+
+        dates = pd.date_range(effective_start, effective_end, freq="D")
+        for d in dates:
+            rows.append({
+                "date":              d,
+                "channel":           ch,
+                "product":           product,
+                "brand_spend_daily": daily_amt,
+            })
+
+    if not rows:
+        return pd.DataFrame(columns=["date","channel","product","brand_spend_daily"])
+    return pd.DataFrame(rows)
+
+
+# ─────────────────────────────────────────────────────────────
 # DATABASE HELPERS — SALES DB  (for TACOS cross-join)
 # ─────────────────────────────────────────────────────────────
 
@@ -1238,6 +1359,132 @@ def _render_forecast(sb):
 
 
 # ─────────────────────────────────────────────────────────────
+# BRAND SPENDS TAB
+# ─────────────────────────────────────────────────────────────
+
+def _render_brand_spends(sb):
+    st.subheader("🏷️ Brand Spend Tracker")
+    st.caption(
+        "Record monthly brand / awareness ad investments. These are not campaign-level "
+        "attributable spends — they apply to the whole company or a specific channel. "
+        "Brand spend is distributed equally across each day of the month for TACOS reporting."
+    )
+
+    products       = _get_products(sb)
+    brand_channels = _get_branding_channels(sb)
+
+    if not brand_channels:
+        st.warning(
+            "⚠️ No branding channels configured. "
+            "Add branding channels in **⚙️ Settings → Branding Channels** first."
+        )
+
+    # ── Record new spend ─────────────────────────────────────
+    st.markdown("#### ➕ Record Brand Spend")
+    with st.form("brand_spend_form"):
+        bc1, bc2, bc3 = st.columns(3)
+        with bc1:
+            sel_year  = st.selectbox("Year", list(range(2023, 2030)),
+                                      index=list(range(2023, 2030)).index(
+                                          pd.Timestamp.now().year), key="bs_year")
+            sel_month = st.selectbox("Month", list(range(1, 13)),
+                                      index=pd.Timestamp.now().month - 1,
+                                      format_func=lambda m: pd.Timestamp(2024, m, 1).strftime("%B"),
+                                      key="bs_month")
+        with bc2:
+            ch_options = brand_channels if brand_channels else ["(no channels yet)"]
+            sel_ch     = st.selectbox("Branding Channel", ch_options, key="bs_ch")
+            amount     = st.number_input("Monthly Spend (₹)", min_value=0.0,
+                                          step=1000.0, value=0.0, key="bs_amount")
+        with bc3:
+            prod_options = ["(All Products — proportional split)"] + products
+            sel_prod     = st.selectbox(
+                "Product Attribution (optional)",
+                prod_options, key="bs_prod",
+                help="Leave as 'All Products' if this brand spend is not attributable "
+                     "to any single product. The spend will be split proportionally "
+                     "across all products based on their sales share."
+            )
+            st.markdown("")
+            st.markdown("")
+            submitted = st.form_submit_button("💾 Save Brand Spend", type="primary",
+                                               use_container_width=True)
+
+        if submitted:
+            if not brand_channels:
+                st.error("Add branding channels in Settings first.")
+            elif amount <= 0:
+                st.error("Amount must be greater than 0.")
+            else:
+                prod_val = None if sel_prod.startswith("(All") else sel_prod
+                if _save_brand_spend(sb, sel_year, sel_month, sel_ch, prod_val, amount):
+                    st.success(
+                        f"✅ Saved ₹{amount:,.0f} brand spend for **{sel_ch}** "
+                        f"({pd.Timestamp(sel_year, sel_month, 1).strftime('%B %Y')})"
+                        + (f" → {prod_val}" if prod_val else " → All Products (proportional)")
+                    )
+                    st.rerun()
+
+    st.divider()
+
+    # ── Existing records ─────────────────────────────────────
+    st.markdown("#### 📋 Recorded Brand Spends")
+    brand_df = _get_brand_spends(sb)
+
+    if brand_df.empty:
+        st.info("No brand spend records yet.")
+        return
+
+    # Format for display
+    disp = brand_df.copy()
+    disp["Month-Year"] = disp.apply(
+        lambda r: pd.Timestamp(int(r["year"]), int(r["month"]), 1).strftime("%B %Y"), axis=1
+    )
+    disp["Product"]    = disp["product"].fillna("All Products (proportional)")
+    disp["Daily Rate"] = (disp["amount"] / disp.apply(
+        lambda r: __import__("calendar").monthrange(int(r["year"]), int(r["month"]))[1], axis=1
+    )).round(0)
+
+    disp_show = disp[["Month-Year","channel","Product","amount","Daily Rate"]].rename(columns={
+        "channel": "Branding Channel", "amount": "Monthly Spend (₹)",
+        "Daily Rate": "Daily Rate (₹)",
+    })
+
+    # Summary KPIs
+    sk1, sk2, sk3 = st.columns(3)
+    sk1.metric("Total Records", len(brand_df))
+    sk2.metric("Total Brand Spend", f"₹{brand_df['amount'].sum():,.0f}")
+    sk3.metric("Channels", brand_df["channel"].nunique())
+
+    st.dataframe(
+        disp_show.style.format({"Monthly Spend (₹)": "₹{:,.0f}", "Daily Rate (₹)": "₹{:,.0f}"}),
+        hide_index=True, use_container_width=True,
+    )
+
+    # ── Delete a record ───────────────────────────────────────
+    st.divider()
+    st.markdown("#### 🗑️ Delete a Record")
+    st.caption("Select a record to permanently remove it.")
+
+    if "id" in brand_df.columns:
+        del_options = {
+            f"ID {row['id']} — {pd.Timestamp(int(row['year']), int(row['month']), 1).strftime('%B %Y')} "
+            f"| {row['channel']} | ₹{row['amount']:,.0f}": row["id"]
+            for _, row in brand_df.iterrows()
+        }
+        del_label = st.selectbox("Select record to delete", ["— select —"] + list(del_options.keys()),
+                                  key="bs_del_select")
+        if st.button("🗑️ Delete Selected", type="primary", key="bs_del_btn"):
+            if del_label != "— select —":
+                rec_id = del_options[del_label]
+                if _delete_brand_spend(sb, rec_id):
+                    st.success("Record deleted.")
+                    st.rerun()
+            else:
+                st.error("Please select a record to delete.")
+
+
+# ─────────────────────────────────────────────────────────────
 # ACOS / TACOS
 # ─────────────────────────────────────────────────────────────
 
@@ -1258,9 +1505,10 @@ def _render_acos_tacos(sb):
 
     df_mkt["date"] = pd.to_datetime(df_mkt["date"])
 
-    # Load channel map, product map, and sales data
+    # Load channel map, product map, sales data, and brand spends
     channel_map = _get_channel_map(sb)
     product_map = _get_product_map(sb)
+    brand_df    = _get_brand_spends(sb)
 
     with st.spinner("Loading total sales data…"):
         df_sales = _get_sales_data()
@@ -1321,40 +1569,64 @@ def _render_acos_tacos(sb):
         if ch_sel:
             sales_f = sales_f[sales_f["mkt_channel"].isin(ch_sel)]
 
+    # ── Brand spend for the selected date range ──────────────────────────────
+    # Expand monthly brand spends into daily rows, then sum for the window
+    bs_daily = pd.DataFrame(columns=["date","channel","product","brand_spend_daily"])
+    if not brand_df.empty and len(dr) == 2:
+        bs_daily = _expand_brand_spends_daily(brand_df, dr[0], dr[1], product_map)
+    total_brand_spend = bs_daily["brand_spend_daily"].sum() if not bs_daily.empty else 0.0
+
     # Grand KPIs
-    total_spend  = mkt_f["spend"].sum()
-    total_ad_rev = mkt_f["sales"].sum()
-    acos_overall = (total_spend / total_ad_rev * 100) if total_ad_rev > 0 else 0
-    roas_overall = (total_ad_rev / total_spend) if total_spend > 0 else 0
+    total_perf_spend = mkt_f["spend"].sum()
+    total_spend      = total_perf_spend + total_brand_spend  # combined for TACOS
+    total_ad_rev     = mkt_f["sales"].sum()
+    acos_overall     = (total_perf_spend / total_ad_rev * 100) if total_ad_rev > 0 else 0
+    roas_overall     = (total_ad_rev / total_perf_spend) if total_perf_spend > 0 else 0
 
     if has_sales:
         # Channel TACOS: spend vs GMV only on channels where we advertise
         ch_gmv        = sales_f["revenue"].sum()
-        ch_tacos      = (total_spend / ch_gmv * 100) if ch_gmv > 0 else 0
+        ch_tacos_perf  = (total_perf_spend / ch_gmv * 100) if ch_gmv > 0 else 0
+        ch_tacos_total = (total_spend / ch_gmv * 100) if ch_gmv > 0 else 0
         # Company TACOS: spend vs ALL company GMV (every channel, organic included)
         co_gmv        = sales_all["revenue"].sum()
-        co_tacos      = (total_spend / co_gmv * 100) if co_gmv > 0 else 0
-        organic_rev   = max(co_gmv - total_ad_rev, 0)
-        organic_pct   = (organic_rev / co_gmv * 100) if co_gmv > 0 else 0
+        co_tacos_perf  = (total_perf_spend / co_gmv * 100) if co_gmv > 0 else 0
+        co_tacos_total = (total_spend / co_gmv * 100) if co_gmv > 0 else 0
+        organic_rev    = max(co_gmv - total_ad_rev, 0)
+        organic_pct    = (organic_rev / co_gmv * 100) if co_gmv > 0 else 0
 
-        st.markdown("##### 📊 Key Metrics")
-        k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Ad Spend",        f"₹{total_spend:,.0f}")
-        k2.metric("Ad Revenue",      f"₹{total_ad_rev:,.0f}")
-        k3.metric("ACOS",            f"{acos_overall:.1f}%",
-                  help="Ad Spend ÷ Ad-Attributed Revenue × 100")
-        k4.metric("ROAS",            f"{roas_overall:.2f}x")
+        st.markdown("##### 📊 Ad Spend Breakdown")
+        ks1, ks2, ks3, ks4 = st.columns(4)
+        ks1.metric("Perf Ad Spend",   f"₹{total_perf_spend:,.0f}",
+                   help="Performance marketing spend — campaign-level, daily attribution")
+        ks2.metric("Brand Ad Spend",  f"₹{total_brand_spend:,.0f}",
+                   help="Brand/awareness spend — monthly, distributed equally across days")
+        ks3.metric("Total Ad Spend",  f"₹{total_spend:,.0f}",
+                   help="Perf Spend + Brand Spend combined")
+        ks4.metric("Ad Revenue",      f"₹{total_ad_rev:,.0f}",
+                   help="Ad-attributed revenue from performance campaigns only")
+
+        st.markdown("##### 📊 Efficiency Metrics")
+        ke1, ke2, ke3, ke4 = st.columns(4)
+        ke1.metric("ACOS",            f"{acos_overall:.1f}%",
+                   help="Perf Ad Spend ÷ Ad-Attributed Revenue × 100")
+        ke2.metric("ROAS",            f"{roas_overall:.2f}x",
+                   help="Ad Revenue ÷ Perf Ad Spend")
+        ke3.metric("Perf-only TACOS", f"{co_tacos_perf:.1f}%",
+                   help="Perf Ad Spend ÷ Total Company GMV")
+        ke4.metric("Total TACOS",     f"{co_tacos_total:.1f}%",
+                   help="(Perf + Brand Spend) ÷ Total Company GMV — true total marketing cost")
 
         st.markdown("##### 🏢 TACOS View")
         t1, t2, t3, t4 = st.columns(4)
-        t1.metric("Channel GMV",     f"₹{ch_gmv:,.0f}",
+        t1.metric("Channel GMV",      f"₹{ch_gmv:,.0f}",
                   help="Total GMV on channels where marketing spend exists")
-        t2.metric("Channel TACOS",   f"{ch_tacos:.1f}%",
-                  help="Ad Spend ÷ GMV on advertised channels only")
-        t3.metric("Company GMV",     f"₹{co_gmv:,.0f}",
+        t2.metric("Channel TACOS",    f"{ch_tacos_total:.1f}%",
+                  help="(Perf + Brand Spend) ÷ GMV on advertised channels only")
+        t3.metric("Company GMV",      f"₹{co_gmv:,.0f}",
                   help="Total GMV across ALL channels (full business view)")
-        t4.metric("Company TACOS",   f"{co_tacos:.1f}%",
-                  help="Ad Spend ÷ Total Company GMV — true cost of advertising to the business")
+        t4.metric("Company TACOS",    f"{co_tacos_total:.1f}%",
+                  help="(Perf + Brand Spend) ÷ Total Company GMV")
 
         st.caption(
             f"🌱 Organic Revenue: ₹{organic_rev:,.0f} ({organic_pct:.1f}% of company GMV) "
@@ -1362,23 +1634,36 @@ def _render_acos_tacos(sb):
         )
     else:
         k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Ad Spend",   f"₹{total_spend:,.0f}")
-        k2.metric("Ad Revenue", f"₹{total_ad_rev:,.0f}")
-        k3.metric("ACOS",       f"{acos_overall:.1f}%")
-        k4.metric("ROAS",       f"{roas_overall:.2f}x")
+        k1.metric("Perf Ad Spend",  f"₹{total_perf_spend:,.0f}")
+        k2.metric("Brand Ad Spend", f"₹{total_brand_spend:,.0f}")
+        k3.metric("ACOS",           f"{acos_overall:.1f}%")
+        k4.metric("ROAS",           f"{roas_overall:.2f}x")
 
     st.divider()
 
-    # Weekly trend
-    st.markdown("#### 📈 Weekly ACOS vs TACOS Trend")
+    # Weekly trend — add brand spend weekly rollup
+    st.markdown("#### 📈 Weekly Spend & TACOS Trend")
     mkt_f["week"] = mkt_f["date"].dt.to_period("W").apply(lambda p: str(p.start_time.date()))
     mkt_weekly = mkt_f.groupby("week").agg(spend=("spend","sum"), ad_rev=("sales","sum")).reset_index()
     mkt_weekly["ACOS"] = pd.to_numeric(mkt_weekly["spend"] / mkt_weekly["ad_rev"].where(mkt_weekly["ad_rev"] > 0) * 100, errors="coerce").round(1)
 
+    # Brand spend weekly aggregation
+    if not bs_daily.empty:
+        bs_daily["week"] = bs_daily["date"].dt.to_period("W").apply(lambda p: str(p.start_time.date()))
+        brand_weekly     = bs_daily.groupby("week")["brand_spend_daily"].sum().reset_index()                                   .rename(columns={"brand_spend_daily":"brand_spend"})
+        mkt_weekly = mkt_weekly.merge(brand_weekly, on="week", how="left").fillna(0)
+    else:
+        mkt_weekly["brand_spend"] = 0.0
+    mkt_weekly["total_spend"] = mkt_weekly["spend"] + mkt_weekly["brand_spend"]
+
     fig_trend = go.Figure()
     fig_trend.add_trace(go.Bar(
         x=mkt_weekly["week"], y=mkt_weekly["spend"],
-        name="Ad Spend (₹)", marker_color="#636EFA", opacity=0.7,
+        name="Perf Ad Spend (₹)", marker_color="#636EFA", opacity=0.85,
+    ))
+    fig_trend.add_trace(go.Bar(
+        x=mkt_weekly["week"], y=mkt_weekly["brand_spend"],
+        name="Brand Ad Spend (₹)", marker_color="#f59e0b", opacity=0.85,
     ))
 
     if has_sales:
@@ -1386,9 +1671,13 @@ def _render_acos_tacos(sb):
         sales_all["week"]  = sales_all["date"].dt.to_period("W").apply(lambda p: str(p.start_time.date()))
         sales_weekly       = sales_all.groupby("week")["revenue"].sum().reset_index()
         combined           = mkt_weekly.merge(sales_weekly, on="week", how="left").fillna(0)
-        combined["TACOS"]    = pd.to_numeric(combined["spend"] / combined["revenue"].where(combined["revenue"] > 0) * 100, errors="coerce").round(1)
-        combined["organic"]  = (combined["revenue"] - combined["ad_rev"]).clip(lower=0)
-        combined["organic%"] = pd.to_numeric(combined["organic"] / combined["revenue"].where(combined["revenue"] > 0) * 100, errors="coerce").round(1)
+        # Perf-only TACOS and Total TACOS (perf + brand)
+        combined["TACOS_perf"]  = pd.to_numeric(combined["spend"] / combined["revenue"].where(combined["revenue"] > 0) * 100, errors="coerce").round(1)
+        combined["TACOS_total"] = pd.to_numeric(combined["total_spend"] / combined["revenue"].where(combined["revenue"] > 0) * 100, errors="coerce").round(1)
+        combined["organic"]     = (combined["revenue"] - combined["ad_rev"]).clip(lower=0)
+        combined["organic%"]    = pd.to_numeric(combined["organic"] / combined["revenue"].where(combined["revenue"] > 0) * 100, errors="coerce").round(1)
+        # Keep backward-compat alias
+        combined["TACOS"] = combined["TACOS_total"]
 
         fig_trend.add_trace(go.Scatter(
             x=combined["week"], y=combined["ACOS"],
@@ -1396,9 +1685,14 @@ def _render_acos_tacos(sb):
             line=dict(color="orange", width=2.5),
         ))
         fig_trend.add_trace(go.Scatter(
-            x=combined["week"], y=combined["TACOS"],
-            name="TACOS %", yaxis="y2", mode="lines+markers",
-            line=dict(color="red", width=2.5, dash="dot"),
+            x=combined["week"], y=combined["TACOS_perf"],
+            name="TACOS % (Perf only)", yaxis="y2", mode="lines+markers",
+            line=dict(color="red", width=2, dash="dot"),
+        ))
+        fig_trend.add_trace(go.Scatter(
+            x=combined["week"], y=combined["TACOS_total"],
+            name="TACOS % (Perf+Brand)", yaxis="y2", mode="lines+markers",
+            line=dict(color="#7c3aed", width=2.5, dash="solid"),
         ))
         fig_trend.add_trace(go.Scatter(
             x=combined["week"], y=combined["organic%"],
@@ -1413,7 +1707,8 @@ def _render_acos_tacos(sb):
         ))
 
     fig_trend.update_layout(
-        height=460,
+        barmode="stack",
+        height=480,
         yaxis=dict(title="Ad Spend (₹)"),
         yaxis2=dict(title="% Metric", overlaying="y", side="right", range=[0, 100]),
         legend=dict(orientation="h", y=1.15),
@@ -1631,7 +1926,7 @@ def _render_history(sb):
 
 def _render_settings(sb):
     st.subheader("⚙️ Marketing Settings")
-    s1, s2, s3, s4, s5 = st.tabs(["Master Data", "Mapping Manager", "Channel Map", "Product Map", "Data Cleanup"])
+    s1, s2, s3, s4, s5, s6 = st.tabs(["Master Data", "Mapping Manager", "Channel Map", "Product Map", "Branding Channels", "Data Cleanup"])
 
     with s1:
         col1, col2 = st.columns(2)
@@ -1813,6 +2108,33 @@ def _render_settings(sb):
                         st.write(f"  • {u}")
 
     with s5:
+        st.markdown("##### 📺 Branding Channels")
+        st.caption(
+            "Define channels where brand/awareness ads are placed. "
+            "These are used in the **Brand Spends** tab to record monthly investments."
+        )
+        existing_bc = _get_branding_channels(sb)
+        if existing_bc:
+            st.markdown("**Configured branding channels:**")
+            for bc in existing_bc:
+                bcc1, bcc2 = st.columns([4, 1])
+                bcc1.write(f"• {bc}")
+                if bcc2.button("Remove", key=f"bs_rmv_{bc}"):
+                    if _delete_branding_channel(sb, bc):
+                        st.success(f"Removed: {bc}")
+                        st.rerun()
+        else:
+            st.info("No branding channels configured yet.")
+
+        st.divider()
+        new_bc = st.text_input("New Branding Channel Name", key="bs_new_ch",
+                               help="e.g. Instagram, YouTube, LinkedIn, Offline Events")
+        if st.button("Add Branding Channel", key="bs_add_ch") and new_bc.strip():
+            if _add_branding_channel(sb, new_bc.strip()):
+                st.success(f"Added: {new_bc.strip()}")
+                st.rerun()
+
+    with s6:
         st.markdown("##### 🗑️ Delete Performance Records")
         st.warning("This permanently removes data. Use with caution.")
         dc1, dc2 = st.columns(2)
@@ -1851,6 +2173,7 @@ def render_marketing_tab(role: str):
             "🔬 Deep Dive",
             "🎯 Budget Optimizer",
             "📐 ACOS & TACOS",
+            "🏷️ Brand Spends",
             "📥 Upload",
             "📚 History",
             "⚙️ Settings",
@@ -1859,9 +2182,10 @@ def render_marketing_tab(role: str):
         with sub_tabs[1]: _render_deep_dive(sb)
         with sub_tabs[2]: _render_forecast(sb)
         with sub_tabs[3]: _render_acos_tacos(sb)
-        with sub_tabs[4]: _render_upload(sb)
-        with sub_tabs[5]: _render_history(sb)
-        with sub_tabs[6]: _render_settings(sb)
+        with sub_tabs[4]: _render_brand_spends(sb)
+        with sub_tabs[5]: _render_upload(sb)
+        with sub_tabs[6]: _render_history(sb)
+        with sub_tabs[7]: _render_settings(sb)
     else:
         sub_tabs = st.tabs([
             "📊 Dashboard",
