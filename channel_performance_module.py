@@ -26,25 +26,12 @@ from datetime import datetime, timedelta
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _load_mappings(supabase_client) -> pd.DataFrame:
-    """Load SKU mappings from Supabase channel_sku_mappings table (paginated)."""
+    """Load SKU mappings from Supabase channel_sku_mappings table."""
     try:
-        all_rows, page, PAGE_SIZE = [], 0, 1000
-        while True:
-            res = (
-                supabase_client.table("channel_sku_mappings")
-                .select("*")
-                .range(page * PAGE_SIZE, (page + 1) * PAGE_SIZE - 1)
-                .execute()
-            )
-            if not res.data:
-                break
-            all_rows.extend(res.data)
-            if len(res.data) < PAGE_SIZE:
-                break
-            page += 1
-        if not all_rows:
+        res = supabase_client.table("channel_sku_mappings").select("*").execute()
+        if not res.data:
             return pd.DataFrame(columns=["channel", "channel_sku", "master_sku"])
-        return pd.DataFrame(all_rows)[["channel", "channel_sku", "master_sku"]].astype(str)
+        return pd.DataFrame(res.data)[["channel", "channel_sku", "master_sku"]].astype(str)
     except Exception:
         return pd.DataFrame(columns=["channel", "channel_sku", "master_sku"])
 
@@ -62,6 +49,20 @@ def _save_mappings(supabase_client, new_entries):
 # ─────────────────────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=60)
+def _load_item_map(supabase_client) -> pd.DataFrame:
+    """
+    Load the item_map table (used by Smart Upload in app_24).
+    raw_name → master_name — used as ASIN→master_sku lookup for Amazon.
+    """
+    try:
+        res = supabase_client.table("item_map").select("raw_name, master_name").execute()
+        if not res.data:
+            return pd.DataFrame(columns=["raw_name", "master_name"])
+        return pd.DataFrame(res.data).astype(str)
+    except Exception:
+        return pd.DataFrame(columns=["raw_name", "master_name"])
+
+
 def _get_sales(_supabase, days: int) -> pd.DataFrame:
     """
     Pull last `days` days of sales from Supabase.
@@ -113,7 +114,7 @@ def _channel_sales(sales_df: pd.DataFrame, channel_keyword: str) -> pd.DataFrame
     if sales_df.empty:
         return pd.DataFrame(columns=["item_name", "city", "qty_sold", "revenue"])
 
-    mask = sales_df["channel"].str.lower().str.contains(channel_keyword.lower(), na=False, regex=False)
+    mask = sales_df["channel"].str.lower().str.contains(channel_keyword.lower(), na=False)
     ch   = sales_df[mask].copy()
     if ch.empty:
         return pd.DataFrame(columns=["item_name", "city", "qty_sold", "revenue"])
@@ -191,39 +192,23 @@ def _save_snapshot(supabase_client, parsed_df: pd.DataFrame, channel: str):
 
 def _load_snapshots(supabase_client) -> dict:
     """
-    Load latest saved inventory snapshots from Supabase (paginated).
+    Load latest saved inventory snapshots from Supabase.
     Returns dict: { channel_name -> (uploaded_at str, DataFrame) }
     """
     try:
-        all_rows, page, PAGE_SIZE = [], 0, 1000
-        while True:
-            res = (
-                supabase_client.table("channel_inventory_snapshots")
-                .select("*")
-                .range(page * PAGE_SIZE, (page + 1) * PAGE_SIZE - 1)
-                .execute()
-            )
-            if not res.data:
-                break
-            all_rows.extend(res.data)
-            if len(res.data) < PAGE_SIZE:
-                break
-            page += 1
-
-        if not all_rows:
+        res = supabase_client.table("channel_inventory_snapshots")             .select("*").execute()
+        if not res.data:
             return {}
-
-        df = pd.DataFrame(all_rows)
+        df = pd.DataFrame(res.data)
         result = {}
         for channel, grp in df.groupby("channel"):
-            # Use the LATEST uploaded_at in case old rows weren't cleaned up
-            latest_ts = grp["uploaded_at"].max()
+            uploaded_at = grp["uploaded_at"].iloc[0]
+            # Parse uploaded_at to a readable string
             try:
-                dt = pd.to_datetime(latest_ts)
-                # Use strftime format compatible with all platforms
-                uploaded_at_str = dt.strftime("%d %b %Y, %I:%M %p").lstrip("0")
+                dt = pd.to_datetime(uploaded_at)
+                uploaded_at_str = dt.strftime("%-d %b %Y, %I:%M %p")
             except Exception:
-                uploaded_at_str = str(latest_ts)
+                uploaded_at_str = str(uploaded_at)
             snap_df = grp[SNAPSHOT_COLS].copy()
             for col in ["inventory", "str", "doc", "drr", "units_sold"]:
                 snap_df[col] = pd.to_numeric(snap_df[col], errors="coerce").fillna(0)
@@ -253,27 +238,31 @@ def _find_col(df: pd.DataFrame, options: list):
 # Channel parsers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _parse_amazon(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: int, db_mappings: pd.DataFrame = None) -> pd.DataFrame:
+def _parse_amazon(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: int, db_mappings: pd.DataFrame = None, item_map_df: pd.DataFrame = None) -> pd.DataFrame:
     inv_df = inv_df.copy()
     sku_c  = _find_col(inv_df, ["ASIN", "asin", "sku"])
     inv_df["channel_sku"] = inv_df[sku_c].astype(str).str.strip() if sku_c else ""
-    inv_df["inventory"]   = pd.to_numeric(inv_df["Sellable On Hand Units"].astype(str).str.replace(",", "", regex=False), errors="coerce").fillna(0)
+    inv_df["inventory"]   = pd.to_numeric(inv_df["Sellable On Hand Units"].astype(str).str.replace(",", ""), errors="coerce").fillna(0)
     inv_df["location"]    = "National"
 
     inv_df["str"] = 0.0
     if "Sell-Through %" in inv_df.columns:
         inv_df["str"] = (
             pd.to_numeric(
-                inv_df["Sell-Through %"].astype(str).str.replace("%", "", regex=False).str.replace(",", "", regex=False), errors="coerce"
+                inv_df["Sell-Through %"].astype(str).str.replace("%", "").str.replace(",", ""), errors="coerce"
             ).fillna(0) / 100
         )
 
-    # Translate channel_sku → master_sku for sales join
+    # Translate ASIN → master_sku using two sources:
+    # 1. channel_sku_mappings (mapped via Channel Performance tab)
+    # 2. item_map (mapped via Smart Upload — raw_name = ASIN string)
+    amz_map = {}
     if db_mappings is not None and not db_mappings.empty:
-        amz_map = db_mappings[db_mappings["channel"] == "Amazon"].set_index("channel_sku")["master_sku"].to_dict()
-        inv_df["master_sku"] = inv_df["channel_sku"].map(amz_map).fillna(inv_df["channel_sku"]).astype(str)
-    else:
-        inv_df["master_sku"] = inv_df["channel_sku"].astype(str)
+        ch_entries = db_mappings[db_mappings["channel"] == "Amazon"]
+        amz_map.update(ch_entries.set_index("channel_sku")["master_sku"].to_dict())
+    if item_map_df is not None and not item_map_df.empty:
+        amz_map.update(item_map_df.set_index("raw_name")["master_name"].to_dict())
+    inv_df["master_sku"] = inv_df["channel_sku"].map(amz_map).fillna(inv_df["channel_sku"]).astype(str)
 
     if not sales_df.empty:
         nat = (
@@ -513,7 +502,7 @@ def _reapply_sales(snap_df: pd.DataFrame, raw_sales: pd.DataFrame,
         # Normalise city keys the same way parsers do
         if channel == "Swiggy":
             city_sales["_ckey"] = city_sales["city"].astype(str).str.strip().str.upper()
-            snap_df["_ckey"]    = snap_df["location"].astype(str).str.split(" (", regex=False).str[0].str.strip().str.upper()
+            snap_df["_ckey"]    = snap_df["location"].astype(str).str.split(" (").str[0].str.strip().str.upper()
         else:
             city_sales["_ckey"] = city_sales["city"].astype(str).str.strip()
             snap_df["_ckey"]    = snap_df["location"].astype(str).str.strip()
@@ -681,29 +670,17 @@ def _render_dashboard(merged: pd.DataFrame):
                 if grp["inventory"].sum() > 0 else 0.0
 
         def _g_drr(grp):
-            # When grouped by "channel", pandas drops the grouping column from grp.
-            # So we can't groupby("channel") again inside .apply().
-            # Instead: sum units_sold and take max n_days directly from grp.
-            u = grp["units_sold"].sum()
-            d = grp["n_days"].max() if "n_days" in grp.columns else 30
+            u = d = 0
+            for ch, sub in grp.groupby("channel"):
+                u += sub["units_sold"].sum()
+                d  = max(d, sub["n_days"].max())
             return u / d if d > 0 else 0.0
-
-        # include_groups=False prevents pandas 2.2+ DeprecationWarning and
-        # ensures the grouping column is available inside the function when needed.
-        apply_kwargs = {"include_groups": False} if hasattr(
-            table_df.groupby(grp_col), "_grouper") else {}
-
-        def _safe_apply(fn):
-            try:
-                return table_df.groupby(grp_col).apply(fn, include_groups=False)
-            except TypeError:
-                return table_df.groupby(grp_col).apply(fn)
 
         agg_df = (
             agg_df
-            .join(_safe_apply(_w_doc).rename("doc"), on=grp_col)
-            .join(_safe_apply(_w_str).rename("str"), on=grp_col)
-            .join(_safe_apply(_g_drr).rename("drr"), on=grp_col)
+            .join(table_df.groupby(grp_col).apply(_w_doc).rename("doc"), on=grp_col)
+            .join(table_df.groupby(grp_col).apply(_w_str).rename("str"), on=grp_col)
+            .join(table_df.groupby(grp_col).apply(_g_drr).rename("drr"), on=grp_col)
             .sort_values("inventory", ascending=False).reset_index(drop=True)
         )
         st.dataframe(
@@ -794,7 +771,9 @@ def render_channel_performance_tab(supabase_client, master_skus_df: pd.DataFrame
 
     # ── PostgreSQL for SKU mapping persistence ────────────────────────────────
     # Load SKU mappings from Supabase (same connection already in use)
-    db_mappings = _load_mappings(supabase_client)
+    db_mappings  = _load_mappings(supabase_client)
+    # Load item_map — Smart Upload's ASIN→master_sku table for Amazon
+    item_map_df  = _load_item_map(supabase_client)
 
     master_list = (
         master_skus_df["name"].unique().tolist()
@@ -868,7 +847,8 @@ def render_channel_performance_tab(supabase_client, master_skus_df: pd.DataFrame
     ch_parse_config = {
         "Amazon":     (lambda f: _parse_amazon(
                             _load_file(f, skiprows=1),
-                            _channel_sales(raw_sales, "amazon"), n_days, db_mappings)),
+                            _channel_sales(raw_sales, "amazon"), n_days, db_mappings,
+                            item_map_df)),
         "Blinkit":    (lambda f: _parse_blinkit(
                             _load_file(f, skiprows=2),
                             _channel_sales(raw_sales, "blinkit"), n_days, db_mappings)),
@@ -892,21 +872,13 @@ def render_channel_performance_tab(supabase_client, master_skus_df: pd.DataFrame
             except Exception as e:
                 st.error(f"{ch_name} parse error: {e}")
 
-    # ── Reload snapshots after saves so combine sees all channels ─────────────
-    # saved_snapshots was loaded at the start of the run (before fresh uploads
-    # were saved). After saving fresh uploads above, we must reload so that the
-    # combine loop below can fall back to freshly-saved snapshots on the next
-    # rerun (when file_uploader widgets reset after st.rerun()).
-    if freshly_parsed:
-        saved_snapshots = _load_snapshots(supabase_client)
-
     # ── Combine: fresh uploads + snapshots for channels not uploaded ──────────
     uploaded_data = []
     snapshot_channels_used = []
 
     for ch_name in [c[0] for c in CHANNELS]:
         if ch_name in freshly_parsed:
-            # Fresh upload takes priority — use in-memory parsed data directly
+            # Fresh upload takes priority
             uploaded_data.append(freshly_parsed[ch_name])
         elif ch_name in saved_snapshots:
             # Use saved snapshot — re-apply current sales data to it
@@ -964,30 +936,10 @@ def render_channel_performance_tab(supabase_client, master_skus_df: pd.DataFrame
                 if new_entries:
                     try:
                         _save_mappings(supabase_client, new_entries)
-                        st.success(
-                            f"✅ Saved {len(new_entries)} mappings. "
-                            "The dashboard will now render with all channels."
-                        )
-                        # Reload mappings in-place so we can continue WITHOUT
-                        # calling st.rerun() — which would clear file_uploader
-                        # widgets and lose the freshly-uploaded inventory files.
-                        db_mappings = _load_mappings(supabase_client)
-                        db_mappings["channel_sku"] = db_mappings["channel_sku"].astype(str)
-                        # Re-merge with fresh mappings
-                        merged   = combined.merge(db_mappings, on=["channel", "channel_sku"], how="left")
-                        unmapped = merged[merged["master_sku"].isna()][["channel", "channel_sku"]].drop_duplicates()
-                        if not unmapped.empty:
-                            st.info(
-                                f"{len(unmapped)} SKUs still unmapped. "
-                                "They will be excluded from the dashboard until mapped."
-                            )
+                        st.success(f"Saved {len(new_entries)} mappings.")
                     except Exception as e:
                         st.error(f"Failed to save mappings: {e}")
-                        return
-        # Continue with dashboard even if some SKUs remain unmapped — exclude them
-        merged = merged[merged["master_sku"].notna()].copy()
-        if merged.empty:
-            st.info("No mapped SKUs available yet. Map the channel SKUs above to proceed.")
-            return
+                st.rerun()
+        return
 
     _render_dashboard(merged)
