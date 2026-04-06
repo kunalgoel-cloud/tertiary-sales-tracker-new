@@ -681,17 +681,34 @@ def _render_dashboard(merged: pd.DataFrame):
                 if grp["inventory"].sum() > 0 else 0.0
 
         def _g_drr(grp):
+            # pandas 2.x drops the grouping key from the sub-frame when using
+            # include_groups=False (or implicitly in newer versions).
+            # Re-attach "channel" from the index if it has been removed.
+            if "channel" not in grp.columns:
+                grp = grp.copy()
+                grp["channel"] = grp.index
             u = d = 0
             for ch, sub in grp.groupby("channel"):
                 u += sub["units_sold"].sum()
                 d  = max(d, sub["n_days"].max())
             return u / d if d > 0 else 0.0
 
+        # pandas 2.2+ deprecates passing the grouping column into the applied
+        # function; use include_groups=False to silence the warning and avoid
+        # the KeyError that occurs in pandas built against Python 3.13.
+        _apply_kwargs = {}
+        try:
+            import pandas as _pd
+            if tuple(int(x) for x in _pd.__version__.split(".")[:2]) >= (2, 2):
+                _apply_kwargs = {"include_groups": False}
+        except Exception:
+            pass
+
         agg_df = (
             agg_df
-            .join(table_df.groupby(grp_col).apply(_w_doc).rename("doc"), on=grp_col)
-            .join(table_df.groupby(grp_col).apply(_w_str).rename("str"), on=grp_col)
-            .join(table_df.groupby(grp_col).apply(_g_drr).rename("drr"), on=grp_col)
+            .join(table_df.groupby(grp_col).apply(_w_doc, **_apply_kwargs).rename("doc"), on=grp_col)
+            .join(table_df.groupby(grp_col).apply(_w_str, **_apply_kwargs).rename("str"), on=grp_col)
+            .join(table_df.groupby(grp_col).apply(_g_drr, **_apply_kwargs).rename("drr"), on=grp_col)
             .sort_values("inventory", ascending=False).reset_index(drop=True)
         )
         st.dataframe(
