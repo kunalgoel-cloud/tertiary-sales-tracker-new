@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import calendar
 from supabase import create_client, Client
 import re
 import plotly.express as px
@@ -122,8 +123,27 @@ role: str = st.session_state["role"]
 
 history_df  = get_table("sales",           ("id", "date", "channel", "item_name", "qty_sold", "revenue"))
 master_skus  = get_table("master_skus",    ("name",))
-master_chans = get_table("master_channels",("name",))
+master_chans = get_table("master_channels",("name", "is_monthly", "requires_city"))
 item_map_df  = get_table("item_map",       ("raw_name", "master_name"))
+
+# ── Channel attribute helpers ─────────────────────────────────────────────
+def _chan_flag(channel_name: str, flag: str, default: bool) -> bool:
+    """Return a boolean flag for a channel from master_chans; default if missing."""
+    if master_chans.empty or flag not in master_chans.columns:
+        return default
+    row = master_chans[master_chans["name"] == channel_name]
+    if row.empty:
+        return default
+    val = row.iloc[0][flag]
+    if pd.isna(val):
+        return default
+    return bool(val)
+
+def is_monthly_channel(ch: str) -> bool:
+    return _chan_flag(ch, "is_monthly", False)
+
+def requires_city_channel(ch: str) -> bool:
+    return _chan_flag(ch, "requires_city", True)
 
 # ─────────────────────────────────────────────
 # SIDEBAR
@@ -136,23 +156,57 @@ with st.sidebar:
         st.subheader("🛠 Data Correction")
 
         with st.expander("Delete Specific Entry"):
-            del_date = st.date_input("Select Date to Clear", value=datetime.now().date())
+            del_mode = st.radio(
+                "Delete by:",
+                ["Single Date", "Entire Month (for monthly channels)"],
+                key="del_mode",
+                horizontal=True,
+            )
             chan_options = ["Select…"] + master_chans["name"].tolist()
             del_chan = st.selectbox("Select Channel to Clear", chan_options)
-            if st.button("🗑️ Delete Selection"):
-                if del_chan != "Select…":
-                    try:
-                        supabase.table("sales").delete()\
-                            .eq("date", str(del_date))\
-                            .eq("channel", del_chan)\
-                            .execute()
-                        st.success(f"Deleted {del_chan} data for {del_date}")
-                        invalidate_data_cache()
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Delete failed: {e}")
-                else:
-                    st.error("Please select a channel.")
+
+            if del_mode == "Single Date":
+                del_date = st.date_input("Select Date to Clear", value=datetime.now().date())
+                if st.button("🗑️ Delete Selection"):
+                    if del_chan != "Select…":
+                        try:
+                            supabase.table("sales").delete()\
+                                .eq("date", str(del_date))\
+                                .eq("channel", del_chan)\
+                                .execute()
+                            st.success(f"Deleted {del_chan} data for {del_date}")
+                            invalidate_data_cache()
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Delete failed: {e}")
+                    else:
+                        st.error("Please select a channel.")
+            else:
+                del_year  = st.number_input("Year",  min_value=2020, max_value=2100,
+                                             value=datetime.now().year,  step=1, key="del_year")
+                del_month = st.number_input("Month", min_value=1,    max_value=12,
+                                             value=datetime.now().month, step=1, key="del_month")
+                if st.button("🗑️ Delete Entire Month"):
+                    if del_chan != "Select…":
+                        try:
+                            days_m = calendar.monthrange(int(del_year), int(del_month))[1]
+                            start_str = f"{int(del_year):04d}-{int(del_month):02d}-01"
+                            end_str   = f"{int(del_year):04d}-{int(del_month):02d}-{days_m:02d}"
+                            supabase.table("sales").delete()\
+                                .eq("channel", del_chan)\
+                                .gte("date", start_str)\
+                                .lte("date", end_str)\
+                                .execute()
+                            st.success(
+                                f"Deleted {del_chan} data for "
+                                f"{calendar.month_name[int(del_month)]} {int(del_year)}"
+                            )
+                            invalidate_data_cache()
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Delete failed: {e}")
+                    else:
+                        st.error("Please select a channel.")
 
         st.divider()
         if st.checkbox("Unlock Global Danger Zone"):
@@ -180,17 +234,45 @@ with st.sidebar:
         st.rerun()
 
 # ─────────────────────────────────────────────
-# TABS
+# TABS — built dynamically based on role
 # ─────────────────────────────────────────────
+# Determine whether any channel actually requires city data
+# (used to gate Marketing + Channel Performance tabs)
+_any_city_channel = True   # tabs are always shown; per-channel gating happens inside them
+
 if role == "admin":
-    tabs = st.tabs(["📊 Trend Analytics", "🔬 Deep Dive", "📣 Performance Marketing", "📤 Smart Upload", "🛠 Configuration", "📦 Channel Performance"])
+    tabs = st.tabs([
+        "📊 Trend Analytics",
+        "🔬 Deep Dive",
+        "📣 Performance Marketing",
+        "📤 Smart Upload",
+        "📅 Monthly Channel Upload",
+        "🛠 Configuration",
+        "📦 Channel Performance",
+    ])
+    _TAB_ANALYTICS       = 0
+    _TAB_DEEPDIVE        = 1
+    _TAB_MARKETING       = 2
+    _TAB_UPLOAD          = 3
+    _TAB_MONTHLY_UPLOAD  = 4
+    _TAB_CONFIG          = 5
+    _TAB_CHANPERF        = 6
 else:
-    tabs = st.tabs(["📊 Trend Analytics", "🔬 Deep Dive", "📣 Performance Marketing", "📦 Channel Performance"])
+    tabs = st.tabs([
+        "📊 Trend Analytics",
+        "🔬 Deep Dive",
+        "📣 Performance Marketing",
+        "📦 Channel Performance",
+    ])
+    _TAB_ANALYTICS  = 0
+    _TAB_DEEPDIVE   = 1
+    _TAB_MARKETING  = 2
+    _TAB_CHANPERF   = 3
 
 # ══════════════════════════════════════════════
 # TAB 1 – TREND ANALYTICS  (unchanged)
 # ══════════════════════════════════════════════
-with tabs[0]:
+with tabs[_TAB_ANALYTICS]:
     if history_df.empty:
         st.info("No data found. Admin must upload sales data first.")
     else:
@@ -304,7 +386,7 @@ with tabs[0]:
 # ══════════════════════════════════════════════
 # TAB 2 – DEEP DIVE  (new)
 # ══════════════════════════════════════════════
-with tabs[1]:
+with tabs[_TAB_DEEPDIVE]:
     if history_df.empty:
         st.info("No data found. Admin must upload sales data first.")
     else:
@@ -347,338 +429,352 @@ with tabs[1]:
 
         if dd_df.empty:
             st.warning("No data in the selected period.")
-            st.stop()
+        else:
 
-        dd_days = max((dd_end - dd_start).days + 1, 1)
-        dd_df["week_label"] = dd_df["date_dt"].dt.to_period("W").apply(lambda p: str(p.start_time.date()))
-        dd_df["dow"]        = dd_df["date_dt"].dt.day_name()
-
-        st.divider()
-
-        # ════════════════════════════════
-        # VIEW 1 — Channel Mix Donut
-        # ════════════════════════════════
-        st.markdown("### 🍩 Channel Revenue Mix")
-        st.caption("What % of total revenue comes from each platform — spot platform concentration risk at a glance.")
-
-        chan_rev = dd_df.groupby("channel")["revenue"].sum().reset_index().sort_values("revenue", ascending=False)
-        chan_qty = dd_df.groupby("channel")["qty_sold"].sum().reset_index().sort_values("qty_sold", ascending=False)
-
-        donut_c1, donut_c2 = st.columns(2)
-
-        with donut_c1:
-            fig_donut_rev = px.pie(
-                chan_rev, values="revenue", names="channel",
-                hole=0.55, height=380,
-                title="By Revenue (₹)",
+            dd_days = max((dd_end - dd_start).days + 1, 1)
+            dd_df["week_label"] = dd_df["date_dt"].dt.to_period("W").apply(lambda p: str(p.start_time.date()))
+            dd_df["dow"]        = dd_df["date_dt"].dt.day_name()
+    
+            st.divider()
+    
+            # ════════════════════════════════
+            # VIEW 1 — Channel Mix Donut
+            # ════════════════════════════════
+            st.markdown("### 🍩 Channel Revenue Mix")
+            st.caption("What % of total revenue comes from each platform — spot platform concentration risk at a glance.")
+    
+            chan_rev = dd_df.groupby("channel")["revenue"].sum().reset_index().sort_values("revenue", ascending=False)
+            chan_qty = dd_df.groupby("channel")["qty_sold"].sum().reset_index().sort_values("qty_sold", ascending=False)
+    
+            donut_c1, donut_c2 = st.columns(2)
+    
+            with donut_c1:
+                fig_donut_rev = px.pie(
+                    chan_rev, values="revenue", names="channel",
+                    hole=0.55, height=380,
+                    title="By Revenue (₹)",
+                    color_discrete_sequence=px.colors.qualitative.Bold,
+                )
+                fig_donut_rev.update_traces(textinfo="label+percent", textposition="outside")
+                fig_donut_rev.update_layout(showlegend=False, margin=dict(t=50, b=10, l=10, r=10))
+                # Centre annotation
+                total_rev = chan_rev["revenue"].sum()
+                fig_donut_rev.add_annotation(
+                    text=f"₹{total_rev/1000:.1f}K", x=0.5, y=0.5,
+                    font=dict(size=18, color="black"), showarrow=False,
+                )
+                st.plotly_chart(fig_donut_rev, use_container_width=True)
+    
+            with donut_c2:
+                fig_donut_qty = px.pie(
+                    chan_qty, values="qty_sold", names="channel",
+                    hole=0.55, height=380,
+                    title="By Units Sold",
+                    color_discrete_sequence=px.colors.qualitative.Bold,
+                )
+                fig_donut_qty.update_traces(textinfo="label+percent", textposition="outside")
+                fig_donut_qty.update_layout(showlegend=False, margin=dict(t=50, b=10, l=10, r=10))
+                total_qty = chan_qty["qty_sold"].sum()
+                fig_donut_qty.add_annotation(
+                    text=f"{total_qty:,.0f} units", x=0.5, y=0.5,
+                    font=dict(size=14, color="black"), showarrow=False,
+                )
+                st.plotly_chart(fig_donut_qty, use_container_width=True)
+    
+            # Channel mix summary table
+            chan_summary = chan_rev.merge(chan_qty, on="channel")
+            chan_summary["rev_%"]       = (chan_summary["revenue"] / chan_summary["revenue"].sum() * 100).round(1)
+            chan_summary["avg_rev/day"] = (chan_summary["revenue"] / dd_days).round(0)
+            chan_summary["avg_price"]   = pd.to_numeric(chan_summary["revenue"] / chan_summary["qty_sold"].where(chan_summary["qty_sold"] > 0), errors="coerce").round(1)
+            chan_summary.columns        = ["Channel", "Revenue (₹)", "Units Sold", "Rev Share %", "DRR (₹)", "Avg Price (₹)"]
+            st.dataframe(
+                chan_summary.style.format({
+                    "Revenue (₹)": "₹{:,.0f}", "Units Sold": "{:,.0f}",
+                    "Rev Share %": "{:.1f}%",  "DRR (₹)": "₹{:,.0f}",
+                    "Avg Price (₹)": "₹{:.1f}",
+                }),
+                hide_index=True, use_container_width=True,
+            )
+    
+            st.divider()
+    
+            # ════════════════════════════════
+            # VIEW 2 — SKU Performance Table
+            # ════════════════════════════════
+            st.markdown("### 🏆 SKU Performance Ranking")
+            st.caption("Which products are driving the business — and which need attention.")
+    
+            sku_perf = (
+                dd_df.groupby("item_name")
+                .agg(revenue=("revenue", "sum"), qty_sold=("qty_sold", "sum"))
+                .reset_index()
+                .sort_values("revenue", ascending=False)
+            )
+            sku_perf["rev_%"]       = (sku_perf["revenue"] / sku_perf["revenue"].sum() * 100).round(1)
+            sku_perf["avg_price"]   = pd.to_numeric(sku_perf["revenue"] / sku_perf["qty_sold"].where(sku_perf["qty_sold"] > 0), errors="coerce").round(1)
+            sku_perf["drr"]         = (sku_perf["revenue"] / dd_days).round(0)
+            sku_perf["status"]      = sku_perf["revenue"].apply(
+                lambda r: "🔴 Dead" if r == 0 else ("🟡 Slow" if r < sku_perf["revenue"].mean() * 0.3 else "🟢 Active")
+            )
+    
+            # Horizontal bar chart
+            fig_sku = px.bar(
+                sku_perf.sort_values("revenue"),
+                x="revenue", y="item_name",
+                orientation="h", height=max(350, len(sku_perf) * 45),
+                color="rev_%",
+                color_continuous_scale="Blues",
+                labels={"revenue": "Revenue (₹)", "item_name": ""},
+                text=sku_perf.sort_values("revenue")["revenue"].apply(lambda x: f"₹{x:,.0f}"),
+            )
+            fig_sku.update_traces(textposition="outside")
+            fig_sku.update_layout(coloraxis_showscale=False, margin=dict(l=10, r=80, t=20, b=20))
+            st.plotly_chart(fig_sku, use_container_width=True)
+    
+            sku_perf.columns = ["SKU", "Revenue (₹)", "Units", "Rev Share %", "Avg Price (₹)", "DRR (₹)", "Status"]
+            st.dataframe(
+                sku_perf.style.format({
+                    "Revenue (₹)": "₹{:,.0f}", "Units": "{:,.0f}",
+                    "Rev Share %": "{:.1f}%",   "Avg Price (₹)": "₹{:.1f}",
+                    "DRR (₹)":     "₹{:,.0f}",
+                }),
+                hide_index=True, use_container_width=True,
+            )
+    
+            st.divider()
+    
+            # ════════════════════════════════
+            # VIEW 3 — Week-over-Week Trend
+            # ════════════════════════════════
+            st.markdown("### 📈 Week-over-Week Performance")
+            st.caption("Are we growing or declining? WoW change per channel reveals momentum shifts.")
+    
+            wow_metric = st.radio("WoW Metric:", ["Revenue (₹)", "Quantity (Units)"], horizontal=True, key="wow_metric")
+            wow_col    = "revenue" if "Revenue" in wow_metric else "qty_sold"
+            wow_prefix = "₹" if "Revenue" in wow_metric else ""
+    
+            weekly = (
+                dd_df.groupby(["week_label", "channel"])[wow_col]
+                .sum()
+                .reset_index()
+                .sort_values("week_label")
+            )
+    
+            fig_wow = px.line(
+                weekly, x="week_label", y=wow_col, color="channel",
+                markers=True, height=420,
+                labels={"week_label": "Week Starting", wow_col: wow_metric},
                 color_discrete_sequence=px.colors.qualitative.Bold,
             )
-            fig_donut_rev.update_traces(textinfo="label+percent", textposition="outside")
-            fig_donut_rev.update_layout(showlegend=False, margin=dict(t=50, b=10, l=10, r=10))
-            # Centre annotation
-            total_rev = chan_rev["revenue"].sum()
-            fig_donut_rev.add_annotation(
-                text=f"₹{total_rev/1000:.1f}K", x=0.5, y=0.5,
-                font=dict(size=18, color="black"), showarrow=False,
+            fig_wow.update_traces(line_width=2.5, marker_size=8)
+            fig_wow.update_layout(xaxis_title="Week", hovermode="x unified")
+            st.plotly_chart(fig_wow, use_container_width=True)
+    
+            # WoW change table — pivot weeks as columns
+            wow_pivot = weekly.pivot_table(index="channel", columns="week_label", values=wow_col, aggfunc="sum").fillna(0)
+            weeks_sorted = sorted(wow_pivot.columns)
+            wow_pivot    = wow_pivot[weeks_sorted]
+    
+            if len(weeks_sorted) >= 2:
+                last_w  = weeks_sorted[-1]
+                prev_w  = weeks_sorted[-2]
+                wow_pivot["WoW Change"] = wow_pivot[last_w] - wow_pivot[prev_w]
+                wow_pivot["WoW %"]      = (
+                    (wow_pivot["WoW Change"] / wow_pivot[prev_w].where(wow_pivot[prev_w] != 0)) * 100
+                ).round(1)
+    
+            st.dataframe(
+                wow_pivot.style.format(
+                    {c: f"{wow_prefix}{{:,.0f}}" for c in weeks_sorted}
+                    | ({"WoW Change": f"{wow_prefix}{{:+,.0f}}", "WoW %": "{:+.1f}%"} if len(weeks_sorted) >= 2 else {})
+                ).map(
+                    lambda v: "color: green" if isinstance(v, (int, float)) and v > 0
+                    else ("color: red" if isinstance(v, (int, float)) and v < 0 else ""),
+                    subset=["WoW %", "WoW Change"] if len(weeks_sorted) >= 2 else [],
+                ),
+                use_container_width=True,
             )
-            st.plotly_chart(fig_donut_rev, use_container_width=True)
-
-        with donut_c2:
-            fig_donut_qty = px.pie(
-                chan_qty, values="qty_sold", names="channel",
-                hole=0.55, height=380,
-                title="By Units Sold",
-                color_discrete_sequence=px.colors.qualitative.Bold,
+    
+            st.divider()
+    
+            # ════════════════════════════════
+            # VIEW 4 — Day-of-Week Heatmap
+            # ════════════════════════════════
+            st.markdown("### 🗓️ Day-of-Week Revenue Heatmap")
+            st.caption("When do customers buy? Use this to time promotions and ensure stock is ready on peak days.")
+    
+            dow_metric = st.radio("Heatmap Metric:", ["Revenue (₹)", "Quantity (Units)"], horizontal=True, key="dow_metric")
+            dow_col    = "revenue" if "Revenue" in dow_metric else "qty_sold"
+    
+            dow_order  = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+            avail_chans_dd = sorted(dd_df["channel"].unique())
+            dow_chan_sel   = st.multiselect(
+                "Channels to include:", avail_chans_dd, default=avail_chans_dd, key="dow_chan"
             )
-            fig_donut_qty.update_traces(textinfo="label+percent", textposition="outside")
-            fig_donut_qty.update_layout(showlegend=False, margin=dict(t=50, b=10, l=10, r=10))
-            total_qty = chan_qty["qty_sold"].sum()
-            fig_donut_qty.add_annotation(
-                text=f"{total_qty:,.0f} units", x=0.5, y=0.5,
-                font=dict(size=14, color="black"), showarrow=False,
+    
+            dow_filtered = dd_df[dd_df["channel"].isin(dow_chan_sel)]
+            dow_pivot    = (
+                dow_filtered.groupby(["channel", "dow"])[dow_col]
+                .sum()
+                .reset_index()
+                .pivot(index="channel", columns="dow", values=dow_col)
+                .reindex(columns=[d for d in dow_order if d in dd_df["dow"].unique()])
+                .fillna(0)
             )
-            st.plotly_chart(fig_donut_qty, use_container_width=True)
-
-        # Channel mix summary table
-        chan_summary = chan_rev.merge(chan_qty, on="channel")
-        chan_summary["rev_%"]       = (chan_summary["revenue"] / chan_summary["revenue"].sum() * 100).round(1)
-        chan_summary["avg_rev/day"] = (chan_summary["revenue"] / dd_days).round(0)
-        chan_summary["avg_price"]   = pd.to_numeric(chan_summary["revenue"] / chan_summary["qty_sold"].where(chan_summary["qty_sold"] > 0), errors="coerce").round(1)
-        chan_summary.columns        = ["Channel", "Revenue (₹)", "Units Sold", "Rev Share %", "DRR (₹)", "Avg Price (₹)"]
-        st.dataframe(
-            chan_summary.style.format({
-                "Revenue (₹)": "₹{:,.0f}", "Units Sold": "{:,.0f}",
-                "Rev Share %": "{:.1f}%",  "DRR (₹)": "₹{:,.0f}",
-                "Avg Price (₹)": "₹{:.1f}",
-            }),
-            hide_index=True, use_container_width=True,
-        )
-
-        st.divider()
-
-        # ════════════════════════════════
-        # VIEW 2 — SKU Performance Table
-        # ════════════════════════════════
-        st.markdown("### 🏆 SKU Performance Ranking")
-        st.caption("Which products are driving the business — and which need attention.")
-
-        sku_perf = (
-            dd_df.groupby("item_name")
-            .agg(revenue=("revenue", "sum"), qty_sold=("qty_sold", "sum"))
-            .reset_index()
-            .sort_values("revenue", ascending=False)
-        )
-        sku_perf["rev_%"]       = (sku_perf["revenue"] / sku_perf["revenue"].sum() * 100).round(1)
-        sku_perf["avg_price"]   = pd.to_numeric(sku_perf["revenue"] / sku_perf["qty_sold"].where(sku_perf["qty_sold"] > 0), errors="coerce").round(1)
-        sku_perf["drr"]         = (sku_perf["revenue"] / dd_days).round(0)
-        sku_perf["status"]      = sku_perf["revenue"].apply(
-            lambda r: "🔴 Dead" if r == 0 else ("🟡 Slow" if r < sku_perf["revenue"].mean() * 0.3 else "🟢 Active")
-        )
-
-        # Horizontal bar chart
-        fig_sku = px.bar(
-            sku_perf.sort_values("revenue"),
-            x="revenue", y="item_name",
-            orientation="h", height=max(350, len(sku_perf) * 45),
-            color="rev_%",
-            color_continuous_scale="Blues",
-            labels={"revenue": "Revenue (₹)", "item_name": ""},
-            text=sku_perf.sort_values("revenue")["revenue"].apply(lambda x: f"₹{x:,.0f}"),
-        )
-        fig_sku.update_traces(textposition="outside")
-        fig_sku.update_layout(coloraxis_showscale=False, margin=dict(l=10, r=80, t=20, b=20))
-        st.plotly_chart(fig_sku, use_container_width=True)
-
-        sku_perf.columns = ["SKU", "Revenue (₹)", "Units", "Rev Share %", "Avg Price (₹)", "DRR (₹)", "Status"]
-        st.dataframe(
-            sku_perf.style.format({
-                "Revenue (₹)": "₹{:,.0f}", "Units": "{:,.0f}",
-                "Rev Share %": "{:.1f}%",   "Avg Price (₹)": "₹{:.1f}",
-                "DRR (₹)":     "₹{:,.0f}",
-            }),
-            hide_index=True, use_container_width=True,
-        )
-
-        st.divider()
-
-        # ════════════════════════════════
-        # VIEW 3 — Week-over-Week Trend
-        # ════════════════════════════════
-        st.markdown("### 📈 Week-over-Week Performance")
-        st.caption("Are we growing or declining? WoW change per channel reveals momentum shifts.")
-
-        wow_metric = st.radio("WoW Metric:", ["Revenue (₹)", "Quantity (Units)"], horizontal=True, key="wow_metric")
-        wow_col    = "revenue" if "Revenue" in wow_metric else "qty_sold"
-        wow_prefix = "₹" if "Revenue" in wow_metric else ""
-
-        weekly = (
-            dd_df.groupby(["week_label", "channel"])[wow_col]
-            .sum()
-            .reset_index()
-            .sort_values("week_label")
-        )
-
-        fig_wow = px.line(
-            weekly, x="week_label", y=wow_col, color="channel",
-            markers=True, height=420,
-            labels={"week_label": "Week Starting", wow_col: wow_metric},
-            color_discrete_sequence=px.colors.qualitative.Bold,
-        )
-        fig_wow.update_traces(line_width=2.5, marker_size=8)
-        fig_wow.update_layout(xaxis_title="Week", hovermode="x unified")
-        st.plotly_chart(fig_wow, use_container_width=True)
-
-        # WoW change table — pivot weeks as columns
-        wow_pivot = weekly.pivot_table(index="channel", columns="week_label", values=wow_col, aggfunc="sum").fillna(0)
-        weeks_sorted = sorted(wow_pivot.columns)
-        wow_pivot    = wow_pivot[weeks_sorted]
-
-        if len(weeks_sorted) >= 2:
-            last_w  = weeks_sorted[-1]
-            prev_w  = weeks_sorted[-2]
-            wow_pivot["WoW Change"] = wow_pivot[last_w] - wow_pivot[prev_w]
-            wow_pivot["WoW %"]      = (
-                (wow_pivot["WoW Change"] / wow_pivot[prev_w].where(wow_pivot[prev_w] != 0)) * 100
-            ).round(1)
-
-        st.dataframe(
-            wow_pivot.style.format(
-                {c: f"{wow_prefix}{{:,.0f}}" for c in weeks_sorted}
-                | ({"WoW Change": f"{wow_prefix}{{:+,.0f}}", "WoW %": "{:+.1f}%"} if len(weeks_sorted) >= 2 else {})
-            ).map(
-                lambda v: "color: green" if isinstance(v, (int, float)) and v > 0
-                else ("color: red" if isinstance(v, (int, float)) and v < 0 else ""),
-                subset=["WoW %", "WoW Change"] if len(weeks_sorted) >= 2 else [],
-            ),
-            use_container_width=True,
-        )
-
-        st.divider()
-
-        # ════════════════════════════════
-        # VIEW 4 — Day-of-Week Heatmap
-        # ════════════════════════════════
-        st.markdown("### 🗓️ Day-of-Week Revenue Heatmap")
-        st.caption("When do customers buy? Use this to time promotions and ensure stock is ready on peak days.")
-
-        dow_metric = st.radio("Heatmap Metric:", ["Revenue (₹)", "Quantity (Units)"], horizontal=True, key="dow_metric")
-        dow_col    = "revenue" if "Revenue" in dow_metric else "qty_sold"
-
-        dow_order  = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-        avail_chans_dd = sorted(dd_df["channel"].unique())
-        dow_chan_sel   = st.multiselect(
-            "Channels to include:", avail_chans_dd, default=avail_chans_dd, key="dow_chan"
-        )
-
-        dow_filtered = dd_df[dd_df["channel"].isin(dow_chan_sel)]
-        dow_pivot    = (
-            dow_filtered.groupby(["channel", "dow"])[dow_col]
-            .sum()
-            .reset_index()
-            .pivot(index="channel", columns="dow", values=dow_col)
-            .reindex(columns=[d for d in dow_order if d in dd_df["dow"].unique()])
-            .fillna(0)
-        )
-
-        fig_heat = go.Figure(
-            data=go.Heatmap(
-                z=dow_pivot.values,
-                x=dow_pivot.columns.tolist(),
-                y=dow_pivot.index.tolist(),
-                colorscale="Blues",
-                text=[[f"{'₹' if dow_col=='revenue' else ''}{v:,.0f}" for v in row] for row in dow_pivot.values],
-                texttemplate="%{text}",
-                showscale=True,
+    
+            fig_heat = go.Figure(
+                data=go.Heatmap(
+                    z=dow_pivot.values,
+                    x=dow_pivot.columns.tolist(),
+                    y=dow_pivot.index.tolist(),
+                    colorscale="Blues",
+                    text=[[f"{'₹' if dow_col=='revenue' else ''}{v:,.0f}" for v in row] for row in dow_pivot.values],
+                    texttemplate="%{text}",
+                    showscale=True,
+                )
             )
-        )
-        fig_heat.update_layout(
-            height=max(250, len(dow_pivot) * 60 + 100),
-            xaxis_title="Day of Week",
-            yaxis_title="Channel",
-            margin=dict(l=10, r=10, t=20, b=20),
-        )
-        st.plotly_chart(fig_heat, use_container_width=True)
-
-        # Best/worst day callout
-        if not dow_pivot.empty:
-            day_totals  = dow_pivot.sum()
-            best_day    = day_totals.idxmax()
-            worst_day   = day_totals.idxmin()
-            hw1, hw2    = st.columns(2)
-            hw1.success(f"📈 **Best day:** {best_day} — avg {'₹' if dow_col=='revenue' else ''}{day_totals[best_day]/max(len(dd_df['date_dt'].dt.isocalendar().week.unique()),1):,.0f}/week")
-            hw2.warning(f"📉 **Weakest day:** {worst_day} — avg {'₹' if dow_col=='revenue' else ''}{day_totals[worst_day]/max(len(dd_df['date_dt'].dt.isocalendar().week.unique()),1):,.0f}/week")
-
-        st.divider()
-
-        # ════════════════════════════════
-        # VIEW 5 — SKU × Channel Matrix
-        # ════════════════════════════════
-        st.markdown("### 📦 SKU × Channel Revenue Matrix")
-        st.caption("Where is each product actually selling? Blank cells = not listed or zero sales on that platform.")
-
-        matrix_metric = st.radio("Matrix Metric:", ["Revenue (₹)", "Quantity (Units)"], horizontal=True, key="matrix_metric")
-        mat_col       = "revenue" if "Revenue" in matrix_metric else "qty_sold"
-
-        sku_chan = (
-            dd_df.groupby(["item_name", "channel"])[mat_col]
-            .sum()
-            .reset_index()
-            .pivot(index="item_name", columns="channel", values=mat_col)
-            .fillna(0)
-        )
-        sku_chan["TOTAL"] = sku_chan.sum(axis=1)
-        sku_chan = sku_chan.sort_values("TOTAL", ascending=False)
-
-        fig_matrix = go.Figure(
-            data=go.Heatmap(
-                z=sku_chan.drop(columns="TOTAL").values,
-                x=sku_chan.drop(columns="TOTAL").columns.tolist(),
-                y=sku_chan.index.tolist(),
-                colorscale="Greens",
-                text=[[f"{'₹' if mat_col=='revenue' else ''}{v:,.0f}" if v > 0 else "—" for v in row]
-                      for row in sku_chan.drop(columns="TOTAL").values],
-                texttemplate="%{text}",
-                showscale=True,
+            fig_heat.update_layout(
+                height=max(250, len(dow_pivot) * 60 + 100),
+                xaxis_title="Day of Week",
+                yaxis_title="Channel",
+                margin=dict(l=10, r=10, t=20, b=20),
             )
-        )
-        fig_matrix.update_layout(
-            height=max(300, len(sku_chan) * 50 + 100),
-            xaxis_title="Channel",
-            yaxis_title="",
-            margin=dict(l=10, r=10, t=20, b=20),
-        )
-        st.plotly_chart(fig_matrix, use_container_width=True)
-
-        # Distribution gap alert
-        zero_combos = []
-        for sku in sku_chan.index:
-            for chan in sku_chan.drop(columns="TOTAL").columns:
-                if sku_chan.loc[sku, chan] == 0:
-                    zero_combos.append(f"**{sku}** on {chan}")
-        if zero_combos:
-            with st.expander(f"⚠️ {len(zero_combos)} distribution gaps (zero sales combos)"):
-                for z in zero_combos:
-                    st.write(f"• {z}")
-
-        st.divider()
-
-        # ════════════════════════════════
-        # VIEW 6 — Zero-Sales Alert Panel
-        # ════════════════════════════════
-        st.markdown("### ⚠️ Ops Health Check")
-        st.caption("SKUs with no sales in the last 7 days, and channels with no recent data uploads.")
-
-        alert_cutoff   = today_dd - timedelta(days=7)
-        recent_df      = history_df[history_df["date_dt"].dt.date >= alert_cutoff]
-
-        alert_col1, alert_col2 = st.columns(2)
-
-        with alert_col1:
-            st.markdown("**🔴 SKUs with zero sales (last 7 days)**")
-            all_skus       = set(history_df["item_name"].unique())
-            active_skus    = set(recent_df[recent_df["revenue"] > 0]["item_name"].unique())
-            dead_skus      = sorted(all_skus - active_skus)
-            if dead_skus:
-                for sku in dead_skus:
-                    st.error(f"• {sku}")
-            else:
-                st.success("All SKUs had sales in the last 7 days ✅")
-
-        with alert_col2:
-            st.markdown("**🟡 Channels with no data in last 3 days**")
-            stale_cutoff   = today_dd - timedelta(days=3)
-            all_channels   = set(history_df["channel"].unique())
-            fresh_channels = set(history_df[history_df["date_dt"].dt.date >= stale_cutoff]["channel"].unique())
-            stale_channels = sorted(all_channels - fresh_channels)
-            if stale_channels:
-                for ch in stale_channels:
-                    last_seen = history_df[history_df["channel"] == ch]["date_dt"].max().date()
-                    st.warning(f"• {ch} — last data: {last_seen}")
-            else:
-                st.success("All channels have recent data ✅")
-
+            st.plotly_chart(fig_heat, use_container_width=True)
+    
+            # Best/worst day callout
+            if not dow_pivot.empty:
+                day_totals  = dow_pivot.sum()
+                best_day    = day_totals.idxmax()
+                worst_day   = day_totals.idxmin()
+                hw1, hw2    = st.columns(2)
+                hw1.success(f"📈 **Best day:** {best_day} — avg {'₹' if dow_col=='revenue' else ''}{day_totals[best_day]/max(len(dd_df['date_dt'].dt.isocalendar().week.unique()),1):,.0f}/week")
+                hw2.warning(f"📉 **Weakest day:** {worst_day} — avg {'₹' if dow_col=='revenue' else ''}{day_totals[worst_day]/max(len(dd_df['date_dt'].dt.isocalendar().week.unique()),1):,.0f}/week")
+    
+            st.divider()
+    
+            # ════════════════════════════════
+            # VIEW 5 — SKU × Channel Matrix
+            # ════════════════════════════════
+            st.markdown("### 📦 SKU × Channel Revenue Matrix")
+            st.caption("Where is each product actually selling? Blank cells = not listed or zero sales on that platform.")
+    
+            matrix_metric = st.radio("Matrix Metric:", ["Revenue (₹)", "Quantity (Units)"], horizontal=True, key="matrix_metric")
+            mat_col       = "revenue" if "Revenue" in matrix_metric else "qty_sold"
+    
+            sku_chan = (
+                dd_df.groupby(["item_name", "channel"])[mat_col]
+                .sum()
+                .reset_index()
+                .pivot(index="item_name", columns="channel", values=mat_col)
+                .fillna(0)
+            )
+            sku_chan["TOTAL"] = sku_chan.sum(axis=1)
+            sku_chan = sku_chan.sort_values("TOTAL", ascending=False)
+    
+            fig_matrix = go.Figure(
+                data=go.Heatmap(
+                    z=sku_chan.drop(columns="TOTAL").values,
+                    x=sku_chan.drop(columns="TOTAL").columns.tolist(),
+                    y=sku_chan.index.tolist(),
+                    colorscale="Greens",
+                    text=[[f"{'₹' if mat_col=='revenue' else ''}{v:,.0f}" if v > 0 else "—" for v in row]
+                          for row in sku_chan.drop(columns="TOTAL").values],
+                    texttemplate="%{text}",
+                    showscale=True,
+                )
+            )
+            fig_matrix.update_layout(
+                height=max(300, len(sku_chan) * 50 + 100),
+                xaxis_title="Channel",
+                yaxis_title="",
+                margin=dict(l=10, r=10, t=20, b=20),
+            )
+            st.plotly_chart(fig_matrix, use_container_width=True)
+    
+            # Distribution gap alert
+            zero_combos = []
+            for sku in sku_chan.index:
+                for chan in sku_chan.drop(columns="TOTAL").columns:
+                    if sku_chan.loc[sku, chan] == 0:
+                        zero_combos.append(f"**{sku}** on {chan}")
+            if zero_combos:
+                with st.expander(f"⚠️ {len(zero_combos)} distribution gaps (zero sales combos)"):
+                    for z in zero_combos:
+                        st.write(f"• {z}")
+    
+            st.divider()
+    
+            # ════════════════════════════════
+            # VIEW 6 — Zero-Sales Alert Panel
+            # ════════════════════════════════
+            st.markdown("### ⚠️ Ops Health Check")
+            st.caption("SKUs with no sales in the last 7 days, and channels with no recent data uploads.")
+    
+            alert_cutoff   = today_dd - timedelta(days=7)
+            recent_df      = history_df[history_df["date_dt"].dt.date >= alert_cutoff]
+    
+            alert_col1, alert_col2 = st.columns(2)
+    
+            with alert_col1:
+                st.markdown("**🔴 SKUs with zero sales (last 7 days)**")
+                all_skus       = set(history_df["item_name"].unique())
+                active_skus    = set(recent_df[recent_df["revenue"] > 0]["item_name"].unique())
+                dead_skus      = sorted(all_skus - active_skus)
+                if dead_skus:
+                    for sku in dead_skus:
+                        st.error(f"• {sku}")
+                else:
+                    st.success("All SKUs had sales in the last 7 days ✅")
+    
+            with alert_col2:
+                st.markdown("**🟡 Channels with no data in last 3 days**")
+                stale_cutoff   = today_dd - timedelta(days=3)
+                all_channels   = set(history_df["channel"].unique())
+                fresh_channels = set(history_df[history_df["date_dt"].dt.date >= stale_cutoff]["channel"].unique())
+                stale_channels = sorted(all_channels - fresh_channels)
+                if stale_channels:
+                    for ch in stale_channels:
+                        last_seen = history_df[history_df["channel"] == ch]["date_dt"].max().date()
+                        st.warning(f"• {ch} — last data: {last_seen}")
+                else:
+                    st.success("All channels have recent data ✅")
+    
 # ══════════════════════════════════════════════
-# TAB 3 – PERFORMANCE MARKETING (all roles, index 2)
+# TAB – PERFORMANCE MARKETING (all roles, index 2)
 # ══════════════════════════════════════════════
-with tabs[2]:
-    render_marketing_tab(role)
+with tabs[_TAB_MARKETING]:
+    # Check if any channels with city data exist in the sales history
+    _has_city_data = (
+        not history_df.empty
+        and "city" in history_df.columns
+        and history_df["city"].notna().any()
+    )
+    if not _has_city_data:
+        st.info(
+            "📣 **Performance Marketing** is based on city-level sales data. "
+            "No city-level data has been uploaded yet, or all active channels "
+            "are configured without city data. "
+            "Upload data from a channel with 'Has city-level data' enabled to use this module."
+        )
+    else:
+        render_marketing_tab(role)
 
 # ══════════════════════════════════════════════
 # TAB 4 – SMART UPLOAD  (admin only)
 # ══════════════════════════════════════════════
 if role == "admin":
-    with tabs[3]:
+    with tabs[_TAB_UPLOAD]:
         st.subheader("Upload Sales Report")
 
         channels = master_chans["name"].tolist() if not master_chans.empty else []
         if not channels:
             st.warning("No channels configured. Add channels in the Configuration tab first.")
-            st.stop()
+        else:
+          selected_channel = st.selectbox("Select Channel", channels)
+          up_file = st.file_uploader("Upload File", type=["csv", "xlsx"])
 
-        selected_channel = st.selectbox("Select Channel", channels)
-        up_file = st.file_uploader("Upload File", type=["csv", "xlsx"])
-
-        if up_file and selected_channel:
+          if up_file and selected_channel:
+            _upload_ok = True
             try:
                 raw_df = (
                     pd.read_csv(up_file)
@@ -687,202 +783,512 @@ if role == "admin":
                 )
             except Exception as e:
                 st.error(f"Could not read file: {e}")
-                st.stop()
+                _upload_ok = False
 
-            st.write(f"**Preview** — {len(raw_df)} rows × {len(raw_df.columns)} cols")
-            st.dataframe(raw_df.head(5), hide_index=True)
+            if _upload_ok:
+              st.write(f"**Preview** — {len(raw_df)} rows × {len(raw_df.columns)} cols")
+              st.dataframe(raw_df.head(5), hide_index=True)
 
-            cols = ["None"] + raw_df.columns.tolist()
+              cols = ["None"] + raw_df.columns.tolist()
 
-            # Channels that carry city-level sales data
-            CITY_CHANNELS = {"Blinkit", "Swiggy", "Big Basket"}
-            needs_city = selected_channel in CITY_CHANNELS
+              # Channels that carry city-level sales data — driven by master_channels config
+              needs_city = requires_city_channel(selected_channel)
 
-            c1, c2, c3 = st.columns(3)
+              c1, c2, c3 = st.columns(3)
 
-            with c1:
-                p_col = st.selectbox("Product Column *", cols, key="p_col")
-                v_col = st.selectbox("Variant Column (optional)", cols, key="v_col")
-            with c2:
-                q_col = st.selectbox("Qty Column *",     cols, key="q_col")
-                r_col = st.selectbox("Revenue Column *", cols, key="r_col")
-            with c3:
-                d_col      = st.selectbox("Date Column (or use manual date below)", cols, key="d_col")
-                fixed_date = st.date_input("Manual Date (used if no date column)", key="fixed_date")
-                if needs_city:
-                    city_col = st.selectbox(
-                        "City Column *", cols, key="city_col",
-                        help="Required for city-level inventory tracking "
-                             "(Blinkit=Supply City, Swiggy=CITY, BigBasket=DC)",
-                    )
+              with c1:
+                  p_col = st.selectbox("Product Column *", cols, key="p_col")
+                  v_col = st.selectbox("Variant Column (optional)", cols, key="v_col")
+              with c2:
+                  q_col = st.selectbox("Qty Column *",     cols, key="q_col")
+                  r_col = st.selectbox("Revenue Column *", cols, key="r_col")
+              with c3:
+                  d_col      = st.selectbox("Date Column (or use manual date below)", cols, key="d_col")
+                  fixed_date = st.date_input("Manual Date (used if no date column)", key="fixed_date")
+                  if needs_city:
+                      city_col = st.selectbox(
+                          "City Column *", cols, key="city_col",
+                          help="Required for city-level inventory tracking "
+                               "(Blinkit=Supply City, Swiggy=CITY, BigBasket=DC)",
+                      )
+                  else:
+                      city_col = "None"  # Amazon and others — city not applicable
+
+              # Validate mandatory column picks
+              mandatory = [("Product", p_col), ("Qty", q_col), ("Revenue", r_col)]
+              if needs_city:
+                  mandatory.append(("City", city_col))
+              missing = [name for name, col in mandatory if col == "None"]
+              if missing:
+                  st.info(f"Please select columns for: {', '.join(missing)}")
+              else:
+                # ── Build composite key safely ──────────────────────────────────
+                work_df = raw_df.copy()
+                work_df["__prod__"] = work_df[p_col].astype(str).str.strip()
+
+                if v_col != "None":
+                    work_df["__var__"] = work_df[v_col].astype(str).str.strip()
+                    work_df["m_key"]   = work_df["__prod__"] + " | " + work_df["__var__"]
                 else:
-                    city_col = "None"  # Amazon and others — city not applicable
+                    work_df["m_key"] = work_df["__prod__"]
 
-            # Validate mandatory column picks
-            mandatory = [("Product", p_col), ("Qty", q_col), ("Revenue", r_col)]
-            if needs_city:
-                mandatory.append(("City", city_col))
-            missing = [name for name, col in mandatory if col == "None"]
-            if missing:
-                st.info(f"Please select columns for: {', '.join(missing)}")
-                st.stop()
+                # ── Filter out totals rows ──────────────────────────────────────
+                SKIP_LABELS = {"total", "grand total", "subtotal", "nan", ""}
+                valid_mask  = ~work_df["__prod__"].str.lower().isin(SKIP_LABELS)
+                work_df     = work_df[valid_mask].copy()
 
-            # ── Build composite key safely ──────────────────────────────────
-            work_df = raw_df.copy()
-            work_df["__prod__"] = work_df[p_col].astype(str).str.strip()
+                masters = master_skus["name"].tolist() if not master_skus.empty else []
 
-            if v_col != "None":
-                work_df["__var__"] = work_df[v_col].astype(str).str.strip()
-                work_df["m_key"]   = work_df["__prod__"] + " | " + work_df["__var__"]
-            else:
-                work_df["m_key"] = work_df["__prod__"]
+                if work_df.empty:
+                    st.error("No valid data rows found after filtering. Check column mapping.")
+                elif not masters:
+                    st.warning("No master SKUs configured. Add SKUs in the Configuration tab first.")
+                else:
+                  st.markdown("#### 🗺 Map Raw Product Names → Master SKUs")
+                  unique_keys = sorted(work_df["m_key"].unique())
+                  sku_map: dict[str, str] = {}
 
-            # ── Filter out totals rows ──────────────────────────────────────
-            SKIP_LABELS = {"total", "grand total", "subtotal", "nan", ""}
-            valid_mask  = ~work_df["__prod__"].str.lower().isin(SKIP_LABELS)
-            work_df     = work_df[valid_mask].copy()
+                  saved_map: dict[str, str] = {}
+                  if not item_map_df.empty:
+                      saved_map = dict(zip(item_map_df["raw_name"], item_map_df["master_name"]))
 
-            if work_df.empty:
-                st.error("No valid data rows found after filtering. Check column mapping.")
-                st.stop()
+                  for k in unique_keys:
+                      saved       = saved_map.get(k, "")
+                      default_idx = masters.index(saved) if saved in masters else 0
+                      sku_map[k]  = st.selectbox(
+                          f"Map: `{k}`",
+                          masters,
+                          index=default_idx,
+                          key=f"sku_{k}",
+                      )
 
-            # ── SKU Mapping UI ──────────────────────────────────────────────
-            masters = master_skus["name"].tolist() if not master_skus.empty else []
-            if not masters:
+                  # ── Date Preview ────────────────────────────────────────────────
+                  if d_col != "None":
+                      def preview_date(val):
+                          s = str(val).strip()
+                          if " - " in s:
+                              s = s.split(" - ")[0].strip()
+                          try:
+                              return pd.to_datetime(s).strftime("%Y-%m-%d")
+                          except Exception:
+                              return f"⚠️ unparseable: {val}"
+
+                      sample_dates   = work_df[d_col].dropna().unique()[:5]
+                      parsed_preview = [preview_date(d) for d in sample_dates]
+                      st.info(f"📅 **Date column preview** — raw: `{sample_dates[0]}` → parsed as: `{parsed_preview[0]}`")
+                      if any("unparseable" in str(p) for p in parsed_preview):
+                          st.warning("Some dates couldn't be parsed — those rows will use the Manual Date instead.")
+
+                  # ── Sync Button ─────────────────────────────────────────────────
+                  if st.button("🚀 Sync to Cloud"):
+                      errors: list[str] = []
+
+                      with st.spinner("Saving mappings…"):
+                          for raw_name, master_name in sku_map.items():
+                              try:
+                                  supabase.table("item_map").upsert(
+                                      {"raw_name": raw_name, "master_name": master_name},
+                                      on_conflict="raw_name",
+                                  ).execute()
+                              except Exception as e:
+                                  errors.append(f"Mapping save failed for '{raw_name}': {e}")
+
+                      with st.spinner("Processing rows…"):
+                          raw_rows = []
+                          for _, r in work_df.iterrows():
+                              if d_col != "None":
+                                  raw_date_val = str(r[d_col]).strip()
+                                  if " - " in raw_date_val:
+                                      raw_date_val = raw_date_val.split(" - ")[0].strip()
+                                  try:
+                                      dt_str = pd.to_datetime(raw_date_val).strftime("%Y-%m-%d")
+                                  except Exception:
+                                      dt_str = str(fixed_date)
+                              else:
+                                  dt_str = str(fixed_date)
+
+                              row_city = (
+                                  str(r[city_col]).strip()
+                                  if city_col != "None" and city_col in r.index
+                                  else None
+                              )
+                              raw_rows.append({
+                                  "date":      dt_str,
+                                  "channel":   selected_channel,
+                                  "item_name": sku_map[r["m_key"]],
+                                  "qty_sold":  clean_num(r[q_col]),
+                                  "revenue":   clean_num(r[r_col]),
+                                  "city":      row_city,
+                              })
+
+                          if not raw_rows:
+                              st.error("No rows to upload after processing.")
+                          else:
+                              group_cols = ["date", "channel", "item_name", "city"]
+                              final_df = (
+                                  pd.DataFrame(raw_rows)
+                                  .groupby(group_cols, dropna=False)
+                                  .agg({"qty_sold": "sum", "revenue": "sum"})
+                                  .reset_index()
+                              )
+
+                              with st.spinner(f"Uploading {len(final_df)} records to Supabase…"):
+                                  try:
+                                      final_df["qty_sold"] = final_df["qty_sold"].fillna(0.0)
+                                      final_df["revenue"]  = final_df["revenue"].fillna(0.0)
+                                      final_df["city"]     = (
+                                          final_df["city"]
+                                          .astype(object)
+                                          .where(final_df["city"].notna(), other=None)
+                                      )
+                                      CHUNK   = 500
+                                      records = final_df.to_dict(orient="records")
+                                      for i in range(0, len(records), CHUNK):
+                                          chunk = records[i : i + CHUNK]
+                                          res   = supabase.table("sales").upsert(
+                                              chunk,
+                                              on_conflict="date,channel,item_name,city",
+                                          ).execute()
+                                          if hasattr(res, "error") and res.error:
+                                              errors.append(f"Upsert chunk {i//CHUNK+1} error: {res.error}")
+                                  except Exception as e:
+                                      errors.append(f"Upload failed: {e}")
+
+                              if errors:
+                                  for err in errors:
+                                      st.error(err)
+                                  st.warning(
+                                      "⚠️ Some records may not have synced. "
+                                      "Check that your `sales` table has a UNIQUE constraint on "
+                                      "(date, channel, item_name, city) in Supabase."
+                                  )
+                              else:
+                                  st.success(f"✅ Synced {len(final_df)} unique records for '{selected_channel}'!")
+                                  invalidate_data_cache()
+                                  st.rerun()
+
+    # ══════════════════════════════════════════
+    # TAB – MONTHLY CHANNEL UPLOAD  (admin only)
+    # ══════════════════════════════════════════
+    with tabs[_TAB_MONTHLY_UPLOAD]:
+        st.subheader("📅 Monthly Channel Sales Entry")
+        st.caption(
+            "For channels where daily data is unavailable. "
+            "Sales can be entered for a whole month (auto-split across days) "
+            "or for specific days. City-level data is optional."
+        )
+
+        # Only show channels marked as monthly
+        monthly_chan_list = []
+        if not master_chans.empty:
+            mc = master_chans.copy()
+            if "is_monthly" in mc.columns:
+                monthly_chan_list = mc[mc["is_monthly"] == True]["name"].tolist()
+
+        if not monthly_chan_list:
+            st.info(
+                "No monthly channels configured yet. "
+                "Go to **🛠 Configuration** → Add Channel → check 'Monthly reporting channel'."
+            )
+        else:
+          mc_channel = st.selectbox("Select Monthly Channel", monthly_chan_list, key="mc_chan")
+          mc_needs_city = requires_city_channel(mc_channel)
+
+          st.divider()
+          st.markdown("#### 📆 Reporting Period")
+          mc_col1, mc_col2 = st.columns(2)
+          with mc_col1:
+              mc_year  = st.number_input("Year",  min_value=2020, max_value=2100,
+                                          value=datetime.now().year,  step=1, key="mc_year")
+          with mc_col2:
+              mc_month = st.number_input("Month", min_value=1,    max_value=12,
+                                          value=datetime.now().month, step=1, key="mc_month")
+
+          days_in_month = calendar.monthrange(int(mc_year), int(mc_month))[1]
+          all_days_of_month = list(range(1, days_in_month + 1))
+
+          st.markdown("#### 🗓️ Day Coverage")
+          mc_day_mode = st.radio(
+              "Which days does this data cover?",
+              ["Entire month (split equally across all days)", "Specific days of the month"],
+              key="mc_day_mode",
+          )
+
+          if mc_day_mode.startswith("Specific"):
+              selected_days = st.multiselect(
+                  f"Select days in {calendar.month_name[int(mc_month)]} {int(mc_year)}",
+                  all_days_of_month, default=all_days_of_month, key="mc_sel_days",
+              )
+              if not selected_days:
+                  st.warning("Select at least one day.")
+                  spread_days = []
+              else:
+                  spread_days = sorted(selected_days)
+          else:
+              spread_days = all_days_of_month
+
+          if spread_days:
+            st.divider()
+            st.markdown("#### 📂 Data Entry Method")
+            mc_entry_mode = st.radio(
+                "How would you like to enter data?",
+                ["Upload Excel / CSV file", "Manual product entry (no file)"],
+                key="mc_entry_mode",
+            )
+
+            mc_masters = master_skus["name"].tolist() if not master_skus.empty else []
+            if not mc_masters:
                 st.warning("No master SKUs configured. Add SKUs in the Configuration tab first.")
-                st.stop()
+            else:
+              mc_city_val = None
+              if mc_needs_city:
+                  mc_city_val = st.text_input(
+                      "City / Region (optional — leave blank if not available)",
+                      key="mc_city",
+                  ).strip() or None
 
-            st.markdown("#### 🗺 Map Raw Product Names → Master SKUs")
-            unique_keys = sorted(work_df["m_key"].unique())
-            sku_map: dict[str, str] = {}
+              # ─── PATH A — FILE UPLOAD ───────────────────────────────────────
+              if mc_entry_mode.startswith("Upload"):
+                  mc_file = st.file_uploader(
+                      "Upload monthly sales file", type=["csv", "xlsx"], key="mc_file_uploader",
+                  )
+                  if mc_file:
+                      _mc_ok = True
+                      try:
+                          mc_raw = (
+                              pd.read_csv(mc_file)
+                              if mc_file.name.lower().endswith(".csv")
+                              else pd.read_excel(mc_file)
+                          )
+                      except Exception as e:
+                          st.error(f"Could not read file: {e}")
+                          _mc_ok = False
 
-            saved_map: dict[str, str] = {}
-            if not item_map_df.empty:
-                saved_map = dict(zip(item_map_df["raw_name"], item_map_df["master_name"]))
+                      if _mc_ok:
+                          st.write(f"**Preview** — {len(mc_raw)} rows × {len(mc_raw.columns)} cols")
+                          st.dataframe(mc_raw.head(5), hide_index=True)
 
-            for k in unique_keys:
-                saved       = saved_map.get(k, "")
-                default_idx = masters.index(saved) if saved in masters else 0
-                sku_map[k]  = st.selectbox(
-                    f"Map: `{k}`",
-                    masters,
-                    index=default_idx,
-                    key=f"sku_{k}",
-                )
+                          mc_cols = ["None"] + mc_raw.columns.tolist()
+                          mcc1, mcc2, mcc3 = st.columns(3)
+                          with mcc1:
+                              mc_p_col = st.selectbox("Product Column *", mc_cols, key="mc_p_col")
+                              mc_v_col = st.selectbox("Variant Column (optional)", mc_cols, key="mc_v_col")
+                          with mcc2:
+                              mc_q_col = st.selectbox("Qty Column *", mc_cols, key="mc_q_col")
+                              mc_r_col = st.selectbox("Revenue Column *", mc_cols, key="mc_r_col")
+                          with mcc3:
+                              mc_d_col = st.selectbox(
+                                  "Date/Day Column (optional — leave None to use period above)",
+                                  mc_cols, key="mc_d_col",
+                                  help="If your file has a date or day-of-month column, select it here.",
+                              )
 
-            # ── Date Preview ────────────────────────────────────────────────
-            if d_col != "None":
-                def preview_date(val):
-                    s = str(val).strip()
-                    if " - " in s:
-                        s = s.split(" - ")[0].strip()
-                    try:
-                        return pd.to_datetime(s).strftime("%Y-%m-%d")
-                    except Exception:
-                        return f"⚠️ unparseable: {val}"
+                          mc_mandatory = [("Product", mc_p_col), ("Qty", mc_q_col), ("Revenue", mc_r_col)]
+                          mc_missing = [n for n, c in mc_mandatory if c == "None"]
+                          if mc_missing:
+                              st.info(f"Please select columns for: {', '.join(mc_missing)}")
+                          else:
+                              mc_work = mc_raw.copy()
+                              mc_work["__prod__"] = mc_work[mc_p_col].astype(str).str.strip()
+                              if mc_v_col != "None":
+                                  mc_work["__var__"] = mc_work[mc_v_col].astype(str).str.strip()
+                                  mc_work["m_key"] = mc_work["__prod__"] + " | " + mc_work["__var__"]
+                              else:
+                                  mc_work["m_key"] = mc_work["__prod__"]
+                              SKIP_LABELS_MC = {"total", "grand total", "subtotal", "nan", ""}
+                              mc_work = mc_work[~mc_work["__prod__"].str.lower().isin(SKIP_LABELS_MC)].copy()
 
-                sample_dates   = work_df[d_col].dropna().unique()[:5]
-                parsed_preview = [preview_date(d) for d in sample_dates]
-                st.info(f"📅 **Date column preview** — raw: `{sample_dates[0]}` → parsed as: `{parsed_preview[0]}`")
-                if any("unparseable" in str(p) for p in parsed_preview):
-                    st.warning("Some dates couldn't be parsed — those rows will use the Manual Date instead.")
+                              if mc_work.empty:
+                                  st.error("No valid product rows found after filtering.")
+                              else:
+                                  st.markdown("#### 🗺 Map Raw Product Names → Master SKUs")
+                                  saved_map_mc: dict = {}
+                                  if not item_map_df.empty:
+                                      saved_map_mc = dict(zip(item_map_df["raw_name"], item_map_df["master_name"]))
+                                  mc_sku_map: dict = {}
+                                  for k in sorted(mc_work["m_key"].unique()):
+                                      saved = saved_map_mc.get(k, "")
+                                      default_idx = mc_masters.index(saved) if saved in mc_masters else 0
+                                      mc_sku_map[k] = st.selectbox(
+                                          f"Map: `{k}`", mc_masters, index=default_idx, key=f"mc_sku_{k}"
+                                      )
 
-            # ── Sync Button ─────────────────────────────────────────────────
-            if st.button("🚀 Sync to Cloud"):
-                errors: list[str] = []
+                                  if st.button("🚀 Sync Monthly Data to Cloud", key="mc_file_sync"):
+                                      mc_errors: list = []
+                                      with st.spinner("Saving mappings…"):
+                                          for raw_n, master_n in mc_sku_map.items():
+                                              try:
+                                                  supabase.table("item_map").upsert(
+                                                      {"raw_name": raw_n, "master_name": master_n},
+                                                      on_conflict="raw_name",
+                                                  ).execute()
+                                              except Exception as e:
+                                                  mc_errors.append(f"Mapping failed for '{raw_n}': {e}")
 
-                with st.spinner("Saving mappings…"):
-                    for raw_name, master_name in sku_map.items():
-                        try:
-                            supabase.table("item_map").upsert(
-                                {"raw_name": raw_name, "master_name": master_name},
-                                on_conflict="raw_name",
-                            ).execute()
-                        except Exception as e:
-                            errors.append(f"Mapping save failed for '{raw_name}': {e}")
+                                      with st.spinner("Spreading sales across days…"):
+                                          mc_rows_to_insert = []
+                                          for _, r in mc_work.iterrows():
+                                              row_days = spread_days
+                                              if mc_d_col != "None":
+                                                  raw_dval = str(r[mc_d_col]).strip()
+                                                  try:
+                                                      day_int = int(float(raw_dval))
+                                                      row_days = [day_int] if 1 <= day_int <= days_in_month else spread_days
+                                                  except (ValueError, TypeError):
+                                                      try:
+                                                          parsed = pd.to_datetime(raw_dval)
+                                                          row_days = [parsed.day] if (parsed.year == int(mc_year) and parsed.month == int(mc_month)) else spread_days
+                                                      except Exception:
+                                                          row_days = spread_days
+                                              n_days = len(row_days)
+                                              qty_per = round(clean_num(r[mc_q_col]) / n_days, 4) if n_days else 0
+                                              rev_per = round(clean_num(r[mc_r_col]) / n_days, 4) if n_days else 0
+                                              for day in row_days:
+                                                  mc_rows_to_insert.append({
+                                                      "date":      f"{int(mc_year):04d}-{int(mc_month):02d}-{day:02d}",
+                                                      "channel":   mc_channel,
+                                                      "item_name": mc_sku_map[r["m_key"]],
+                                                      "qty_sold":  qty_per,
+                                                      "revenue":   rev_per,
+                                                      "city":      mc_city_val,
+                                                  })
 
-                with st.spinner("Processing rows…"):
-                    raw_rows = []
-                    for _, r in work_df.iterrows():
-                        if d_col != "None":
-                            raw_date_val = str(r[d_col]).strip()
-                            if " - " in raw_date_val:
-                                raw_date_val = raw_date_val.split(" - ")[0].strip()
-                            try:
-                                dt_str = pd.to_datetime(raw_date_val).strftime("%Y-%m-%d")
-                            except Exception:
-                                dt_str = str(fixed_date)
-                        else:
-                            dt_str = str(fixed_date)
+                                      if not mc_rows_to_insert:
+                                          st.error("No rows generated.")
+                                      else:
+                                          gc = ["date", "channel", "item_name", "city"]
+                                          mc_final = (
+                                              pd.DataFrame(mc_rows_to_insert)
+                                              .groupby(gc, dropna=False)
+                                              .agg({"qty_sold": "sum", "revenue": "sum"})
+                                              .reset_index()
+                                          )
+                                          mc_final["qty_sold"] = mc_final["qty_sold"].fillna(0.0)
+                                          mc_final["revenue"]  = mc_final["revenue"].fillna(0.0)
+                                          mc_final["city"]     = mc_final["city"].astype(object).where(mc_final["city"].notna(), other=None)
+                                          with st.spinner(f"Uploading {len(mc_final)} records…"):
+                                              try:
+                                                  CHUNK = 500
+                                                  recs = mc_final.to_dict(orient="records")
+                                                  for i in range(0, len(recs), CHUNK):
+                                                      res = supabase.table("sales").upsert(recs[i:i+CHUNK], on_conflict="date,channel,item_name,city").execute()
+                                                      if hasattr(res, "error") and res.error:
+                                                          mc_errors.append(f"Chunk {i//CHUNK+1}: {res.error}")
+                                              except Exception as e:
+                                                  mc_errors.append(f"Upload failed: {e}")
+                                          if mc_errors:
+                                              for err in mc_errors: st.error(err)
+                                          else:
+                                              st.success(f"✅ Synced {len(mc_final)} records for '{mc_channel}' — {calendar.month_name[int(mc_month)]} {int(mc_year)} across {len(spread_days)} day(s).")
+                                              invalidate_data_cache()
+                                              st.rerun()
 
-                        row_city = (
-                            str(r[city_col]).strip()
-                            if city_col != "None" and city_col in r.index
-                            else None
-                        )
-                        raw_rows.append({
-                            "date":      dt_str,
-                            "channel":   selected_channel,
-                            "item_name": sku_map[r["m_key"]],
-                            "qty_sold":  clean_num(r[q_col]),
-                            "revenue":   clean_num(r[r_col]),
-                            "city":      row_city,
-                        })
+              # ─── PATH B — MANUAL ENTRY ──────────────────────────────────────
+              else:
+                  st.markdown("#### ✏️ Manual Product Entry")
+                  st.caption("Add each product's quantity and revenue for the selected period.")
+                  if "mc_manual_rows" not in st.session_state:
+                      st.session_state["mc_manual_rows"] = []
 
-                    if not raw_rows:
-                        st.error("No rows to upload after processing.")
-                        st.stop()
+                  with st.form("mc_add_row_form", clear_on_submit=True):
+                      fm1, fm2, fm3, fm4 = st.columns([3, 2, 2, 1])
+                      with fm1:
+                          fm_sku = st.selectbox("Product (Master SKU)", mc_masters, key="fm_sku")
+                      with fm2:
+                          fm_qty = st.number_input("Quantity", min_value=0.0, step=1.0, key="fm_qty")
+                      with fm3:
+                          fm_rev = st.number_input("Revenue (₹)", min_value=0.0, step=0.01, key="fm_rev")
+                      with fm4:
+                          fm_day = st.text_input("Day(s) (opt.)", placeholder="e.g. 5 or 5,10,15", key="fm_day",
+                                                  help="Leave blank to spread across the whole period.")
+                      if st.form_submit_button("➕ Add Row"):
+                          st.session_state["mc_manual_rows"].append({
+                              "sku": fm_sku, "qty": fm_qty, "revenue": fm_rev, "day_spec": fm_day.strip(),
+                          })
 
-                    group_cols = ["date", "channel", "item_name", "city"]
-                    final_df = (
-                        pd.DataFrame(raw_rows)
-                        .groupby(group_cols, dropna=False)
-                        .agg({"qty_sold": "sum", "revenue": "sum"})
-                        .reset_index()
-                    )
+                  if st.session_state["mc_manual_rows"]:
+                      st.dataframe(
+                          pd.DataFrame(st.session_state["mc_manual_rows"]).rename(columns={
+                              "sku": "Product", "qty": "Qty", "revenue": "Revenue (₹)", "day_spec": "Day(s)"
+                          }), hide_index=True, use_container_width=True
+                      )
+                      rm1, rm2 = st.columns(2)
+                      with rm1:
+                          if st.button("🗑️ Clear All Rows", key="mc_clear"):
+                              st.session_state["mc_manual_rows"] = []
+                              st.rerun()
+                      with rm2:
+                          if st.button("🚀 Sync Manual Data to Cloud", key="mc_manual_sync"):
+                              mc_m_errors: list = []
+                              mc_manual_inserts = []
+                              for entry in st.session_state["mc_manual_rows"]:
+                                  day_spec = entry.get("day_spec", "").strip()
+                                  if day_spec:
+                                      try:
+                                          parsed_days = [int(d.strip()) for d in day_spec.split(",") if d.strip().isdigit()]
+                                          row_days = [d for d in parsed_days if 1 <= d <= days_in_month] or spread_days
+                                      except Exception:
+                                          row_days = spread_days
+                                  else:
+                                      row_days = spread_days
+                                  n_days = len(row_days)
+                                  qty_per = round(entry["qty"] / n_days, 4) if n_days else 0
+                                  rev_per = round(entry["revenue"] / n_days, 4) if n_days else 0
+                                  for day in row_days:
+                                      mc_manual_inserts.append({
+                                          "date":      f"{int(mc_year):04d}-{int(mc_month):02d}-{day:02d}",
+                                          "channel":   mc_channel,
+                                          "item_name": entry["sku"],
+                                          "qty_sold":  qty_per,
+                                          "revenue":   rev_per,
+                                          "city":      mc_city_val,
+                                      })
+                              if not mc_manual_inserts:
+                                  st.error("No records to insert.")
+                              else:
+                                  gc = ["date", "channel", "item_name", "city"]
+                                  mc_m_final = (
+                                      pd.DataFrame(mc_manual_inserts)
+                                      .groupby(gc, dropna=False)
+                                      .agg({"qty_sold": "sum", "revenue": "sum"})
+                                      .reset_index()
+                                  )
+                                  mc_m_final["qty_sold"] = mc_m_final["qty_sold"].fillna(0.0)
+                                  mc_m_final["revenue"]  = mc_m_final["revenue"].fillna(0.0)
+                                  mc_m_final["city"]     = mc_m_final["city"].astype(object).where(mc_m_final["city"].notna(), other=None)
+                                  with st.spinner(f"Uploading {len(mc_m_final)} records…"):
+                                      try:
+                                          CHUNK = 500
+                                          recs = mc_m_final.to_dict(orient="records")
+                                          for i in range(0, len(recs), CHUNK):
+                                              res = supabase.table("sales").upsert(recs[i:i+CHUNK], on_conflict="date,channel,item_name,city").execute()
+                                              if hasattr(res, "error") and res.error:
+                                                  mc_m_errors.append(f"Chunk {i//CHUNK+1}: {res.error}")
+                                      except Exception as e:
+                                          mc_m_errors.append(f"Upload failed: {e}")
+                                  if mc_m_errors:
+                                      for err in mc_m_errors: st.error(err)
+                                  else:
+                                      st.success(f"✅ Synced {len(mc_m_final)} records for '{mc_channel}' — {calendar.month_name[int(mc_month)]} {int(mc_year)} across {len(spread_days)} day(s).")
+                                      st.session_state["mc_manual_rows"] = []
+                                      invalidate_data_cache()
+                                      st.rerun()
+                  else:
+                      st.info("No rows added yet. Use the form above to add products.")
 
-                with st.spinner(f"Uploading {len(final_df)} records to Supabase…"):
-                    try:
-                        # Sanitise before JSON serialisation:
-                        # - qty_sold / revenue: NaN → 0.0
-                        # - city: NaN (float64) → None so JSON encodes as null
-                        final_df["qty_sold"] = final_df["qty_sold"].fillna(0.0)
-                        final_df["revenue"]  = final_df["revenue"].fillna(0.0)
-                        final_df["city"]     = (
-                            final_df["city"]
-                            .astype(object)
-                            .where(final_df["city"].notna(), other=None)
-                        )
-                        CHUNK   = 500
-                        records = final_df.to_dict(orient="records")
-                        for i in range(0, len(records), CHUNK):
-                            chunk = records[i : i + CHUNK]
-                            res   = supabase.table("sales").upsert(
-                                chunk,
-                                on_conflict="date,channel,item_name,city",
-                            ).execute()
-                            if hasattr(res, "error") and res.error:
-                                errors.append(f"Upsert chunk {i//CHUNK+1} error: {res.error}")
-                    except Exception as e:
-                        errors.append(f"Upload failed: {e}")
+              st.divider()
+              st.info(
+                  "💡 **To delete monthly data**: use the **Delete Specific Entry** panel "
+                  "in the sidebar — select the channel and any date within the uploaded month. "
+                  "All rows for that channel & date will be removed."
+              )
 
-                if errors:
-                    for err in errors:
-                        st.error(err)
-                    st.warning(
-                        "⚠️ Some records may not have synced. "
-                        "Check that your `sales` table has a UNIQUE constraint on "
-                        "(date, channel, item_name, city) in Supabase."
-                    )
-                else:
-                    st.success(f"✅ Synced {len(final_df)} unique records for '{selected_channel}'!")
-                    invalidate_data_cache()
-                    st.rerun()
 
     # ══════════════════════════════════════════
-    # TAB 4 – CONFIGURATION  (admin only)
     # ══════════════════════════════════════════
-    with tabs[4]:
+    # TAB – CONFIGURATION  (admin only)
+    # ══════════════════════════════════════════
+    with tabs[_TAB_CONFIG]:
         st.subheader("⚙️ System Configuration")
         sc1, sc2 = st.columns(2)
 
@@ -904,17 +1310,30 @@ if role == "admin":
         with sc2:
             st.markdown("#### 🏢 Sales Channels")
             n_ch = st.text_input("New Channel Name")
+            ch_is_monthly    = st.checkbox("📅 Monthly reporting channel", value=False,
+                                           help="Enable if daily data is unavailable — sales are reported monthly.")
+            ch_requires_city = st.checkbox("🏙️ Has city-level data", value=True,
+                                           help="Uncheck if city breakdown is unavailable (disables Channel Performance & Marketing for this channel).")
             if st.button("Add Channel") and n_ch.strip():
                 safe_ch = sanitize(n_ch)
                 if safe_ch:
                     try:
-                        supabase.table("master_channels").insert({"name": safe_ch}).execute()
+                        supabase.table("master_channels").insert({
+                            "name":          safe_ch,
+                            "is_monthly":    ch_is_monthly,
+                            "requires_city": ch_requires_city,
+                        }).execute()
                         st.success(f"Added channel: {safe_ch}")
+                        invalidate_data_cache()
                         st.rerun()
                     except Exception as e:
                         st.error(f"Failed to add channel: {e}")
             if not master_chans.empty:
-                st.dataframe(master_chans, hide_index=True)
+                display_chans = master_chans.copy()
+                # Friendly column names
+                rename_map = {"name": "Channel", "is_monthly": "Monthly?", "requires_city": "City Data?"}
+                display_chans = display_chans.rename(columns={k: v for k, v in rename_map.items() if k in display_chans.columns})
+                st.dataframe(display_chans, hide_index=True)
 
         st.divider()
         st.markdown("#### 🗺 Current Item Mappings")
@@ -926,7 +1345,17 @@ if role == "admin":
 # ══════════════════════════════════════════════
 # TAB – CHANNEL PERFORMANCE (admin + viewer, last tab)
 # ══════════════════════════════════════════════
-# Admin: tabs[5]  |  Viewer: tabs[3]
-_cp_tab_index = 5 if role == "admin" else 3
-with tabs[_cp_tab_index]:
-    render_channel_performance_tab(supabase, master_skus, role)
+with tabs[_TAB_CHANPERF]:
+    _has_city_data_cp = (
+        not history_df.empty
+        and "city" in history_df.columns
+        and history_df["city"].notna().any()
+    )
+    if not _has_city_data_cp:
+        st.info(
+            "📦 **Channel Performance** requires city-level sales data. "
+            "No city-level data has been uploaded yet, or all active channels "
+            "are configured without city data."
+        )
+    else:
+        render_channel_performance_tab(supabase, master_skus, role)
