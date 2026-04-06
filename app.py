@@ -844,21 +844,17 @@ if role == "admin":
                 with st.spinner(f"Uploading {len(final_df)} records to Supabase…"):
                     try:
                         # Sanitise before JSON serialisation:
-                        # - city: NaN → None (null in JSON, allowed by Supabase)
                         # - qty_sold / revenue: NaN → 0.0
+                        # - city: NaN (float64) → None so JSON encodes as null
                         final_df["qty_sold"] = final_df["qty_sold"].fillna(0.0)
                         final_df["revenue"]  = final_df["revenue"].fillna(0.0)
-                        # Replace NaN city with None so JSON encodes as null
-                        final_df["city"] = final_df["city"].where(
-                            final_df["city"].notna() & (final_df["city"].astype(str) != "nan"),
-                            other=None,
+                        final_df["city"]     = (
+                            final_df["city"]
+                            .astype(object)
+                            .where(final_df["city"].notna(), other=None)
                         )
                         CHUNK   = 500
                         records = final_df.to_dict(orient="records")
-                        # Ensure city None stays None (not "None" string)
-                        for rec in records:
-                            if rec.get("city") in (float("nan"), "nan", "None"):
-                                rec["city"] = None
                         for i in range(0, len(records), CHUNK):
                             chunk = records[i : i + CHUNK]
                             res   = supabase.table("sales").upsert(
