@@ -48,7 +48,6 @@ def _save_mappings(supabase_client, new_entries):
 # Supabase sales fetch
 # ─────────────────────────────────────────────────────────────────────────────
 
-@st.cache_data(ttl=60)
 def _load_item_map(supabase_client) -> pd.DataFrame:
     """
     Load the item_map table (used by Smart Upload in app_24).
