@@ -501,7 +501,7 @@ def _reapply_sales(snap_df: pd.DataFrame, raw_sales: pd.DataFrame,
         # Normalise city keys the same way parsers do
         if channel == "Swiggy":
             city_sales["_ckey"] = city_sales["city"].astype(str).str.strip().str.upper()
-            snap_df["_ckey"]    = snap_df["location"].astype(str).str.split(" (").str[0].str.strip().str.upper()
+            snap_df["_ckey"]    = snap_df["location"].astype(str).str.split(" (", regex=False).str[0].str.strip().str.upper()
         else:
             city_sales["_ckey"] = city_sales["city"].astype(str).str.strip()
             snap_df["_ckey"]    = snap_df["location"].astype(str).str.strip()
