@@ -1,6 +1,5 @@
 import streamlit as st
 import pandas as pd
-import calendar
 from supabase import create_client, Client
 import re
 import plotly.express as px
@@ -123,27 +122,8 @@ role: str = st.session_state["role"]
 
 history_df  = get_table("sales",           ("id", "date", "channel", "item_name", "qty_sold", "revenue"))
 master_skus  = get_table("master_skus",    ("name",))
-master_chans = get_table("master_channels",("name", "is_monthly", "requires_city"))
+master_chans = get_table("master_channels",("name",))
 item_map_df  = get_table("item_map",       ("raw_name", "master_name"))
-
-# ── Channel attribute helpers ─────────────────────────────────────────────
-def _chan_flag(channel_name: str, flag: str, default: bool) -> bool:
-    """Return a boolean flag for a channel from master_chans; default if missing."""
-    if master_chans.empty or flag not in master_chans.columns:
-        return default
-    row = master_chans[master_chans["name"] == channel_name]
-    if row.empty:
-        return default
-    val = row.iloc[0][flag]
-    if pd.isna(val):
-        return default
-    return bool(val)
-
-def is_monthly_channel(ch: str) -> bool:
-    return _chan_flag(ch, "is_monthly", False)
-
-def requires_city_channel(ch: str) -> bool:
-    return _chan_flag(ch, "requires_city", True)
 
 # ─────────────────────────────────────────────
 # SIDEBAR
@@ -156,57 +136,23 @@ with st.sidebar:
         st.subheader("🛠 Data Correction")
 
         with st.expander("Delete Specific Entry"):
-            del_mode = st.radio(
-                "Delete by:",
-                ["Single Date", "Entire Month (for monthly channels)"],
-                key="del_mode",
-                horizontal=True,
-            )
+            del_date = st.date_input("Select Date to Clear", value=datetime.now().date())
             chan_options = ["Select…"] + master_chans["name"].tolist()
             del_chan = st.selectbox("Select Channel to Clear", chan_options)
-
-            if del_mode == "Single Date":
-                del_date = st.date_input("Select Date to Clear", value=datetime.now().date())
-                if st.button("🗑️ Delete Selection"):
-                    if del_chan != "Select…":
-                        try:
-                            supabase.table("sales").delete()\
-                                .eq("date", str(del_date))\
-                                .eq("channel", del_chan)\
-                                .execute()
-                            st.success(f"Deleted {del_chan} data for {del_date}")
-                            invalidate_data_cache()
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Delete failed: {e}")
-                    else:
-                        st.error("Please select a channel.")
-            else:
-                del_year  = st.number_input("Year",  min_value=2020, max_value=2100,
-                                             value=datetime.now().year,  step=1, key="del_year")
-                del_month = st.number_input("Month", min_value=1,    max_value=12,
-                                             value=datetime.now().month, step=1, key="del_month")
-                if st.button("🗑️ Delete Entire Month"):
-                    if del_chan != "Select…":
-                        try:
-                            days_m = calendar.monthrange(int(del_year), int(del_month))[1]
-                            start_str = f"{int(del_year):04d}-{int(del_month):02d}-01"
-                            end_str   = f"{int(del_year):04d}-{int(del_month):02d}-{days_m:02d}"
-                            supabase.table("sales").delete()\
-                                .eq("channel", del_chan)\
-                                .gte("date", start_str)\
-                                .lte("date", end_str)\
-                                .execute()
-                            st.success(
-                                f"Deleted {del_chan} data for "
-                                f"{calendar.month_name[int(del_month)]} {int(del_year)}"
-                            )
-                            invalidate_data_cache()
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Delete failed: {e}")
-                    else:
-                        st.error("Please select a channel.")
+            if st.button("🗑️ Delete Selection"):
+                if del_chan != "Select…":
+                    try:
+                        supabase.table("sales").delete()\
+                            .eq("date", str(del_date))\
+                            .eq("channel", del_chan)\
+                            .execute()
+                        st.success(f"Deleted {del_chan} data for {del_date}")
+                        invalidate_data_cache()
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Delete failed: {e}")
+                else:
+                    st.error("Please select a channel.")
 
         st.divider()
         if st.checkbox("Unlock Global Danger Zone"):
@@ -234,45 +180,17 @@ with st.sidebar:
         st.rerun()
 
 # ─────────────────────────────────────────────
-# TABS — built dynamically based on role
+# TABS
 # ─────────────────────────────────────────────
-# Determine whether any channel actually requires city data
-# (used to gate Marketing + Channel Performance tabs)
-_any_city_channel = True   # tabs are always shown; per-channel gating happens inside them
-
 if role == "admin":
-    tabs = st.tabs([
-        "📊 Trend Analytics",
-        "🔬 Deep Dive",
-        "📣 Performance Marketing",
-        "📤 Smart Upload",
-        "📅 Monthly Channel Upload",
-        "🛠 Configuration",
-        "📦 Channel Performance",
-    ])
-    _TAB_ANALYTICS       = 0
-    _TAB_DEEPDIVE        = 1
-    _TAB_MARKETING       = 2
-    _TAB_UPLOAD          = 3
-    _TAB_MONTHLY_UPLOAD  = 4
-    _TAB_CONFIG          = 5
-    _TAB_CHANPERF        = 6
+    tabs = st.tabs(["📊 Trend Analytics", "🔬 Deep Dive", "📣 Performance Marketing", "📤 Smart Upload", "🛠 Configuration", "📦 Channel Performance"])
 else:
-    tabs = st.tabs([
-        "📊 Trend Analytics",
-        "🔬 Deep Dive",
-        "📣 Performance Marketing",
-        "📦 Channel Performance",
-    ])
-    _TAB_ANALYTICS  = 0
-    _TAB_DEEPDIVE   = 1
-    _TAB_MARKETING  = 2
-    _TAB_CHANPERF   = 3
+    tabs = st.tabs(["📊 Trend Analytics", "🔬 Deep Dive", "📣 Performance Marketing", "📦 Channel Performance"])
 
 # ══════════════════════════════════════════════
 # TAB 1 – TREND ANALYTICS  (unchanged)
 # ══════════════════════════════════════════════
-with tabs[_TAB_ANALYTICS]:
+with tabs[0]:
     if history_df.empty:
         st.info("No data found. Admin must upload sales data first.")
     else:
@@ -386,7 +304,7 @@ with tabs[_TAB_ANALYTICS]:
 # ══════════════════════════════════════════════
 # TAB 2 – DEEP DIVE  (new)
 # ══════════════════════════════════════════════
-with tabs[_TAB_DEEPDIVE]:
+with tabs[1]:
     if history_df.empty:
         st.info("No data found. Admin must upload sales data first.")
     else:
@@ -740,30 +658,16 @@ with tabs[_TAB_DEEPDIVE]:
                 st.success("All channels have recent data ✅")
 
 # ══════════════════════════════════════════════
-# TAB – PERFORMANCE MARKETING (all roles, index 2)
+# TAB 3 – PERFORMANCE MARKETING (all roles, index 2)
 # ══════════════════════════════════════════════
-with tabs[_TAB_MARKETING]:
-    # Check if any channels with city data exist in the sales history
-    _has_city_data = (
-        not history_df.empty
-        and "city" in history_df.columns
-        and history_df["city"].notna().any()
-    )
-    if not _has_city_data:
-        st.info(
-            "📣 **Performance Marketing** is based on city-level sales data. "
-            "No city-level data has been uploaded yet, or all active channels "
-            "are configured without city data. "
-            "Upload data from a channel with 'Has city-level data' enabled to use this module."
-        )
-    else:
-        render_marketing_tab(role)
+with tabs[2]:
+    render_marketing_tab(role)
 
 # ══════════════════════════════════════════════
 # TAB 4 – SMART UPLOAD  (admin only)
 # ══════════════════════════════════════════════
 if role == "admin":
-    with tabs[_TAB_UPLOAD]:
+    with tabs[3]:
         st.subheader("Upload Sales Report")
 
         channels = master_chans["name"].tolist() if not master_chans.empty else []
@@ -790,8 +694,9 @@ if role == "admin":
 
             cols = ["None"] + raw_df.columns.tolist()
 
-            # Channels that carry city-level sales data — driven by master_channels config
-            needs_city = requires_city_channel(selected_channel)
+            # Channels that carry city-level sales data
+            CITY_CHANNELS = {"Blinkit", "Swiggy", "Big Basket"}
+            needs_city = selected_channel in CITY_CHANNELS
 
             c1, c2, c3 = st.columns(3)
 
@@ -975,418 +880,9 @@ if role == "admin":
                     st.rerun()
 
     # ══════════════════════════════════════════
-    # TAB – MONTHLY CHANNEL UPLOAD  (admin only)
+    # TAB 4 – CONFIGURATION  (admin only)
     # ══════════════════════════════════════════
-    with tabs[_TAB_MONTHLY_UPLOAD]:
-        st.subheader("📅 Monthly Channel Sales Entry")
-        st.caption(
-            "For channels where daily data is unavailable. "
-            "Sales can be entered for a whole month (auto-split across days) "
-            "or for specific days. City-level data is optional."
-        )
-
-        # Only show channels marked as monthly
-        monthly_chan_list = []
-        if not master_chans.empty:
-            mc = master_chans.copy()
-            if "is_monthly" in mc.columns:
-                monthly_chan_list = mc[mc["is_monthly"] == True]["name"].tolist()
-
-        if not monthly_chan_list:
-            st.info(
-                "No monthly channels configured yet. "
-                "Go to **🛠 Configuration** → Add Channel → check 'Monthly reporting channel'."
-            )
-            st.stop()
-
-        mc_channel = st.selectbox("Select Monthly Channel", monthly_chan_list, key="mc_chan")
-
-        # Determine if this channel requires city data
-        mc_needs_city = requires_city_channel(mc_channel)
-
-        st.divider()
-        st.markdown("#### 📆 Reporting Period")
-        mc_col1, mc_col2 = st.columns(2)
-        with mc_col1:
-            mc_year  = st.number_input("Year",  min_value=2020, max_value=2100,
-                                        value=datetime.now().year,  step=1, key="mc_year")
-        with mc_col2:
-            mc_month = st.number_input("Month", min_value=1,    max_value=12,
-                                        value=datetime.now().month, step=1, key="mc_month")
-
-        days_in_month = calendar.monthrange(int(mc_year), int(mc_month))[1]
-        all_days_of_month = list(range(1, days_in_month + 1))
-
-        st.markdown("#### 🗓️ Day Coverage")
-        mc_day_mode = st.radio(
-            "Which days does this data cover?",
-            ["Entire month (split equally across all days)",
-             "Specific days of the month"],
-            key="mc_day_mode",
-        )
-
-        if mc_day_mode.startswith("Specific"):
-            selected_days = st.multiselect(
-                f"Select days in {calendar.month_name[int(mc_month)]} {int(mc_year)}",
-                all_days_of_month,
-                default=all_days_of_month,
-                key="mc_sel_days",
-            )
-            if not selected_days:
-                st.warning("Select at least one day.")
-                st.stop()
-            spread_days = sorted(selected_days)
-        else:
-            spread_days = all_days_of_month
-
-        st.divider()
-        st.markdown("#### 📂 Data Entry Method")
-        mc_entry_mode = st.radio(
-            "How would you like to enter data?",
-            ["Upload Excel / CSV file", "Manual product entry (no file)"],
-            key="mc_entry_mode",
-        )
-
-        # ── Helper: get master SKUs ─────────────────────────────────
-        mc_masters = master_skus["name"].tolist() if not master_skus.empty else []
-        if not mc_masters:
-            st.warning("No master SKUs configured. Add SKUs in the Configuration tab first.")
-            st.stop()
-
-        # ── Shared city input (optional, shown only if channel has city data) ─
-        mc_city_val = None
-        if mc_needs_city:
-            mc_city_val = st.text_input(
-                "City / Region (optional — leave blank if not available)",
-                key="mc_city",
-            ).strip() or None
-
-        # ═══════════════════════════════════════
-        # PATH A — FILE UPLOAD
-        # ═══════════════════════════════════════
-        if mc_entry_mode.startswith("Upload"):
-            mc_file = st.file_uploader(
-                "Upload monthly sales file",
-                type=["csv", "xlsx"],
-                key="mc_file_uploader",
-            )
-
-            if mc_file:
-                try:
-                    mc_raw = (
-                        pd.read_csv(mc_file)
-                        if mc_file.name.lower().endswith(".csv")
-                        else pd.read_excel(mc_file)
-                    )
-                except Exception as e:
-                    st.error(f"Could not read file: {e}")
-                    st.stop()
-
-                st.write(f"**Preview** — {len(mc_raw)} rows × {len(mc_raw.columns)} cols")
-                st.dataframe(mc_raw.head(5), hide_index=True)
-
-                mc_cols = ["None"] + mc_raw.columns.tolist()
-                mcc1, mcc2, mcc3 = st.columns(3)
-                with mcc1:
-                    mc_p_col = st.selectbox("Product Column *", mc_cols, key="mc_p_col")
-                    mc_v_col = st.selectbox("Variant Column (optional)", mc_cols, key="mc_v_col")
-                with mcc2:
-                    mc_q_col = st.selectbox("Qty Column *",     mc_cols, key="mc_q_col")
-                    mc_r_col = st.selectbox("Revenue Column *", mc_cols, key="mc_r_col")
-                with mcc3:
-                    mc_d_col = st.selectbox(
-                        "Date/Day Column (optional — leave None to use period above)",
-                        mc_cols, key="mc_d_col",
-                        help="If your file has a date or day-of-month column, select it here.",
-                    )
-
-                mc_mandatory = [("Product", mc_p_col), ("Qty", mc_q_col), ("Revenue", mc_r_col)]
-                mc_missing   = [n for n, c in mc_mandatory if c == "None"]
-                if mc_missing:
-                    st.info(f"Please select columns for: {', '.join(mc_missing)}")
-                    st.stop()
-
-                # Build composite key
-                mc_work = mc_raw.copy()
-                mc_work["__prod__"] = mc_work[mc_p_col].astype(str).str.strip()
-                if mc_v_col != "None":
-                    mc_work["__var__"] = mc_work[mc_v_col].astype(str).str.strip()
-                    mc_work["m_key"]   = mc_work["__prod__"] + " | " + mc_work["__var__"]
-                else:
-                    mc_work["m_key"] = mc_work["__prod__"]
-
-                SKIP_LABELS_MC = {"total", "grand total", "subtotal", "nan", ""}
-                mc_work = mc_work[~mc_work["__prod__"].str.lower().isin(SKIP_LABELS_MC)].copy()
-
-                if mc_work.empty:
-                    st.error("No valid product rows found after filtering.")
-                    st.stop()
-
-                # SKU Mapping
-                st.markdown("#### 🗺 Map Raw Product Names → Master SKUs")
-                saved_map_mc: dict = {}
-                if not item_map_df.empty:
-                    saved_map_mc = dict(zip(item_map_df["raw_name"], item_map_df["master_name"]))
-
-                mc_sku_map: dict = {}
-                for k in sorted(mc_work["m_key"].unique()):
-                    saved       = saved_map_mc.get(k, "")
-                    default_idx = mc_masters.index(saved) if saved in mc_masters else 0
-                    mc_sku_map[k] = st.selectbox(
-                        f"Map: `{k}`", mc_masters, index=default_idx, key=f"mc_sku_{k}"
-                    )
-
-                if st.button("🚀 Sync Monthly Data to Cloud", key="mc_file_sync"):
-                    mc_errors: list = []
-
-                    # Save mappings
-                    with st.spinner("Saving mappings…"):
-                        for raw_n, master_n in mc_sku_map.items():
-                            try:
-                                supabase.table("item_map").upsert(
-                                    {"raw_name": raw_n, "master_name": master_n},
-                                    on_conflict="raw_name",
-                                ).execute()
-                            except Exception as e:
-                                mc_errors.append(f"Mapping save failed for '{raw_n}': {e}")
-
-                    # Build daily rows
-                    with st.spinner("Spreading sales across days…"):
-                        mc_rows_to_insert = []
-                        for _, r in mc_work.iterrows():
-                            # Determine date(s) for this row
-                            row_days = spread_days
-
-                            if mc_d_col != "None":
-                                raw_dval = str(r[mc_d_col]).strip()
-                                # Try to interpret as a day-of-month integer first
-                                try:
-                                    day_int = int(float(raw_dval))
-                                    if 1 <= day_int <= days_in_month:
-                                        row_days = [day_int]
-                                    else:
-                                        row_days = spread_days
-                                except (ValueError, TypeError):
-                                    # Try as full date
-                                    try:
-                                        parsed = pd.to_datetime(raw_dval)
-                                        if (parsed.year == int(mc_year) and
-                                                parsed.month == int(mc_month)):
-                                            row_days = [parsed.day]
-                                        else:
-                                            row_days = spread_days
-                                    except Exception:
-                                        row_days = spread_days
-
-                            total_qty = clean_num(r[mc_q_col])
-                            total_rev = clean_num(r[mc_r_col])
-                            n_days    = len(row_days)
-                            qty_per   = round(total_qty / n_days, 4) if n_days else 0
-                            rev_per   = round(total_rev / n_days, 4) if n_days else 0
-
-                            for day in row_days:
-                                dt_str = f"{int(mc_year):04d}-{int(mc_month):02d}-{day:02d}"
-                                mc_rows_to_insert.append({
-                                    "date":      dt_str,
-                                    "channel":   mc_channel,
-                                    "item_name": mc_sku_map[r["m_key"]],
-                                    "qty_sold":  qty_per,
-                                    "revenue":   rev_per,
-                                    "city":      mc_city_val,
-                                })
-
-                    if not mc_rows_to_insert:
-                        st.error("No rows generated.")
-                    else:
-                        group_cols = ["date", "channel", "item_name", "city"]
-                        mc_final = (
-                            pd.DataFrame(mc_rows_to_insert)
-                            .groupby(group_cols, dropna=False)
-                            .agg({"qty_sold": "sum", "revenue": "sum"})
-                            .reset_index()
-                        )
-                        mc_final["qty_sold"] = mc_final["qty_sold"].fillna(0.0)
-                        mc_final["revenue"]  = mc_final["revenue"].fillna(0.0)
-                        mc_final["city"]     = (
-                            mc_final["city"].astype(object)
-                            .where(mc_final["city"].notna(), other=None)
-                        )
-
-                        with st.spinner(f"Uploading {len(mc_final)} records…"):
-                            try:
-                                CHUNK   = 500
-                                records = mc_final.to_dict(orient="records")
-                                for i in range(0, len(records), CHUNK):
-                                    chunk = records[i: i + CHUNK]
-                                    res = supabase.table("sales").upsert(
-                                        chunk,
-                                        on_conflict="date,channel,item_name,city",
-                                    ).execute()
-                                    if hasattr(res, "error") and res.error:
-                                        mc_errors.append(f"Upsert chunk {i//CHUNK+1}: {res.error}")
-                            except Exception as e:
-                                mc_errors.append(f"Upload failed: {e}")
-
-                        if mc_errors:
-                            for err in mc_errors:
-                                st.error(err)
-                        else:
-                            st.success(
-                                f"✅ Synced {len(mc_final)} daily records for "
-                                f"'{mc_channel}' — "
-                                f"{calendar.month_name[int(mc_month)]} {int(mc_year)} "
-                                f"across {len(spread_days)} day(s)."
-                            )
-                            invalidate_data_cache()
-                            st.rerun()
-
-        # ═══════════════════════════════════════
-        # PATH B — MANUAL ENTRY (no file)
-        # ═══════════════════════════════════════
-        else:
-            st.markdown("#### ✏️ Manual Product Entry")
-            st.caption("Add each product's quantity and price for the selected period.")
-
-            # Session state to hold rows
-            if "mc_manual_rows" not in st.session_state:
-                st.session_state["mc_manual_rows"] = []
-
-            # Add row form
-            with st.form("mc_add_row_form", clear_on_submit=True):
-                fm1, fm2, fm3, fm4 = st.columns([3, 2, 2, 1])
-                with fm1:
-                    fm_sku  = st.selectbox("Product (Master SKU)", mc_masters, key="fm_sku")
-                with fm2:
-                    fm_qty  = st.number_input("Quantity", min_value=0.0, step=1.0, key="fm_qty")
-                with fm3:
-                    fm_rev  = st.number_input("Revenue (₹)", min_value=0.0, step=0.01, key="fm_rev")
-                with fm4:
-                    fm_day = st.text_input(
-                        "Day(s) (opt.)",
-                        placeholder="e.g. 5 or 5,10,15",
-                        key="fm_day",
-                        help="Leave blank to spread across the whole period."
-                    )
-                add_row = st.form_submit_button("➕ Add Row")
-                if add_row:
-                    st.session_state["mc_manual_rows"].append({
-                        "sku":      fm_sku,
-                        "qty":      fm_qty,
-                        "revenue":  fm_rev,
-                        "day_spec": fm_day.strip(),
-                    })
-
-            # Display current rows
-            if st.session_state["mc_manual_rows"]:
-                mc_rows_df = pd.DataFrame(st.session_state["mc_manual_rows"])
-                st.dataframe(mc_rows_df.rename(columns={
-                    "sku": "Product", "qty": "Qty", "revenue": "Revenue (₹)", "day_spec": "Day(s)"
-                }), hide_index=True, use_container_width=True)
-
-                rm1, rm2 = st.columns(2)
-                with rm1:
-                    if st.button("🗑️ Clear All Rows", key="mc_clear"):
-                        st.session_state["mc_manual_rows"] = []
-                        st.rerun()
-                with rm2:
-                    if st.button("🚀 Sync Manual Data to Cloud", key="mc_manual_sync"):
-                        mc_m_errors: list = []
-                        mc_manual_inserts = []
-
-                        for entry in st.session_state["mc_manual_rows"]:
-                            day_spec = entry.get("day_spec", "").strip()
-
-                            # Resolve specific days from day_spec
-                            if day_spec:
-                                try:
-                                    parsed_days = [
-                                        int(d.strip()) for d in day_spec.split(",")
-                                        if d.strip().isdigit()
-                                    ]
-                                    row_days = [d for d in parsed_days if 1 <= d <= days_in_month]
-                                    if not row_days:
-                                        row_days = spread_days
-                                except Exception:
-                                    row_days = spread_days
-                            else:
-                                row_days = spread_days
-
-                            n_days  = len(row_days)
-                            qty_per = round(entry["qty"] / n_days, 4) if n_days else 0
-                            rev_per = round(entry["revenue"] / n_days, 4) if n_days else 0
-
-                            for day in row_days:
-                                dt_str = f"{int(mc_year):04d}-{int(mc_month):02d}-{day:02d}"
-                                mc_manual_inserts.append({
-                                    "date":      dt_str,
-                                    "channel":   mc_channel,
-                                    "item_name": entry["sku"],
-                                    "qty_sold":  qty_per,
-                                    "revenue":   rev_per,
-                                    "city":      mc_city_val,
-                                })
-
-                        if not mc_manual_inserts:
-                            st.error("No records to insert.")
-                        else:
-                            group_cols = ["date", "channel", "item_name", "city"]
-                            mc_m_final = (
-                                pd.DataFrame(mc_manual_inserts)
-                                .groupby(group_cols, dropna=False)
-                                .agg({"qty_sold": "sum", "revenue": "sum"})
-                                .reset_index()
-                            )
-                            mc_m_final["qty_sold"] = mc_m_final["qty_sold"].fillna(0.0)
-                            mc_m_final["revenue"]  = mc_m_final["revenue"].fillna(0.0)
-                            mc_m_final["city"]     = (
-                                mc_m_final["city"].astype(object)
-                                .where(mc_m_final["city"].notna(), other=None)
-                            )
-
-                            with st.spinner(f"Uploading {len(mc_m_final)} records…"):
-                                try:
-                                    CHUNK   = 500
-                                    records = mc_m_final.to_dict(orient="records")
-                                    for i in range(0, len(records), CHUNK):
-                                        chunk = records[i: i + CHUNK]
-                                        res   = supabase.table("sales").upsert(
-                                            chunk,
-                                            on_conflict="date,channel,item_name,city",
-                                        ).execute()
-                                        if hasattr(res, "error") and res.error:
-                                            mc_m_errors.append(f"Upsert chunk {i//CHUNK+1}: {res.error}")
-                                except Exception as e:
-                                    mc_m_errors.append(f"Upload failed: {e}")
-
-                            if mc_m_errors:
-                                for err in mc_m_errors:
-                                    st.error(err)
-                            else:
-                                st.success(
-                                    f"✅ Synced {len(mc_m_final)} daily records for "
-                                    f"'{mc_channel}' — "
-                                    f"{calendar.month_name[int(mc_month)]} {int(mc_year)} "
-                                    f"across {len(spread_days)} day(s)."
-                                )
-                                st.session_state["mc_manual_rows"] = []
-                                invalidate_data_cache()
-                                st.rerun()
-            else:
-                st.info("No rows added yet. Use the form above to add products.")
-
-        # ── Sidebar deletion note ──────────────────────────────────────────
-        st.divider()
-        st.info(
-            "💡 **To delete monthly data**: use the **Delete Specific Entry** panel "
-            "in the sidebar — select the channel and any date within the uploaded month. "
-            "All rows for that channel & date will be removed."
-        )
-
-    # ══════════════════════════════════════════
-    # ══════════════════════════════════════════
-    # TAB – CONFIGURATION  (admin only)
-    # ══════════════════════════════════════════
-    with tabs[_TAB_CONFIG]:
+    with tabs[4]:
         st.subheader("⚙️ System Configuration")
         sc1, sc2 = st.columns(2)
 
@@ -1408,30 +904,17 @@ if role == "admin":
         with sc2:
             st.markdown("#### 🏢 Sales Channels")
             n_ch = st.text_input("New Channel Name")
-            ch_is_monthly    = st.checkbox("📅 Monthly reporting channel", value=False,
-                                           help="Enable if daily data is unavailable — sales are reported monthly.")
-            ch_requires_city = st.checkbox("🏙️ Has city-level data", value=True,
-                                           help="Uncheck if city breakdown is unavailable (disables Channel Performance & Marketing for this channel).")
             if st.button("Add Channel") and n_ch.strip():
                 safe_ch = sanitize(n_ch)
                 if safe_ch:
                     try:
-                        supabase.table("master_channels").insert({
-                            "name":          safe_ch,
-                            "is_monthly":    ch_is_monthly,
-                            "requires_city": ch_requires_city,
-                        }).execute()
+                        supabase.table("master_channels").insert({"name": safe_ch}).execute()
                         st.success(f"Added channel: {safe_ch}")
-                        invalidate_data_cache()
                         st.rerun()
                     except Exception as e:
                         st.error(f"Failed to add channel: {e}")
             if not master_chans.empty:
-                display_chans = master_chans.copy()
-                # Friendly column names
-                rename_map = {"name": "Channel", "is_monthly": "Monthly?", "requires_city": "City Data?"}
-                display_chans = display_chans.rename(columns={k: v for k, v in rename_map.items() if k in display_chans.columns})
-                st.dataframe(display_chans, hide_index=True)
+                st.dataframe(master_chans, hide_index=True)
 
         st.divider()
         st.markdown("#### 🗺 Current Item Mappings")
@@ -1443,17 +926,7 @@ if role == "admin":
 # ══════════════════════════════════════════════
 # TAB – CHANNEL PERFORMANCE (admin + viewer, last tab)
 # ══════════════════════════════════════════════
-with tabs[_TAB_CHANPERF]:
-    _has_city_data_cp = (
-        not history_df.empty
-        and "city" in history_df.columns
-        and history_df["city"].notna().any()
-    )
-    if not _has_city_data_cp:
-        st.info(
-            "📦 **Channel Performance** requires city-level sales data. "
-            "No city-level data has been uploaded yet, or all active channels "
-            "are configured without city data."
-        )
-    else:
-        render_channel_performance_tab(supabase, master_skus, role)
+# Admin: tabs[5]  |  Viewer: tabs[3]
+_cp_tab_index = 5 if role == "admin" else 3
+with tabs[_cp_tab_index]:
+    render_channel_performance_tab(supabase, master_skus, role)
