@@ -7,7 +7,6 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta
 from marketing_module import render_marketing_tab
 from channel_performance_module import render_channel_performance_tab
-from deals_promos_module import render_deals_promos_tab
 
 def _fmt_err(e: Exception) -> str:
     """Short readable error — strips 502 HTML bodies."""
@@ -184,9 +183,9 @@ with st.sidebar:
 # TABS
 # ─────────────────────────────────────────────
 if role == "admin":
-    tabs = st.tabs(["📊 Trend Analytics", "🔬 Deep Dive", "📣 Performance Marketing", "📤 Smart Upload", "🛠 Configuration", "📦 Channel Performance", "🏷️ Deals & Promos"])
+    tabs = st.tabs(["📊 Trend Analytics", "🔬 Deep Dive", "📣 Performance Marketing", "📤 Smart Upload", "🛠 Configuration", "📦 Channel Performance"])
 else:
-    tabs = st.tabs(["📊 Trend Analytics", "🔬 Deep Dive", "📣 Performance Marketing", "📦 Channel Performance", "🏷️ Deals & Promos"])
+    tabs = st.tabs(["📊 Trend Analytics", "🔬 Deep Dive", "📣 Performance Marketing", "📦 Channel Performance"])
 
 # ══════════════════════════════════════════════
 # TAB 1 – TREND ANALYTICS  (unchanged)
@@ -844,8 +843,22 @@ if role == "admin":
 
                 with st.spinner(f"Uploading {len(final_df)} records to Supabase…"):
                     try:
+                        # Sanitise before JSON serialisation:
+                        # - city: NaN → None (null in JSON, allowed by Supabase)
+                        # - qty_sold / revenue: NaN → 0.0
+                        final_df["qty_sold"] = final_df["qty_sold"].fillna(0.0)
+                        final_df["revenue"]  = final_df["revenue"].fillna(0.0)
+                        # Replace NaN city with None so JSON encodes as null
+                        final_df["city"] = final_df["city"].where(
+                            final_df["city"].notna() & (final_df["city"].astype(str) != "nan"),
+                            other=None,
+                        )
                         CHUNK   = 500
                         records = final_df.to_dict(orient="records")
+                        # Ensure city None stays None (not "None" string)
+                        for rec in records:
+                            if rec.get("city") in (float("nan"), "nan", "None"):
+                                rec["city"] = None
                         for i in range(0, len(records), CHUNK):
                             chunk = records[i : i + CHUNK]
                             res   = supabase.table("sales").upsert(
@@ -921,11 +934,3 @@ if role == "admin":
 _cp_tab_index = 5 if role == "admin" else 3
 with tabs[_cp_tab_index]:
     render_channel_performance_tab(supabase, master_skus, role)
-
-# ══════════════════════════════════════════════
-# TAB – DEALS & PROMOS (admin + viewer)
-# ══════════════════════════════════════════════
-# Admin: tabs[6]  |  Viewer: tabs[4]
-_dp_tab_index = 6 if role == "admin" else 4
-with tabs[_dp_tab_index]:
-    render_deals_promos_tab(history_df, role)
