@@ -502,6 +502,18 @@ def _reapply_sales(snap_df: pd.DataFrame, raw_sales: pd.DataFrame,
         if channel == "Swiggy":
             city_sales["_ckey"] = city_sales["city"].astype(str).str.strip().str.upper()
             snap_df["_ckey"]    = snap_df["location"].astype(str).str.split(" (", regex=False).str[0].str.strip().str.upper()
+        elif channel == "Big Basket":
+            # Strip "-DC" / "-DC2" suffix and apply city aliases, same as _parse_bigbasket
+            BB_DC_CITY_MAP = {
+                "Ahmedabad": "Ahmedabad-Gandhinagar", "Bhubaneswar": "Bhubaneshwar-Cuttack",
+                "Kundli": "Gurgaon", "Lucknow": "Lucknow-Kanpur",
+                "Vadodara": "Ahmedabad-Gandhinagar", "Vijayawada": "Vijayawada-Guntur",
+            }
+            def _dc_to_city(dc_name):
+                city = re.sub(r"[-\s]?DC\d*$", "", str(dc_name), flags=re.IGNORECASE).strip()
+                return BB_DC_CITY_MAP.get(city, city)
+            city_sales["_ckey"] = city_sales["city"].astype(str).str.strip()
+            snap_df["_ckey"]    = snap_df["location"].astype(str).apply(_dc_to_city)
         else:
             city_sales["_ckey"] = city_sales["city"].astype(str).str.strip()
             snap_df["_ckey"]    = snap_df["location"].astype(str).str.strip()
