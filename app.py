@@ -824,7 +824,7 @@ if role == "admin":
               else:
                 # ── Build composite key safely ──────────────────────────────────
                 work_df = raw_df.copy()
-                work_df["__prod__"] = work_df[p_col].astype(str).str.strip()
+                work_df["__prod__"] = work_df[p_col].astype(object).fillna("").astype(str).str.strip()
 
                 if v_col != "None":
                     work_df["__var__"] = work_df[v_col].astype(str).str.strip()
