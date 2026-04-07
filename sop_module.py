@@ -123,17 +123,40 @@ def _weighted_drr(daily: pd.Series, halflife_weeks: int = _DECAY_HALFLIFE_WEEKS)
 
 
 def build_base_forecast(
-    history_df: pd.DataFrame,
+    history_df:   pd.DataFrame,
     forecast_days: int = 30,
     lookback_days: int = 90,
+    mkt_spend_by_date: dict | None = None,   # {date_str: total_spend} from marketing DB
 ) -> pd.DataFrame:
     """
-    From raw sales history, compute a base (organic) 30-day forecast
-    per (channel, item_name).
+    Compute a decay-weighted ORGANIC baseline forecast per (channel, item_name).
+
+    ORGANIC DRR LOGIC
+    ─────────────────
+    Total sales on any day = organic + marketing-driven sales.
+    We want the pure organic component so the marketing uplift is not
+    double-counted when we later add it back.
+
+    Strategy (in order of preference):
+      A) Use only zero-spend days (days with no marketing budget) to
+         compute DRR — these are uncontaminated organic observations.
+      B) If A gives < _MIN_HISTORY_DAYS, use all days but deflate DRR
+         by the channel's historical organic_share:
+             organic_share = revenue on zero-spend days / total revenue
+         This preserves the correct SKU × Channel split ratios.
+      C) If zero-spend days don't exist at all, use full DRR as proxy
+         (conservative — will be refined as data accumulates).
+
+    SKU REVENUE SHARE is computed within each channel so the relative
+    mix is preserved regardless of the absolute DRR level.
 
     Returns DataFrame with columns:
-        channel, item_name, base_qty_30d, base_rev_30d,
-        avg_price, drr_qty, drr_rev, history_days_used
+        channel, item_name,
+        base_qty_30d, base_rev_30d,        ← organic forecast
+        total_qty_30d_hist, total_rev_30d_hist,  ← total historical DRR × 30
+        rev_share_in_channel,              ← this SKU's % of channel revenue
+        organic_share,                     ← % of revenue from zero-spend days
+        avg_price, drr_qty, history_days_used
     """
     if history_df.empty:
         return pd.DataFrame()
@@ -143,70 +166,147 @@ def build_base_forecast(
         df["date_dt"] = pd.to_datetime(df["date"], errors="coerce")
     df = df.dropna(subset=["date_dt"])
 
-    cutoff = df["date_dt"].max().date() - timedelta(days=lookback_days)
+    # Use whatever data is available within the lookback window.
+    # If lookback exceeds available history, use all history (no truncation error).
+    latest = df["date_dt"].max().date()
+    cutoff = latest - timedelta(days=lookback_days)
     df = df[df["date_dt"].dt.date >= cutoff]
 
     if df.empty:
         return pd.DataFrame()
 
+    # Build set of zero-spend dates (dates with no marketing spend)
+    zero_spend_dates: set = set()
+    if mkt_spend_by_date:
+        all_dates_in_window = set(df["date_dt"].dt.strftime("%Y-%m-%d").unique())
+        zero_spend_dates    = all_dates_in_window - set(mkt_spend_by_date.keys())
+    else:
+        # No marketing data at all → treat all dates as organic
+        zero_spend_dates = set(df["date_dt"].dt.strftime("%Y-%m-%d").unique())
+
     rows = []
     for (channel, item), grp in df.groupby(["channel", "item_name"]):
-        # Build a complete daily series (fill missing days with 0)
         date_range = pd.date_range(grp["date_dt"].min(), grp["date_dt"].max(), freq="D")
-        daily_qty = grp.groupby("date_dt")["qty_sold"].sum().reindex(date_range, fill_value=0)
-        daily_rev = grp.groupby("date_dt")["revenue"].sum().reindex(date_range, fill_value=0)
+        daily_qty  = grp.groupby("date_dt")["qty_sold"].sum().reindex(date_range, fill_value=0)
+        daily_rev  = grp.groupby("date_dt")["revenue"].sum().reindex(date_range, fill_value=0)
 
         history_days = len(date_range)
         if history_days < _MIN_HISTORY_DAYS:
             continue
 
-        drr_qty = _weighted_drr(daily_qty)
-        drr_rev = _weighted_drr(daily_rev)
+        # ── Total DRR (includes all days) ──────────────────────────────────
+        drr_qty_total = _weighted_drr(daily_qty)
+        drr_rev_total = _weighted_drr(daily_rev)
+        avg_price     = round(drr_rev_total / drr_qty_total, 2) if drr_qty_total > 0 else 0.0
+
+        # ── Organic DRR ─────────────────────────────────────────────────────
+        zero_mask = pd.Series(
+            [d.strftime("%Y-%m-%d") in zero_spend_dates for d in date_range],
+            index=date_range,
+        )
+        organic_qty_days = daily_qty[zero_mask]
+        organic_rev_days = daily_rev[zero_mask]
+
+        if len(organic_qty_days) >= _MIN_HISTORY_DAYS:
+            # Strategy A: enough clean days → use zero-spend DRR directly
+            drr_qty_org = _weighted_drr(organic_qty_days)
+            drr_rev_org = _weighted_drr(organic_rev_days)
+            organic_share = (
+                organic_rev_days.sum() / daily_rev.sum()
+                if daily_rev.sum() > 0 else 1.0
+            )
+        elif len(organic_qty_days) > 0:
+            # Strategy B: some clean days but < MIN_HISTORY_DAYS
+            # Use organic_share ratio to deflate full-period DRR
+            organic_share = (
+                organic_rev_days.sum() / daily_rev.sum()
+                if daily_rev.sum() > 0 else 1.0
+            )
+            drr_qty_org = drr_qty_total * organic_share
+            drr_rev_org = drr_rev_total * organic_share
+        else:
+            # Strategy C: no zero-spend days — use total as proxy
+            organic_share = 1.0
+            drr_qty_org   = drr_qty_total
+            drr_rev_org   = drr_rev_total
 
         rows.append({
-            "channel":          channel,
-            "item_name":        item,
-            "base_qty_30d":     round(drr_qty * forecast_days, 2),
-            "base_rev_30d":     round(drr_rev * forecast_days, 2),
-            "drr_qty":          round(drr_qty, 3),
-            "drr_rev":          round(drr_rev, 2),
-            "avg_price":        round(drr_rev / drr_qty, 2) if drr_qty > 0 else 0.0,
-            "history_days_used": history_days,
+            "channel":               channel,
+            "item_name":             item,
+            "base_qty_30d":          round(drr_qty_org   * forecast_days, 2),
+            "base_rev_30d":          round(drr_rev_org   * forecast_days, 2),
+            "total_qty_30d_hist":    round(drr_qty_total * forecast_days, 2),
+            "total_rev_30d_hist":    round(drr_rev_total * forecast_days, 2),
+            "drr_qty":               round(drr_qty_org,   3),
+            "drr_rev":               round(drr_rev_org,   2),
+            "avg_price":             avg_price,
+            "organic_share":         round(organic_share, 3),
+            "history_days_used":     history_days,
+            "organic_days_used":     int(zero_mask.sum()),
         })
 
-    return pd.DataFrame(rows)
+    if not rows:
+        return pd.DataFrame()
+
+    result = pd.DataFrame(rows)
+
+    # ── Revenue share within each channel (used for budget allocation) ───────
+    chan_total = result.groupby("channel")["base_rev_30d"].transform("sum")
+    result["rev_share_in_channel"] = np.where(
+        chan_total > 0,
+        (result["base_rev_30d"] / chan_total).round(4),
+        1.0 / result.groupby("channel")["base_rev_30d"].transform("count"),
+    )
+
+    return result
 
 
 def apply_marketing_uplift(
-    base_df: pd.DataFrame,
-    channel_budgets: dict[str, float],   # channel → planned ₹ spend
-    channel_roas:    dict[str, float],   # channel → historical ROAS
+    base_df:        pd.DataFrame,
+    channel_budgets: dict[str, float],   # channel → total planned ₹ spend
+    channel_roas:    dict[str, float],   # channel → ROAS
 ) -> pd.DataFrame:
     """
-    Given a base forecast and per-channel marketing budgets,
-    compute the marketing uplift and return an augmented forecast.
+    Allocate the per-channel marketing budget across SKUs proportionally
+    to their organic revenue share, then compute incremental uplift.
 
-    Uplift revenue  = budget × ROAS
-    Uplift units    = uplift revenue / avg_price   (price held constant)
+    KEY FIX vs original:
+    ────────────────────
+    The budget is entered at CHANNEL level (e.g. ₹1,00,000 for Swiggy).
+    It must be split across SKUs in proportion to each SKU's share of
+    that channel's organic revenue — NOT given in full to every SKU.
 
-    The delta between total and base is tagged as marketing-driven,
-    so we always know the reason for any change.
+    Formula per SKU:
+        sku_budget     = channel_budget × rev_share_in_channel
+        uplift_rev     = sku_budget × ROAS
+        uplift_qty     = uplift_rev / avg_price
+
+    Attribution:
+        Every rupee of uplift is tagged "marketing-driven" so the split
+        between organic and marketing is always traceable.
     """
     if base_df.empty:
         return base_df
 
     df = base_df.copy()
 
-    df["planned_mkt_spend"] = df["channel"].map(channel_budgets).fillna(0.0)
-    df["assumed_roas"]      = df["channel"].map(channel_roas).fillna(_DEFAULT_ROAS)
+    # Ensure rev_share_in_channel exists (fallback: equal split)
+    if "rev_share_in_channel" not in df.columns:
+        df["rev_share_in_channel"] = (
+            1.0 / df.groupby("channel")["channel"].transform("count")
+        )
 
-    df["mkt_uplift_rev"] = df["planned_mkt_spend"] * df["assumed_roas"]
+    # Allocate budget proportionally across SKUs within each channel
+    df["channel_total_budget"] = df["channel"].map(channel_budgets).fillna(0.0)
+    df["planned_mkt_spend"]    = (df["channel_total_budget"] * df["rev_share_in_channel"]).round(2)
+    df["assumed_roas"]         = df["channel"].map(channel_roas).fillna(_DEFAULT_ROAS)
+
+    df["mkt_uplift_rev"] = (df["planned_mkt_spend"] * df["assumed_roas"]).round(2)
     df["mkt_uplift_qty"] = np.where(
         df["avg_price"] > 0,
         df["mkt_uplift_rev"] / df["avg_price"],
         0.0,
     ).round(2)
-    df["mkt_uplift_rev"] = df["mkt_uplift_rev"].round(2)
 
     df["total_qty_30d"] = (df["base_qty_30d"] + df["mkt_uplift_qty"]).round(2)
     df["total_rev_30d"] = (df["base_rev_30d"] + df["mkt_uplift_rev"]).round(2)
@@ -218,7 +318,7 @@ def apply_marketing_uplift(
 # MARKETING ROAS HELPER
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _estimate_roas_from_marketing_db(sb, channels: list[str]) -> dict[str, float]:
+def _estimate_roas_from_marketing_db(sb, channels: list[str]) -> tuple[dict[str, float], dict[str, str]]:
     """
     Try to pull historical ROAS from the marketing supabase DB.
     Falls back to _DEFAULT_ROAS per channel if unavailable.
@@ -251,6 +351,33 @@ def _estimate_roas_from_marketing_db(sb, channels: list[str]) -> dict[str, float
         if ch not in roas_map:
             roas_map[ch] = _DEFAULT_ROAS
     return roas_map
+
+
+def _get_marketing_spend_by_date(sb) -> dict[str, float]:
+    """
+    Return {date_str: total_spend} for all dates that had marketing spend.
+    Used to identify zero-spend (pure organic) days.
+    Empty dict if marketing DB unavailable.
+    """
+    result: dict[str, float] = {}
+    try:
+        from supabase import create_client
+        mkt_url = st.secrets.get("MARKETING_SUPABASE_URL")
+        mkt_key = st.secrets.get("MARKETING_SUPABASE_KEY")
+        if not mkt_url or not mkt_key:
+            return result
+        mkt_sb = create_client(mkt_url, mkt_key)
+        res = mkt_sb.table("campaigns").select("date, total_spend").execute()
+        if res.data:
+            mdf = pd.DataFrame(res.data)
+            mdf["total_spend"] = pd.to_numeric(mdf["total_spend"], errors="coerce").fillna(0)
+            mdf = mdf[mdf["total_spend"] > 0]
+            if "date" in mdf.columns:
+                mdf["date"] = pd.to_datetime(mdf["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+                result = mdf.groupby("date")["total_spend"].sum().to_dict()
+    except Exception:
+        pass
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -419,8 +546,15 @@ def render_sop_tab(
         )
 
         # ── Build base forecast ───────────────────────────────────────────────
+        # Build marketing spend calendar (which dates had spend) for organic separation
+        with st.spinner("Fetching marketing spend calendar…"):
+            mkt_spend_by_date = _get_marketing_spend_by_date(supabase_client)
+
         with st.spinner("Building baseline forecast…"):
-            base_df = build_base_forecast(df, forecast_days=30, lookback_days=lookback)
+            base_df = build_base_forecast(
+                df, forecast_days=30, lookback_days=lookback,
+                mkt_spend_by_date=mkt_spend_by_date,
+            )
 
         if base_df.empty:
             st.warning(f"Not enough history (need ≥ {_MIN_HISTORY_DAYS} days per SKU-channel). Upload more data.")
@@ -446,7 +580,7 @@ def render_sop_tab(
 
         # Try to load ROAS from marketing DB; fall back to defaults
         with st.spinner("Fetching historical ROAS…"):
-            roas_map = _estimate_roas_from_marketing_db(supabase_client, sel_channels)
+            roas_map, roas_source = _estimate_roas_from_marketing_db(supabase_client, sel_channels)
 
         budget_cols = st.columns(min(len(sel_channels), 4))
         channel_budgets: dict[str, float] = {}
@@ -460,11 +594,13 @@ def render_sop_tab(
                     value=0.0, key=f"sop_budget_{ch}",
                 )
                 roas_default = roas_map.get(ch, _DEFAULT_ROAS)
+                roas_label   = roas_source.get(ch, "Default")
+                st.caption(f"📊 {roas_label}")
                 roas_override = st.number_input(
                     f"ROAS", min_value=0.1, step=0.1,
                     value=float(roas_default),
                     key=f"sop_roas_{ch}",
-                    help=f"Historical ROAS for {ch}. Edit to model a scenario.",
+                    help=f"Source: {roas_label}. Edit to model a different scenario.",
                 )
                 channel_budgets[ch]       = budget
                 channel_roas_overrides[ch] = roas_override
@@ -512,7 +648,9 @@ def render_sop_tab(
             "channel", "item_name",
             "base_qty_30d", "mkt_uplift_qty", "total_qty_30d",
             "base_rev_30d", "mkt_uplift_rev", "total_rev_30d",
-            "drr_qty", "avg_price", "history_days_used",
+            "rev_share_in_channel", "planned_mkt_spend",
+            "drr_qty", "avg_price", "organic_share",
+            "organic_days_used", "history_days_used",
         ]
         show_cols = [c for c in display_cols if c in forecast_df.columns]
 
@@ -522,8 +660,11 @@ def render_sop_tab(
             "total_qty_30d": "Total Units",
             "base_rev_30d": "Organic Rev (₹)", "mkt_uplift_rev": "Mkt Rev (₹)",
             "total_rev_30d": "Total Rev (₹)",
-            "drr_qty": "DRR (units/day)", "avg_price": "Avg Price (₹)",
-            "history_days_used": "History Days",
+            "rev_share_in_channel": "Rev Share in Ch",
+            "planned_mkt_spend": "Allocated Budget (₹)",
+            "drr_qty": "Organic DRR", "avg_price": "Avg Price (₹)",
+            "organic_share": "Organic %",
+            "organic_days_used": "Organic Days", "history_days_used": "Total Days",
         }
 
         disp = forecast_df[show_cols].rename(columns=col_rename).sort_values(
@@ -534,7 +675,9 @@ def render_sop_tab(
             disp.style.format({
                 "Organic Units": "{:,.1f}", "Mkt Units": "{:,.1f}", "Total Units": "{:,.1f}",
                 "Organic Rev (₹)": "₹{:,.0f}", "Mkt Rev (₹)": "₹{:,.0f}", "Total Rev (₹)": "₹{:,.0f}",
-                "DRR (units/day)": "{:.2f}", "Avg Price (₹)": "₹{:.1f}",
+                "Rev Share in Ch": "{:.1%}", "Allocated Budget (₹)": "₹{:,.0f}",
+                "Organic DRR": "{:.2f}", "Avg Price (₹)": "₹{:.1f}",
+                "Organic %": "{:.1%}",
             }).bar(subset=["Total Units"], color="#4C8BF5"),
             use_container_width=True, hide_index=True,
         )
