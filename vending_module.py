@@ -25,7 +25,8 @@ import streamlit as st
 # CONSTANTS
 # ─────────────────────────────────────────────────────────────────────────────
 
-_DB_PATH = "vending_database.json"
+_DB_PATH          = "vending_database.json"
+_PRICE_TABLE      = "vending_sku_prices"   # Supabase table for persistent prices
 
 MONTHS = ["Jan","Feb","Mar","Apr","May","Jun",
           "Jul","Aug","Sep","Oct","Nov","Dec"]
@@ -85,6 +86,48 @@ def _save_db(db: dict):
 
 def _db_key(customer: str, month: str, year: int) -> str:
     return f"{customer}__{month}__{year}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SKU PRICE PERSISTENCE  (Supabase — survives redeployment)
+# Table schema:  vending_sku_prices (product TEXT PRIMARY KEY, price FLOAT)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _get_supabase():
+    """Return the shared Supabase client from st.session_state, or None."""
+    return st.session_state.get("_vnd_supabase", None)
+
+
+def _attach_supabase(supabase_client):
+    """Called from the main app to give the vending module access to Supabase."""
+    st.session_state["_vnd_supabase"] = supabase_client
+
+
+def _load_prices_from_db() -> dict:
+    """Load all SKU prices from Supabase.  Returns {} on any failure."""
+    sb = _get_supabase()
+    if sb is None:
+        return {}
+    try:
+        res = sb.table(_PRICE_TABLE).select("product,price").execute()
+        if res.data:
+            return {row["product"]: float(row["price"]) for row in res.data}
+    except Exception:
+        pass
+    return {}
+
+
+def _save_prices_to_db(price_map: dict):
+    """Upsert SKU prices into Supabase.  Silently skips on failure."""
+    sb = _get_supabase()
+    if sb is None:
+        return
+    try:
+        rows = [{"product": k, "price": float(v)} for k, v in price_map.items()]
+        if rows:
+            sb.table(_PRICE_TABLE).upsert(rows, on_conflict="product").execute()
+    except Exception:
+        pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -244,22 +287,23 @@ def _render_analysis(df_raw: pd.DataFrame, price_map: dict,
     m5.metric("Avg Days of Cover",  f"{avg_doc:.1f}" if not np.isnan(avg_doc) else "∞")
 
     fmt = {
-        "drr": "{:.1f}", "days_of_cover": "{:.1f}", "str_pct": "{:.1f}",
+        "drr": "{:.2f}", "days_of_cover": "{:.1f}", "str_pct": "{:.1f}",
         "velocity": "{:.2f}", "Machine_Count": "{:,.0f}",
         "Sales_Qty": "{:,.0f}", "Total_SOH": "{:,.0f}",
     }
 
-    t1, t2, t3, t4 = st.tabs([
+    t1, t2, t3, t4, t5 = st.tabs([
         "📦 Inventory Analysis",
         "🤖 Machine Performance",
-        "📊 Charts",
+        "🔬 Deep Dive",
         "📈 Trend Lines",
+        "⚙️ SKU Config",
     ])
 
     with t1:
         st.dataframe(
             fdf[["City","Product","Total_SOH","drr","days_of_cover","str_pct"]]
-            .style.format(fmt).bar(subset=["str_pct"], color=["#f87171", "#4ade80"], vmin=0, vmax=1),
+            .style.format(fmt).bar(subset=["str_pct"], color=["#f87171","#4ade80"], vmin=0, vmax=100),
             use_container_width=True,
         )
 
@@ -270,41 +314,329 @@ def _render_analysis(df_raw: pd.DataFrame, price_map: dict,
             use_container_width=True,
         )
 
+    # ══════════════════════════════════════════════════════════════════════
+    # TAB — DEEP DIVE
+    # ══════════════════════════════════════════════════════════════════════
     with t3:
-        c1, c2 = st.columns(2)
-        with c1:
-            city_s = fdf.groupby("City")["Sales_Qty"].sum().reset_index().sort_values("Sales_Qty", ascending=False)
-            st.plotly_chart(
-                px.bar(city_s, x="City", y="Sales_Qty", title="Sales by City",
-                       color="Sales_Qty", color_continuous_scale="Blues"),
-                use_container_width=True,
-            )
-        with c2:
-            prod_soh = fdf.groupby("Product")["Total_SOH"].sum().reset_index()
-            st.plotly_chart(
-                px.pie(prod_soh, names="Product", values="Total_SOH",
-                       title="SOH Distribution by Product"),
-                use_container_width=True,
-            )
-        c3, c4 = st.columns(2)
-        with c3:
-            abc_d = fdf["abc_class"].value_counts().reset_index()
-            abc_d.columns = ["Class", "Count"]
-            st.plotly_chart(
-                px.bar(abc_d, x="Class", y="Count", title="ABC Classification",
-                       color="Class",
-                       color_discrete_map={"A": "#2ecc71", "B": "#f39c12", "C": "#e74c3c"}),
-                use_container_width=True,
-            )
-        with c4:
-            vel_top = fdf[fdf["velocity"] > 0].sort_values("velocity", ascending=False).head(15)
-            st.plotly_chart(
-                px.bar(vel_top, x="velocity", y="Product", orientation="h",
-                       title="Top 15 Products by Velocity",
-                       color="velocity", color_continuous_scale="Greens"),
-                use_container_width=True,
+        st.markdown("### 🔬 Deep Dive Actionable Intelligence")
+        st.caption(
+            "Use this section to make concrete decisions with your channel partner: "
+            "which cities to scale, which machines to fix, and which SKUs to liquidate or push."
+        )
+
+        # ── Thresholds (sidebar-style expander) ─────────────────────────
+        with st.expander("⚙️ Adjust Decision Thresholds", expanded=False):
+            th1, th2, th3, th4 = st.columns(4)
+            DOC_OVER   = th1.number_input("Overstock DOC (days)",   value=60,  min_value=1, key="vnd_doc_over")
+            DOC_UNDER  = th2.number_input("Understock DOC (days)",  value=15,  min_value=1, key="vnd_doc_under")
+            STR_SCALE  = th3.number_input("Scale STR% threshold",   value=60,  min_value=1, max_value=100, key="vnd_str_scale")
+            STR_LIQ    = th4.number_input("Liquidate STR% threshold", value=25, min_value=1, max_value=100, key="vnd_str_liq")
+            VEL_LOW    = th1.number_input("Low velocity (<)",        value=0.5, min_value=0.0, step=0.1, key="vnd_vel_low")
+            VEL_HIGH   = th2.number_input("High velocity (>)",       value=1.5, min_value=0.0, step=0.1, key="vnd_vel_high")
+            DOC_CRIT   = th3.number_input("City CRITICAL DOC (days)",value=10,  min_value=1, key="vnd_doc_crit")
+            DOC_OK     = th4.number_input("City OK DOC (days)",      value=30,  min_value=1, key="vnd_doc_ok")
+
+        st.divider()
+
+        # ── 1. CITY HEALTH SCORECARD ────────────────────────────────────
+        st.markdown("#### 🏙️ City Health Scorecard")
+        st.caption("Overall vending health per city — drive your partner review agenda from this.")
+
+        city_agg = fdf.groupby("City").agg(
+            Sales_Qty    = ("Sales_Qty",    "sum"),
+            Total_SOH    = ("Total_SOH",    "sum"),
+            Machine_Count= ("Machine_Count","sum"),
+            velocity_mean= ("velocity",     "mean"),
+            str_pct_mean = ("str_pct",      "mean"),
+        ).reset_index()
+        city_agg["drr"]          = city_agg["Sales_Qty"] / 30
+        city_agg["days_of_cover"]= np.where(
+            city_agg["drr"] > 0, city_agg["Total_SOH"] / city_agg["drr"], 999
+        )
+        city_agg["sales_val"] = city_agg["City"].map(
+            fdf.groupby("City")["sales_val"].sum()
+        )
+
+        def _city_health(row):
+            doc = row["days_of_cover"]
+            str_p = row["str_pct_mean"]
+            if doc < DOC_CRIT or str_p < STR_LIQ:
+                return "🔴 Critical"
+            if doc < DOC_OK or str_p < STR_SCALE:
+                return "🟡 OK"
+            return "🟢 Healthy"
+
+        city_agg["Health"] = city_agg.apply(_city_health, axis=1)
+        city_agg["DOC_display"] = city_agg["days_of_cover"].apply(
+            lambda x: f"{x:.0f}d" if x < 999 else "∞"
+        )
+
+        # Health summary pills
+        hcols = st.columns(3)
+        for i, (label, emoji) in enumerate([("🟢 Healthy","🟢"),("🟡 OK","🟡"),("🔴 Critical","🔴")]):
+            cnt = (city_agg["Health"] == label).sum()
+            hcols[i].metric(label, f"{cnt} cities")
+
+        # Colour-coded table
+        health_disp = city_agg[["City","Health","Sales_Qty","sales_val","Machine_Count",
+                                  "velocity_mean","str_pct_mean","DOC_display"]].copy()
+        health_disp.columns = ["City","Health","Sales Qty","Sales ₹","Machines",
+                                "Avg Velocity","Avg STR%","Avg DOC"]
+
+        def _color_health(val):
+            if "Critical" in str(val): return "background-color:#fee2e2; color:#991b1b; font-weight:bold"
+            if "OK"       in str(val): return "background-color:#fef9c3; color:#92400e; font-weight:bold"
+            if "Healthy"  in str(val): return "background-color:#dcfce7; color:#166534; font-weight:bold"
+            return ""
+
+        st.dataframe(
+            health_disp.style
+            .format({"Sales Qty":"{:,.0f}","Sales ₹":"₹{:,.0f}",
+                     "Machines":"{:,.0f}","Avg Velocity":"{:.2f}","Avg STR%":"{:.1f}"})
+            .map(_color_health, subset=["Health"]),
+            use_container_width=True, hide_index=True,
+        )
+
+        # City health bar chart
+        ch_order = city_agg.sort_values("str_pct_mean", ascending=True)
+        fig_ch = px.bar(
+            ch_order, x="str_pct_mean", y="City", orientation="h",
+            color="Health",
+            color_discrete_map={"🟢 Healthy":"#22c55e","🟡 OK":"#eab308","🔴 Critical":"#ef4444"},
+            labels={"str_pct_mean":"Avg STR %"},
+            title="City STR% — Health Banding",
+            height=max(300, len(ch_order)*40),
+        )
+        fig_ch.add_vline(x=STR_LIQ,   line_dash="dot", line_color="#ef4444",
+                         annotation_text=f"Liquidate <{STR_LIQ}%", annotation_position="top right")
+        fig_ch.add_vline(x=STR_SCALE, line_dash="dot", line_color="#22c55e",
+                         annotation_text=f"Scale >{STR_SCALE}%", annotation_position="top right")
+        st.plotly_chart(fig_ch, use_container_width=True)
+
+        st.divider()
+
+        # ── 2. MACHINE OVER/UNDER STOCK ─────────────────────────────────
+        st.markdown("#### 🏧 Machine Stock Alerts — Which Machines to Check")
+        st.caption("Pinpoint city×product combinations that are overstocked (cash tied up) or understocked (lost sales).")
+
+        mach_df = fdf.copy()
+        mach_df["stock_status"] = np.where(
+            mach_df["days_of_cover"] > DOC_OVER,  "⬆️ Overstock",
+            np.where(mach_df["days_of_cover"] < DOC_UNDER, "⬇️ Understock", "✅ Normal")
+        )
+        # Only show problem rows
+        alerts = mach_df[mach_df["stock_status"] != "✅ Normal"].copy()
+
+        mc1, mc2 = st.columns(2)
+        mc1.metric("⬆️ Overstock alerts",  (alerts["stock_status"]=="⬆️ Overstock").sum(),
+                   help=f"DOC > {DOC_OVER} days")
+        mc2.metric("⬇️ Understock alerts", (alerts["stock_status"]=="⬇️ Understock").sum(),
+                   help=f"DOC < {DOC_UNDER} days")
+
+        if not alerts.empty:
+            def _color_stock(val):
+                if "Overstock"  in str(val): return "background-color:#dbeafe; color:#1e40af; font-weight:bold"
+                if "Understock" in str(val): return "background-color:#fee2e2; color:#991b1b; font-weight:bold"
+                return ""
+
+            alerts_disp = alerts[["City","Product","Machine_Count","Total_SOH",
+                                   "drr","days_of_cover","stock_status"]].copy()
+            alerts_disp.columns = ["City","Product","Machines","SOH","DRR","DOC","Status"]
+            st.dataframe(
+                alerts_disp.style
+                .format({"Machines":"{:,.0f}","SOH":"{:,.0f}","DRR":"{:.2f}","DOC":"{:.1f}"})
+                .map(_color_stock, subset=["Status"]),
+                use_container_width=True, hide_index=True,
             )
 
+            # Bubble chart: DOC vs Velocity, sized by SOH
+            bubble_df = mach_df[mach_df["days_of_cover"] < 500].copy()
+            fig_bub = px.scatter(
+                bubble_df, x="days_of_cover", y="velocity",
+                size="Total_SOH", color="stock_status", hover_data=["City","Product"],
+                color_discrete_map={
+                    "⬆️ Overstock":"#3b82f6","⬇️ Understock":"#ef4444","✅ Normal":"#22c55e"
+                },
+                labels={"days_of_cover":"Days of Cover","velocity":"Daily Velocity / Machine"},
+                title="Stock Health Map — Bubble Size = SOH Qty",
+                height=450,
+            )
+            fig_bub.add_vline(x=DOC_UNDER, line_dash="dot", line_color="#ef4444")
+            fig_bub.add_vline(x=DOC_OVER,  line_dash="dot", line_color="#3b82f6")
+            fig_bub.add_hline(y=VEL_LOW,   line_dash="dot", line_color="#f59e0b")
+            st.plotly_chart(fig_bub, use_container_width=True)
+        else:
+            st.success("✅ All city×product combinations are within normal stock range.")
+
+        st.divider()
+
+        # ── 3. PRODUCT × LOCATION DRILL-DOWN ────────────────────────────
+        st.markdown("#### 📦 Product × Location Stock Drill-Down")
+        st.caption("Select a product to see its stock health across every city.")
+
+        prod_list = sorted(fdf["Product"].unique())
+        sel_prod_dd = st.selectbox("Select Product", prod_list, key="vnd_dd_prod")
+        prod_city = fdf[fdf["Product"] == sel_prod_dd].copy()
+        prod_city["stock_status"] = np.where(
+            prod_city["days_of_cover"] > DOC_OVER,  "⬆️ Overstock",
+            np.where(prod_city["days_of_cover"] < DOC_UNDER, "⬇️ Understock", "✅ Normal")
+        )
+
+        pcc1, pcc2 = st.columns([3, 2])
+        with pcc1:
+            pc_disp = prod_city[["City","Machines" if "Machines" in prod_city.columns else "Machine_Count",
+                                  "Total_SOH","Sales_Qty","drr","days_of_cover","str_pct","stock_status"]].copy()
+            pc_disp.columns = ["City","Machines","SOH","Sales","DRR","DOC","STR%","Status"]
+
+            def _color_pc(val):
+                if "Overstock"  in str(val): return "background-color:#dbeafe;color:#1e40af;font-weight:bold"
+                if "Understock" in str(val): return "background-color:#fee2e2;color:#991b1b;font-weight:bold"
+                if "Normal"     in str(val): return "background-color:#dcfce7;color:#166534;font-weight:bold"
+                return ""
+
+            st.dataframe(
+                pc_disp.style
+                .format({"Machines":"{:,.0f}","SOH":"{:,.0f}","Sales":"{:,.0f}",
+                         "DRR":"{:.2f}","DOC":"{:.1f}","STR%":"{:.1f}"})
+                .map(_color_pc, subset=["Status"]),
+                use_container_width=True, hide_index=True,
+            )
+
+        with pcc2:
+            fig_pc = px.bar(
+                prod_city.sort_values("days_of_cover"),
+                x="days_of_cover", y="City", orientation="h",
+                color="stock_status",
+                color_discrete_map={
+                    "⬆️ Overstock":"#3b82f6","⬇️ Understock":"#ef4444","✅ Normal":"#22c55e"
+                },
+                title=f"DOC by City — {sel_prod_dd[:30]}",
+                labels={"days_of_cover":"Days of Cover"},
+                height=max(300, len(prod_city)*45),
+            )
+            fig_pc.add_vline(x=DOC_UNDER, line_dash="dot", line_color="#ef4444")
+            fig_pc.add_vline(x=DOC_OVER,  line_dash="dot", line_color="#3b82f6")
+            st.plotly_chart(fig_pc, use_container_width=True)
+
+        st.divider()
+
+        # ── 4. SCALE / MAINTAIN / LIQUIDATE MATRIX ──────────────────────
+        st.markdown("#### 🎯 SKU × City Action Matrix — Scale / Maintain / Liquidate")
+        st.caption(
+            f"**Scale** = STR% > {STR_SCALE}% and DOC < {DOC_OVER}d  |  "
+            f"**Liquidate** = STR% < {STR_LIQ}% or DOC > {DOC_OVER}d  |  "
+            f"**Maintain** = everything else"
+        )
+
+        action_df = fdf.copy()
+
+        def _action(row):
+            s, d = row["str_pct"], row["days_of_cover"]
+            if s >= STR_SCALE and d < DOC_OVER:
+                return "🚀 Scale"
+            if s < STR_LIQ or d > DOC_OVER:
+                return "🔻 Liquidate"
+            return "🔄 Maintain"
+
+        action_df["Action"] = action_df.apply(_action, axis=1)
+
+        ac1, ac2, ac3 = st.columns(3)
+        ac1.metric("🚀 Scale",     (action_df["Action"]=="🚀 Scale").sum(),     delta="opportunities")
+        ac2.metric("🔄 Maintain",  (action_df["Action"]=="🔄 Maintain").sum())
+        ac3.metric("🔻 Liquidate", (action_df["Action"]=="🔻 Liquidate").sum(), delta="⚠️ at risk", delta_color="inverse")
+
+        # Pivot: City vs Product coloured by action
+        pivot_data = action_df[["City","Product","Action","str_pct","days_of_cover","Sales_Qty"]].copy()
+
+        # Action filter
+        act_filter = st.multiselect(
+            "Filter Actions", ["🚀 Scale","🔄 Maintain","🔻 Liquidate"],
+            default=["🚀 Scale","🔻 Liquidate"], key="vnd_act_filter"
+        )
+        filtered_act = pivot_data[pivot_data["Action"].isin(act_filter)] if act_filter else pivot_data
+
+        def _color_action(val):
+            if "Scale"     in str(val): return "background-color:#dcfce7;color:#166534;font-weight:bold"
+            if "Liquidate" in str(val): return "background-color:#fee2e2;color:#991b1b;font-weight:bold"
+            if "Maintain"  in str(val): return "background-color:#fef9c3;color:#92400e"
+            return ""
+
+        act_disp = filtered_act[["City","Product","Action","str_pct","days_of_cover","Sales_Qty"]].copy()
+        act_disp.columns = ["City","Product","Action","STR%","DOC","Sales Qty"]
+        st.dataframe(
+            act_disp.sort_values(["Action","City"])
+            .style.format({"STR%":"{:.1f}","DOC":"{:.1f}","Sales Qty":"{:,.0f}"})
+            .map(_color_action, subset=["Action"]),
+            use_container_width=True, hide_index=True,
+        )
+
+        # Scatter: STR% vs DOC quadrant chart
+        quad_df = action_df[action_df["days_of_cover"] < 500].copy()
+        fig_quad = px.scatter(
+            quad_df, x="str_pct", y="days_of_cover",
+            color="Action", size="Sales_Qty",
+            hover_data=["City","Product","str_pct","days_of_cover"],
+            color_discrete_map={
+                "🚀 Scale":"#22c55e","🔄 Maintain":"#eab308","🔻 Liquidate":"#ef4444"
+            },
+            labels={"str_pct":"STR %","days_of_cover":"Days of Cover"},
+            title="Action Quadrant — STR% vs Days of Cover (size = Sales Qty)",
+            height=500,
+        )
+        fig_quad.add_vline(x=STR_LIQ,   line_dash="dash", line_color="#ef4444",
+                           annotation_text=f"STR {STR_LIQ}%")
+        fig_quad.add_vline(x=STR_SCALE, line_dash="dash", line_color="#22c55e",
+                           annotation_text=f"STR {STR_SCALE}%")
+        fig_quad.add_hline(y=DOC_UNDER, line_dash="dash", line_color="#ef4444",
+                           annotation_text=f"DOC {DOC_UNDER}d")
+        fig_quad.add_hline(y=DOC_OVER,  line_dash="dash", line_color="#3b82f6",
+                           annotation_text=f"DOC {DOC_OVER}d")
+        st.plotly_chart(fig_quad, use_container_width=True)
+
+        st.divider()
+
+        # ── 5. PARTNER REVIEW SUMMARY ────────────────────────────────────
+        st.markdown("#### 📋 Partner Review Summary")
+        st.caption("Ready-to-use talking points for your channel partner meeting.")
+
+        critical_cities = city_agg[city_agg["Health"]=="🔴 Critical"]["City"].tolist()
+        scale_items     = action_df[action_df["Action"]=="🚀 Scale"][["City","Product","str_pct","days_of_cover"]]
+        liq_items       = action_df[action_df["Action"]=="🔻 Liquidate"][["City","Product","str_pct","days_of_cover"]]
+        over_items      = alerts[alerts["stock_status"]=="⬆️ Overstock"][["City","Product","days_of_cover"]] if not alerts.empty else pd.DataFrame()
+        under_items     = alerts[alerts["stock_status"]=="⬇️ Understock"][["City","Product","days_of_cover"]] if not alerts.empty else pd.DataFrame()
+
+        rv1, rv2 = st.columns(2)
+        with rv1:
+            st.markdown("**🔴 Immediate Attention Required**")
+            if critical_cities:
+                for c in critical_cities:
+                    st.error(f"• **{c}** — Critical health, review stock and sales urgently")
+            if not under_items.empty:
+                for _, r in under_items.head(5).iterrows():
+                    st.error(f"• **{r['City']}** / {r['Product'][:25]}… — only {r['days_of_cover']:.0f}d cover (risk of stockout)")
+            if not critical_cities and under_items.empty:
+                st.success("No critical issues found.")
+
+        with rv2:
+            st.markdown("**🟢 Growth Opportunities**")
+            if not scale_items.empty:
+                for _, r in scale_items.head(5).iterrows():
+                    st.success(f"• **{r['City']}** / {r['Product'][:25]}… — STR {r['str_pct']:.0f}%, DOC {r['days_of_cover']:.0f}d → increase fill qty")
+            else:
+                st.info("No scale opportunities in current filters.")
+
+        if not liq_items.empty:
+            st.markdown("**⚠️ Liquidation Candidates**")
+            liq_disp = liq_items.copy()
+            liq_disp.columns = ["City","Product","STR%","DOC"]
+            st.dataframe(
+                liq_disp.style.format({"STR%":"{:.1f}","DOC":"{:.1f}"}),
+                use_container_width=True, hide_index=True,
+            )
+
+    # ══════════════════════════════════════════════════════════════════════
+    # TAB — TREND LINES (unchanged)
+    # ══════════════════════════════════════════════════════════════════════
     with t4:
         st.markdown("### 📈 Trend Line Analysis")
         st.info("Select historical data points to plot trends. Save multiple months first.")
@@ -360,6 +692,59 @@ def _render_analysis(df_raw: pd.DataFrame, price_map: dict,
             else:
                 st.info("Select at least one city, product, and data point.")
 
+    # ══════════════════════════════════════════════════════════════════════
+    # TAB — SKU CONFIG  (persistent prices via Supabase)
+    # ══════════════════════════════════════════════════════════════════════
+    with t5:
+        st.markdown("### ⚙️ SKU Price Configuration")
+        st.caption(
+            "Set MRP for each product once — prices are saved to the database and "
+            "auto-loaded next time. You can update them at any time."
+        )
+
+        # Load persisted prices and merge with current session prices
+        persisted = _load_prices_from_db()
+        merged_prices = {**persisted, **price_map}   # session prices take precedence
+
+        all_prods_cfg = sorted(fdf["Product"].unique())
+        cfg_init = pd.DataFrame({
+            "Product":        all_prods_cfg,
+            "Price_per_Unit": [merged_prices.get(p, 0.0) for p in all_prods_cfg],
+        })
+
+        cfg_edited = st.data_editor(
+            cfg_init,
+            use_container_width=True,
+            hide_index=True,
+            key="vnd_cfg_price_editor",
+            column_config={
+                "Product":        st.column_config.TextColumn("Product", disabled=True),
+                "Price_per_Unit": st.column_config.NumberColumn("MRP (₹)", min_value=0.0, step=0.5, format="₹%.2f"),
+            },
+        )
+
+        cfg1, cfg2 = st.columns(2)
+        if cfg1.button("💾 Save Prices Permanently", type="primary",
+                       use_container_width=True, key="vnd_cfg_save"):
+            new_map = dict(zip(cfg_edited["Product"], cfg_edited["Price_per_Unit"]))
+            _save_prices_to_db(new_map)
+            st.session_state["vnd_price_map"] = new_map
+            st.success("✅ Prices saved to database — they will auto-load on every future session.")
+            st.rerun()
+
+        if cfg2.button("🔄 Reload Saved Prices", use_container_width=True, key="vnd_cfg_reload"):
+            reloaded = _load_prices_from_db()
+            if reloaded:
+                st.session_state["vnd_price_map"] = reloaded
+                st.success(f"Loaded {len(reloaded)} saved prices.")
+                st.rerun()
+            else:
+                st.info("No prices found in database yet.")
+
+        if persisted:
+            st.divider()
+            st.caption(f"ℹ️ {len(persisted)} SKU price(s) currently saved in database.")
+
     # Save button
     st.markdown("---")
     sv1, sv2 = st.columns([3, 1])
@@ -374,6 +759,8 @@ def _render_analysis(df_raw: pd.DataFrame, price_map: dict,
             "data": df_raw.to_dict(orient="records"),
         }
         _save_db(db)
+        # Also persist prices to Supabase so they survive redeployment
+        _save_prices_to_db(price_map)
         st.session_state["vnd_db"] = db
         st.success(f"✅ Saved: {target_cust} — {sel_month} {sel_year}")
         st.rerun()
@@ -383,14 +770,29 @@ def _render_analysis(df_raw: pd.DataFrame, price_map: dict,
 # PUBLIC ENTRY POINT
 # ─────────────────────────────────────────────────────────────────────────────
 
-def render_vending_tab(role: str):
+def render_vending_tab(role: str, supabase_client=None):
     """
     Renders the full Vending Performance Hub inside a tab.
     Call this from the main app's tab context:
         with tabs[_TAB_VENDING]:
-            render_vending_tab(role)
+            render_vending_tab(role, supabase_client=supabase)
+
+    supabase_client: the Supabase client from the main app (for price persistence).
     """
     _init_state()
+
+    # Attach Supabase client so price helpers can use it
+    if supabase_client is not None:
+        _attach_supabase(supabase_client)
+
+    # Auto-load persisted prices once per session
+    if not st.session_state.get("vnd_prices_loaded", False):
+        persisted = _load_prices_from_db()
+        if persisted:
+            # Merge: don't overwrite prices already set this session
+            current = st.session_state.get("vnd_price_map", {})
+            st.session_state["vnd_price_map"] = {**persisted, **current}
+        st.session_state["vnd_prices_loaded"] = True
 
     st.subheader("📊 Vending Performance Hub")
     st.caption(
@@ -416,7 +818,9 @@ def render_vending_tab(role: str):
                     chosen_key = keys[labels.index(chosen_label)]
                     saved = db[chosen_key]
                     st.session_state["vnd_processed_df"]       = pd.DataFrame(saved["data"])
-                    st.session_state["vnd_price_map"]          = saved["price_map"]
+                    # Merge saved prices with persisted DB prices (DB wins for any not in saved)
+                    persisted_now = _load_prices_from_db()
+                    st.session_state["vnd_price_map"] = {**persisted_now, **saved.get("price_map", {})}
                     st.session_state["vnd_analysis_generated"] = True
                     st.rerun()
             if sv_col3.button("🗑 Reset", use_container_width=True, key="vnd_reset_btn"):
@@ -450,19 +854,46 @@ def render_vending_tab(role: str):
         if st.session_state["vnd_processed_df"] is not None:
             st.markdown("---")
             st.subheader("💰 Step 2: Item-Wise Price Entry")
-            st.info("Set the MRP for each product (used for value-based metrics).")
+
+            # Pre-fill from persisted prices
+            current_prices = st.session_state.get("vnd_price_map", {})
+            persisted_now  = _load_prices_from_db()
+            prefill        = {**persisted_now, **current_prices}
 
             unique_prods = sorted(st.session_state["vnd_processed_df"]["Product"].unique())
-            price_init   = pd.DataFrame({"Product": unique_prods, "Price_per_Unit": 0.0})
-            edited       = st.data_editor(price_init, use_container_width=True,
-                                           hide_index=True, key="vnd_price_editor")
+            prefilled_prices = [prefill.get(p, 0.0) for p in unique_prods]
+            any_prefilled = any(v > 0 for v in prefilled_prices)
+
+            if any_prefilled:
+                st.success(
+                    f"✅ Prices auto-loaded from database for "
+                    f"{sum(1 for v in prefilled_prices if v > 0)}/{len(unique_prods)} SKUs. "
+                    "Update below if needed."
+                )
+            else:
+                st.info("Set the MRP for each product (saved permanently after first entry).")
+
+            price_init = pd.DataFrame({
+                "Product":        unique_prods,
+                "Price_per_Unit": prefilled_prices,
+            })
+            edited = st.data_editor(
+                price_init, use_container_width=True, hide_index=True,
+                key="vnd_price_editor",
+                column_config={
+                    "Product":        st.column_config.TextColumn("Product", disabled=True),
+                    "Price_per_Unit": st.column_config.NumberColumn("MRP (₹)", min_value=0.0,
+                                                                     step=0.5, format="₹%.2f"),
+                },
+            )
 
             if st.button("🚀 Generate Performance Analysis", type="primary",
                           key="vnd_gen_btn"):
+                new_map = dict(zip(edited["Product"], edited["Price_per_Unit"]))
                 st.session_state["vnd_analysis_generated"] = True
-                st.session_state["vnd_price_map"] = dict(
-                    zip(edited["Product"], edited["Price_per_Unit"])
-                )
+                st.session_state["vnd_price_map"]          = new_map
+                # Auto-save prices to DB whenever analysis is generated
+                _save_prices_to_db(new_map)
 
     # ── Dashboard ─────────────────────────────────────────────────────────
     if (st.session_state["vnd_analysis_generated"]
