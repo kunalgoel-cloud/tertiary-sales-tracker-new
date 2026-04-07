@@ -259,14 +259,14 @@ def _render_analysis(df_raw: pd.DataFrame, price_map: dict,
     with t1:
         st.dataframe(
             fdf[["City","Product","Total_SOH","drr","days_of_cover","str_pct"]]
-            .style.format(fmt).background_gradient(subset=["str_pct"], cmap="RdYlGn"),
+            .style.format(fmt).bar(subset=["str_pct"], color=["#f87171", "#4ade80"], vmin=0, vmax=1),
             use_container_width=True,
         )
 
     with t2:
         st.dataframe(
             fdf[["City","Product","Machine_Count","Sales_Qty","velocity","abc_class"]]
-            .style.format(fmt).background_gradient(subset=["velocity"], cmap="YlGn"),
+            .style.format(fmt).bar(subset=["velocity"], color="#4ade80"),
             use_container_width=True,
         )
 
