@@ -845,7 +845,7 @@ if role == "admin":
                     st.warning("No master SKUs configured. Add SKUs in the Configuration tab first.")
                 else:
                   st.markdown("#### 🗺 Map Raw Product Names → Master SKUs")
-                  unique_keys = sorted(work_df["m_key"].astype(str).unique())
+                  unique_keys = sorted(work_df["m_key"].dropna().astype(str).unique().tolist())
                   sku_map: dict[str, str] = {}
 
                   saved_map: dict[str, str] = {}
@@ -1106,7 +1106,7 @@ if role == "admin":
                                   if not item_map_df.empty:
                                       saved_map_mc = dict(zip(item_map_df["raw_name"], item_map_df["master_name"]))
                                   mc_sku_map: dict = {}
-                                  for k in sorted(mc_work["m_key"].astype(str).unique()):
+                                  for k in sorted(mc_work["m_key"].dropna().astype(str).unique().tolist()):
                                       saved = saved_map_mc.get(k, "")
                                       default_idx = mc_masters.index(saved) if saved in mc_masters else 0
                                       mc_sku_map[k] = st.selectbox(
