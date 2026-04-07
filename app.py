@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from marketing_module import render_marketing_tab
 from channel_performance_module import render_channel_performance_tab
 from vending_module import render_vending_tab
+from sop_module import render_sop_tab
 
 def _fmt_err(e: Exception) -> str:
     """Short readable error — strips 502 HTML bodies."""
@@ -259,6 +260,7 @@ if role == "admin":
         "🛠 Configuration",
         "📦 Channel Performance",
         "🎰 Vending",
+        "📋 S&OP",
     ])
     _TAB_ANALYTICS       = 0
     _TAB_DEEPDIVE        = 1
@@ -268,6 +270,7 @@ if role == "admin":
     _TAB_CONFIG          = 5
     _TAB_CHANPERF        = 6
     _TAB_VENDING         = 7
+    _TAB_SOP             = 8
 else:
     tabs = st.tabs([
         "📊 Trend Analytics",
@@ -275,12 +278,14 @@ else:
         "📣 Performance Marketing",
         "📦 Channel Performance",
         "🎰 Vending",
+        "📋 S&OP",
     ])
     _TAB_ANALYTICS  = 0
     _TAB_DEEPDIVE   = 1
     _TAB_MARKETING  = 2
     _TAB_CHANPERF   = 3
     _TAB_VENDING    = 4
+    _TAB_SOP        = 5
 
 # ══════════════════════════════════════════════
 # TAB 1 – TREND ANALYTICS  (unchanged)
@@ -1375,3 +1380,9 @@ with tabs[_TAB_CHANPERF]:
 # ══════════════════════════════════════════════
 with tabs[_TAB_VENDING]:
     render_vending_tab(role)
+
+# ══════════════════════════════════════════════
+# TAB – S&OP (admin + viewer)
+# ══════════════════════════════════════════════
+with tabs[_TAB_SOP]:
+    render_sop_tab(supabase, history_df, master_skus, master_chans, role)
