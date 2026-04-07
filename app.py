@@ -8,6 +8,7 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta
 from marketing_module import render_marketing_tab
 from channel_performance_module import render_channel_performance_tab
+from vending_module import render_vending_tab
 
 def _fmt_err(e: Exception) -> str:
     """Short readable error — strips 502 HTML bodies."""
@@ -54,9 +55,9 @@ def sanitize(text: str) -> str:
     """Strip dangerous characters from user-supplied names."""
     return re.sub(r"[<>\"'%;()&+]", "", str(text)).strip()[:200]
 
-@st.cache_data(ttl=30)
+@st.cache_data(ttl=120)
 def get_table(table: str, default_cols: tuple) -> pd.DataFrame:
-    """Fetch a Supabase table with pagination; return empty DataFrame on failure."""
+    """Fetch a Supabase table with pagination (cached 120s); return empty DataFrame on failure."""
     try:
         all_rows = []
         page = 0
@@ -125,6 +126,14 @@ history_df  = get_table("sales",           ("id", "date", "channel", "item_name"
 master_skus  = get_table("master_skus",    ("name",))
 master_chans = get_table("master_channels",("name", "is_monthly", "requires_city"))
 item_map_df  = get_table("item_map",       ("raw_name", "master_name"))
+
+# Pre-parse dates once at top level so both Analytics and Deep Dive tabs
+# share the same parsed DataFrame without repeating the expensive conversion.
+if not history_df.empty:
+    if "date_dt" not in history_df.columns:
+        history_df = history_df.copy()
+        history_df["date_dt"] = pd.to_datetime(history_df["date"], errors="coerce")
+        history_df = history_df.dropna(subset=["date_dt"])
 
 # ── Channel attribute helpers ─────────────────────────────────────────────
 def _chan_flag(channel_name: str, flag: str, default: bool) -> bool:
@@ -249,6 +258,7 @@ if role == "admin":
         "📅 Monthly Channel Upload",
         "🛠 Configuration",
         "📦 Channel Performance",
+        "🎰 Vending",
     ])
     _TAB_ANALYTICS       = 0
     _TAB_DEEPDIVE        = 1
@@ -257,17 +267,20 @@ if role == "admin":
     _TAB_MONTHLY_UPLOAD  = 4
     _TAB_CONFIG          = 5
     _TAB_CHANPERF        = 6
+    _TAB_VENDING         = 7
 else:
     tabs = st.tabs([
         "📊 Trend Analytics",
         "🔬 Deep Dive",
         "📣 Performance Marketing",
         "📦 Channel Performance",
+        "🎰 Vending",
     ])
     _TAB_ANALYTICS  = 0
     _TAB_DEEPDIVE   = 1
     _TAB_MARKETING  = 2
     _TAB_CHANPERF   = 3
+    _TAB_VENDING    = 4
 
 # ══════════════════════════════════════════════
 # TAB 1 – TREND ANALYTICS  (unchanged)
@@ -276,8 +289,7 @@ with tabs[_TAB_ANALYTICS]:
     if history_df.empty:
         st.info("No data found. Admin must upload sales data first.")
     else:
-        history_df["date_dt"] = pd.to_datetime(history_df["date"], errors="coerce")
-        history_df = history_df.dropna(subset=["date_dt"])
+        # date_dt already parsed at startup — no re-parse needed
 
         v1, v2 = st.columns([2, 1])
         with v1:
@@ -391,9 +403,7 @@ with tabs[_TAB_DEEPDIVE]:
         st.info("No data found. Admin must upload sales data first.")
     else:
         # Ensure date column is parsed (re-do in case tab 1 was skipped)
-        if "date_dt" not in history_df.columns:
-            history_df["date_dt"] = pd.to_datetime(history_df["date"], errors="coerce")
-            history_df = history_df.dropna(subset=["date_dt"])
+        # date_dt already parsed at startup — no re-parse needed
 
         st.subheader("🔬 Deep Dive Analytics")
 
@@ -1359,3 +1369,9 @@ with tabs[_TAB_CHANPERF]:
         )
     else:
         render_channel_performance_tab(supabase, master_skus, role)
+
+# ══════════════════════════════════════════════
+# TAB – VENDING (admin + viewer)
+# ══════════════════════════════════════════════
+with tabs[_TAB_VENDING]:
+    render_vending_tab(role)
