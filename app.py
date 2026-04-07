@@ -822,17 +822,26 @@ if role == "admin":
                   fixed_date = st.date_input("Manual Date (used if no date column)", key="fixed_date")
                   if needs_city:
                       city_col = st.selectbox(
-                          "City Column *", cols, key="city_col",
-                          help="Required for city-level inventory tracking "
-                               "(Blinkit=Supply City, Swiggy=CITY, BigBasket=DC)",
+                          "City Column (optional)",
+                          cols,
+                          key="city_col",
+                          help="Select a city/region column if available, or leave as None to set a fixed city below.",
                       )
+                      if city_col == "None":
+                          city_fallback = st.selectbox(
+                              "City / Region (no column available)",
+                              ["National", "Pan India", "Online", "Unknown"],
+                              key="city_fallback",
+                              help="All rows will be tagged with this value since no city column is available.",
+                          )
+                      else:
+                          city_fallback = None
                   else:
-                      city_col = "None"  # Amazon and others — city not applicable
+                      city_col      = "None"
+                      city_fallback = None
 
-              # Validate mandatory column picks
+              # Validate mandatory column picks — city is no longer blocking
               mandatory = [("Product", p_col), ("Qty", q_col), ("Revenue", r_col)]
-              if needs_city:
-                  mandatory.append(("City", city_col))
               missing = [name for name, col in mandatory if col == "None"]
               if missing:
                   st.info(f"Please select columns for: {', '.join(missing)}")
@@ -925,7 +934,7 @@ if role == "admin":
                               row_city = (
                                   str(r[city_col]).strip()
                                   if city_col != "None" and city_col in r.index
-                                  else None
+                                  else city_fallback  # "National" / "Pan India" / etc, or None
                               )
                               raw_rows.append({
                                   "date":      dt_str,
