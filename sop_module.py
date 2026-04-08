@@ -162,6 +162,14 @@ def build_base_forecast(
         return pd.DataFrame()
 
     df = history_df.copy()
+
+    # Ensure key columns are plain Python str (not StringDtype with pd.NA)
+    for col in ["channel", "item_name"]:
+        if col in df.columns:
+            df[col] = df[col].astype(object).fillna("").astype(str).str.strip()
+    df = df[df["channel"] != ""]
+    df = df[df["item_name"] != ""]
+
     if "date_dt" not in df.columns:
         df["date_dt"] = pd.to_datetime(df["date"], errors="coerce")
     df = df.dropna(subset=["date_dt"])
@@ -582,10 +590,14 @@ def render_sop_tab(
             mkt_spend_by_date = _get_marketing_spend_by_date(supabase_client)
 
         with st.spinner("Building baseline forecast…"):
-            base_df = build_base_forecast(
-                df, forecast_days=30, lookback_days=lookback,
-                mkt_spend_by_date=mkt_spend_by_date,
-            )
+            try:
+                base_df = build_base_forecast(
+                    df, forecast_days=30, lookback_days=lookback,
+                    mkt_spend_by_date=mkt_spend_by_date,
+                )
+            except Exception as _e:
+                st.error(f"Forecast error: {_e}")
+                base_df = pd.DataFrame()
 
         if base_df.empty:
             st.warning(f"Not enough history (need ≥ {_MIN_HISTORY_DAYS} days per SKU-channel). Upload more data.")
