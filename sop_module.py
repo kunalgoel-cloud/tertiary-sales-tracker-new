@@ -31,6 +31,73 @@ import plotly.graph_objects as go
 import streamlit as st
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Matplotlib-free colour gradient for st.dataframe Styler
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _css_gradient(df_sub: pd.DataFrame, low_col: str, mid_col: str | None,
+                  high_col: str) -> pd.DataFrame:
+    """
+    Return a same-shape DataFrame of CSS background-color strings.
+    Works on a numeric subset.  No matplotlib required.
+
+    Colour stops:
+      Blues  : white → #1565C0
+      RdYlGn : #d73027 → #ffffbf → #1a9850
+    """
+    arr = df_sub.to_numpy(dtype=float, na_value=0.0)
+    vmin, vmax = arr.min(), arr.max()
+    span = vmax - vmin if vmax != vmin else 1.0
+
+    def _lerp(a: tuple, b: tuple, t: float) -> str:
+        r = int(a[0] + (b[0] - a[0]) * t)
+        g = int(a[1] + (b[1] - a[1]) * t)
+        b_ = int(a[2] + (b[2] - a[2]) * t)
+        return f"background-color: rgb({r},{g},{b_})"
+
+    low_rgb  = tuple(int(low_col.lstrip("#")[i:i+2], 16) for i in (0, 2, 4))
+    high_rgb = tuple(int(high_col.lstrip("#")[i:i+2], 16) for i in (0, 2, 4))
+    mid_rgb  = (tuple(int(mid_col.lstrip("#")[i:i+2], 16) for i in (0, 2, 4))
+                if mid_col else None)
+
+    out = []
+    for row in arr:
+        row_css = []
+        for v in row:
+            t = (v - vmin) / span           # 0 → 1
+            if mid_rgb is None:
+                css = _lerp(low_rgb, high_rgb, t)
+            else:
+                if t < 0.5:
+                    css = _lerp(low_rgb, mid_rgb, t * 2)
+                else:
+                    css = _lerp(mid_rgb, high_rgb, (t - 0.5) * 2)
+            row_css.append(css)
+        out.append(row_css)
+    return pd.DataFrame(out, index=df_sub.index, columns=df_sub.columns)
+
+
+def _apply_gradient(styler: "pd.io.formats.style.Styler",
+                    subset,
+                    cmap: str = "Blues") -> "pd.io.formats.style.Styler":
+    """
+    Drop-in replacement for .background_gradient(cmap=..., axis=None, subset=...).
+    Supported cmaps: 'Blues', 'RdYlGn'.
+    """
+    if cmap == "RdYlGn":
+        return styler.apply(
+            _css_gradient,
+            low_col="d73027", mid_col="ffffbf", high_col="1a9850",
+            subset=subset, axis=None,
+        )
+    # Default → Blues (white to deep blue)
+    return styler.apply(
+        _css_gradient,
+        low_col="ffffff", mid_col=None, high_col="1565C0",
+        subset=subset, axis=None,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 _DEFAULT_ROAS         = 3.0
 _DECAY_HALFLIFE_WEEKS = 4
 _MIN_HISTORY_DAYS     = 7
@@ -750,10 +817,11 @@ def render_sop_tab(supabase_client, history_df, master_skus_df, master_chans_df,
             color_cols = [c for c in piv.columns if c != "TOTAL"]
 
             st.dataframe(
-                piv_display.style
-                    .format(fmt_str)
-                    .background_gradient(cmap="Blues", axis=None,
-                                         subset=pd.IndexSlice[piv.index, color_cols]),
+                _apply_gradient(
+                    piv_display.style.format(fmt_str),
+                    subset=pd.IndexSlice[piv.index, color_cols],
+                    cmap="Blues",
+                ),
                 use_container_width=True,
             )
 
@@ -933,9 +1001,11 @@ def render_sop_tab(supabase_client, history_df, master_skus_df, master_chans_df,
             color_cols = [c for c in apiv.columns if c != "TOTAL"]
             cmap = "RdYlGn" if "Variance" in avp_view or "Attainment" in avp_view else "Blues"
             st.dataframe(
-                apiv.style.format(afmt)
-                    .background_gradient(cmap=cmap, axis=None,
-                                         subset=pd.IndexSlice[apiv.index, color_cols]),
+                _apply_gradient(
+                    apiv.style.format(afmt),
+                    subset=pd.IndexSlice[apiv.index, color_cols],
+                    cmap=cmap,
+                ),
                 use_container_width=True,
             )
 
