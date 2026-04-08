@@ -331,17 +331,23 @@ def _estimate_roas_from_marketing_db(
     channels: list[str],
 ) -> tuple[dict[str, float], dict[str, str]]:
     """
-    Compute ROAS estimates with a strict priority hierarchy:
-      1. Channel-level ROAS from marketing DB (ALL available history)
-      2. Company-level ROAS from marketing DB (aggregate across all channels)
-      3. Hardcoded _DEFAULT_ROAS  ← only if absolutely no data exists anywhere
+    Compute ROAS estimates from the marketing `performance` table.
+
+    Priority hierarchy (never fall back to hardcoded default if any real data exists):
+      1. Channel-level ROAS  — performance.channel matches sales channel exactly
+                               OR via channel_map (mkt_channel → sales_channel)
+      2. Company-level ROAS  — aggregate across all channels in performance table
+      3. _DEFAULT_ROAS        — only if performance table is empty / unavailable
+
+    Uses ALL available history (no date window cap) so even short histories
+    are utilised rather than ignored.
 
     Returns:
-        roas_map    — {channel: roas_value}
-        roas_source — {channel: human-readable source label}
+        roas_map    — {sales_channel: roas_value}
+        roas_source — {sales_channel: human-readable source label}
     """
-    roas_map:    dict[str, float] = {}
-    roas_source: dict[str, str]   = {}
+    roas_map:     dict[str, float] = {}
+    roas_source:  dict[str, str]   = {}
     channel_roas: dict[str, float] = {}
     company_roas: float | None     = None
 
@@ -350,36 +356,65 @@ def _estimate_roas_from_marketing_db(
         mkt_url = st.secrets.get("MARKETING_SUPABASE_URL")
         mkt_key = st.secrets.get("MARKETING_SUPABASE_KEY")
         if not mkt_url or not mkt_key:
-            raise ValueError("no marketing secrets")
+            raise KeyError("no marketing secrets")
         mkt_sb = create_client(mkt_url, mkt_key)
 
-        # Fetch ALL campaign records — no date filter so partial history is used
-        res = mkt_sb.table("campaigns").select(
-            "channel, total_spend, attributed_revenue"
-        ).execute()
+        # ── Fetch all performance records (spend + sales per channel) ─────────
+        # The marketing module uses: table "performance", columns: channel, spend, sales
+        all_rows = []
+        page, PAGE_SIZE = 0, 1000
+        while True:
+            res = mkt_sb.table("performance").select(
+                "channel, spend, sales"
+            ).range(page * PAGE_SIZE, (page + 1) * PAGE_SIZE - 1).execute()
+            if not res.data:
+                break
+            all_rows.extend(res.data)
+            if len(res.data) < PAGE_SIZE:
+                break
+            page += 1
 
-        if res.data:
-            mdf = pd.DataFrame(res.data)
-            mdf["total_spend"]        = pd.to_numeric(mdf["total_spend"],        errors="coerce").fillna(0)
-            mdf["attributed_revenue"] = pd.to_numeric(mdf["attributed_revenue"], errors="coerce").fillna(0)
+        if all_rows:
+            mdf = pd.DataFrame(all_rows)
+            mdf["spend"] = pd.to_numeric(mdf["spend"], errors="coerce").fillna(0)
+            mdf["sales"] = pd.to_numeric(mdf["sales"], errors="coerce").fillna(0)
 
-            # Channel-level ROAS
-            grp = mdf.groupby("channel")[["total_spend", "attributed_revenue"]].sum()
-            for ch, row in grp.iterrows():
-                if row["total_spend"] > 0:
-                    channel_roas[ch] = round(row["attributed_revenue"] / row["total_spend"], 2)
+            # Channel-level ROAS (using marketing channel names as-is)
+            grp = mdf.groupby("channel")[["spend", "sales"]].sum()
+            for mkt_ch, row in grp.iterrows():
+                if row["spend"] > 0:
+                    channel_roas[str(mkt_ch)] = round(row["sales"] / row["spend"], 2)
 
-            # Company-level ROAS (aggregate)
-            tot_spend = mdf["total_spend"].sum()
-            tot_rev   = mdf["attributed_revenue"].sum()
+            # Company-level ROAS
+            tot_spend = mdf["spend"].sum()
+            tot_sales = mdf["sales"].sum()
             if tot_spend > 0:
-                company_roas = round(tot_rev / tot_spend, 2)
+                company_roas = round(tot_sales / tot_spend, 2)
+
+        # ── Fetch channel_map to translate mkt_channel → sales_channel ────────
+        # e.g. "Swiggy Instamart" in marketing → "Swiggy" in sales
+        reverse_ch_map: dict[str, str] = {}  # sales_channel → mkt_channel
+        try:
+            cmap_res = mkt_sb.table("channel_map").select(
+                "mkt_channel, sales_channel"
+            ).execute()
+            if cmap_res.data:
+                for row in cmap_res.data:
+                    reverse_ch_map[str(row["sales_channel"])] = str(row["mkt_channel"])
+        except Exception:
+            pass
+
     except Exception:
         pass
 
-    # Assign ROAS using priority hierarchy
+    # ── Assign ROAS to each sales channel ─────────────────────────────────────
     for ch in channels:
-        if ch in channel_roas:
+        # Try exact match first, then via channel_map translation
+        mkt_ch_name = reverse_ch_map.get(ch, ch)   # sales_ch → mkt_ch name
+        if mkt_ch_name in channel_roas:
+            roas_map[ch]    = channel_roas[mkt_ch_name]
+            roas_source[ch] = f"Channel history ({channel_roas[mkt_ch_name]:.1f}×)"
+        elif ch in channel_roas:
             roas_map[ch]    = channel_roas[ch]
             roas_source[ch] = f"Channel history ({channel_roas[ch]:.1f}×)"
         elif company_roas is not None:
@@ -387,7 +422,7 @@ def _estimate_roas_from_marketing_db(
             roas_source[ch] = f"Company average ({company_roas:.1f}×)"
         else:
             roas_map[ch]    = _DEFAULT_ROAS
-            roas_source[ch] = f"Default — no marketing data ({_DEFAULT_ROAS:.1f}×)"
+            roas_source[ch] = f"No marketing data — default ({_DEFAULT_ROAS:.1f}×)"
 
     return roas_map, roas_source
 
@@ -406,14 +441,26 @@ def _get_marketing_spend_by_date(sb) -> dict[str, float]:
         if not mkt_url or not mkt_key:
             return result
         mkt_sb = create_client(mkt_url, mkt_key)
-        res = mkt_sb.table("campaigns").select("date, total_spend").execute()
-        if res.data:
-            mdf = pd.DataFrame(res.data)
-            mdf["total_spend"] = pd.to_numeric(mdf["total_spend"], errors="coerce").fillna(0)
-            mdf = mdf[mdf["total_spend"] > 0]
+        # Uses performance table (same as marketing module): channel, spend, sales, date
+        all_rows = []
+        page, PAGE_SIZE = 0, 1000
+        while True:
+            res = mkt_sb.table("performance").select("date, spend").range(
+                page * PAGE_SIZE, (page + 1) * PAGE_SIZE - 1
+            ).execute()
+            if not res.data:
+                break
+            all_rows.extend(res.data)
+            if len(res.data) < PAGE_SIZE:
+                break
+            page += 1
+        if all_rows:
+            mdf = pd.DataFrame(all_rows)
+            mdf["spend"] = pd.to_numeric(mdf["spend"], errors="coerce").fillna(0)
+            mdf = mdf[mdf["spend"] > 0]
             if "date" in mdf.columns:
                 mdf["date"] = pd.to_datetime(mdf["date"], errors="coerce").dt.strftime("%Y-%m-%d")
-                result = mdf.groupby("date")["total_spend"].sum().to_dict()
+                result = mdf.groupby("date")["spend"].sum().to_dict()
     except Exception:
         pass
     return result
@@ -684,81 +731,98 @@ def render_sop_tab(
             help="Total planned spend across all channels",
         )
 
-        # ── Forecast table ────────────────────────────────────────────────────
-        st.markdown("##### Forecast by SKU × Channel")
+        # ── Product × Channel pivot tables ───────────────────────────────────
+        st.markdown("##### 📦 Product × Channel Forecast")
+        st.caption(
+            "Each cell = 30-day forecast for that SKU on that channel. "
+            "Switch views to see Total Units, Revenue, Organic-only, or Organic %."
+        )
 
-        display_cols = [
+        pivot_metric = st.radio(
+            "Pivot view:", ["Total Units", "Total Revenue (₹)", "Organic Units", "Organic %"],
+            horizontal=True, key="sop_pivot_metric",
+        )
+
+        def _build_pivot(df, val_col):
+            if df.empty:
+                return pd.DataFrame()
+            piv = (
+                df.pivot_table(index="item_name", columns="channel",
+                               values=val_col, aggfunc="sum")
+                .fillna(0)
+            )
+            piv["TOTAL"] = piv.sum(axis=1)
+            return piv.sort_values("TOTAL", ascending=False)
+
+        if pivot_metric == "Total Units":
+            piv = _build_pivot(forecast_df, "total_qty_30d")
+            fmt = {c: "{:,.1f}" for c in piv.columns}
+            color_subset = [c for c in piv.columns if c != "TOTAL"]
+        elif pivot_metric == "Total Revenue (₹)":
+            piv = _build_pivot(forecast_df, "total_rev_30d")
+            fmt = {c: "₹{:,.0f}" for c in piv.columns}
+            color_subset = [c for c in piv.columns if c != "TOTAL"]
+        elif pivot_metric == "Organic Units":
+            piv = _build_pivot(forecast_df, "base_qty_30d")
+            fmt = {c: "{:,.1f}" for c in piv.columns}
+            color_subset = [c for c in piv.columns if c != "TOTAL"]
+        else:  # Organic %
+            piv_base  = _build_pivot(forecast_df, "base_qty_30d")
+            piv_total = _build_pivot(forecast_df, "total_qty_30d")
+            piv = (piv_base / piv_total.replace(0, np.nan) * 100).fillna(0).round(1)
+            fmt = {c: "{:.1f}%" for c in piv.columns}
+            color_subset = [c for c in piv.columns if c != "TOTAL"]
+
+        if not piv.empty:
+            st.dataframe(
+                piv.style.format(fmt).background_gradient(
+                    cmap="Blues", axis=None, subset=color_subset
+                ),
+                use_container_width=True,
+            )
+
+        st.divider()
+
+        # ── Detailed assumptions table ────────────────────────────────────────
+        st.markdown("##### 🔍 Detailed Assumptions by SKU × Channel")
+        st.caption(
+            "Shows exactly how each number was built: "
+            "organic DRR from zero-spend days, ROAS source, budget allocated."
+        )
+
+        detail_cols = [
             "channel", "item_name",
             "base_qty_30d", "mkt_uplift_qty", "total_qty_30d",
-            "base_rev_30d", "mkt_uplift_rev", "total_rev_30d",
-            "rev_share_in_channel", "planned_mkt_spend",
-            "drr_qty", "avg_price", "organic_share",
+            "organic_share", "drr_qty", "avg_price",
+            "planned_mkt_spend", "assumed_roas",
             "organic_days_used", "history_days_used",
         ]
-        show_cols = [c for c in display_cols if c in forecast_df.columns]
-
+        show_cols = [c for c in detail_cols if c in forecast_df.columns]
         col_rename = {
             "channel": "Channel", "item_name": "SKU",
             "base_qty_30d": "Organic Units", "mkt_uplift_qty": "Mkt Units",
             "total_qty_30d": "Total Units",
-            "base_rev_30d": "Organic Rev (₹)", "mkt_uplift_rev": "Mkt Rev (₹)",
-            "total_rev_30d": "Total Rev (₹)",
-            "rev_share_in_channel": "Rev Share in Ch",
-            "planned_mkt_spend": "Allocated Budget (₹)",
-            "drr_qty": "Organic DRR", "avg_price": "Avg Price (₹)",
-            "organic_share": "Organic %",
-            "organic_days_used": "Organic Days", "history_days_used": "Total Days",
+            "organic_share": "Organic %", "drr_qty": "Organic DRR/day",
+            "avg_price": "Avg Price (₹)",
+            "planned_mkt_spend": "Budget Allocated (₹)", "assumed_roas": "ROAS Used",
+            "organic_days_used": "Organic Days", "history_days_used": "History Days",
         }
-
-        disp = forecast_df[show_cols].rename(columns=col_rename).sort_values(
-            ["Channel", "Total Units"], ascending=[True, False]
+        disp = (
+            forecast_df[show_cols]
+            .rename(columns=col_rename)
+            .sort_values(["Channel", "Total Units"], ascending=[True, False])
         )
-
         st.dataframe(
             disp.style.format({
                 "Organic Units": "{:,.1f}", "Mkt Units": "{:,.1f}", "Total Units": "{:,.1f}",
-                "Organic Rev (₹)": "₹{:,.0f}", "Mkt Rev (₹)": "₹{:,.0f}", "Total Rev (₹)": "₹{:,.0f}",
-                "Rev Share in Ch": "{:.1%}", "Allocated Budget (₹)": "₹{:,.0f}",
-                "Organic DRR": "{:.2f}", "Avg Price (₹)": "₹{:.1f}",
-                "Organic %": "{:.1%}",
+                "Organic %": "{:.1%}", "Organic DRR/day": "{:.2f}",
+                "Avg Price (₹)": "₹{:.1f}",
+                "Budget Allocated (₹)": "₹{:,.0f}", "ROAS Used": "{:.2f}×",
             }).bar(subset=["Total Units"], color="#4C8BF5"),
             use_container_width=True, hide_index=True,
         )
 
-        # ── Forecast charts ───────────────────────────────────────────────────
-        st.markdown("##### Organic vs Marketing Split")
-        chart_grp = forecast_df.groupby("channel").agg(
-            organic=("base_qty_30d", "sum"),
-            marketing=("mkt_uplift_qty", "sum"),
-        ).reset_index()
-        chart_melt = chart_grp.melt(id_vars="channel", var_name="Type", value_name="Units")
-        fig_split = px.bar(
-            chart_melt, x="channel", y="Units", color="Type",
-            barmode="stack", height=350,
-            color_discrete_map={"organic": "#4C8BF5", "marketing": "#F4A261"},
-            labels={"channel": "Channel", "Units": "Forecast Units (30d)"},
-        )
-        fig_split.update_layout(legend_title="", margin=dict(t=20))
-        st.plotly_chart(fig_split, use_container_width=True)
-
-        # SKU breakdown chart
-        sku_grp = forecast_df.groupby("item_name").agg(
-            total=("total_qty_30d", "sum"),
-            organic=("base_qty_30d", "sum"),
-        ).sort_values("total", ascending=False).head(15).reset_index()
-        fig_sku = px.bar(
-            sku_grp.sort_values("total"),
-            x="total", y="item_name", orientation="h",
-            height=max(300, len(sku_grp) * 35),
-            color="total", color_continuous_scale="Blues",
-            labels={"total": "Total Units (30d)", "item_name": ""},
-            text=sku_grp.sort_values("total")["total"].apply(lambda v: f"{v:,.0f}"),
-        )
-        fig_sku.update_traces(textposition="outside")
-        fig_sku.update_layout(coloraxis_showscale=False, margin=dict(l=10, r=60, t=20))
-        st.plotly_chart(fig_sku, use_container_width=True)
-
-        # ── Save plan ─────────────────────────────────────────────────────────
+                # ── Save plan ─────────────────────────────────────────────────────────
         if role == "admin":
             st.divider()
             st.markdown("#### 💾 Save Plan")
