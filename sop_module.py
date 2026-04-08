@@ -1,81 +1,58 @@
 """
-sop_module.py
-─────────────────────────────────────────────────────────────────────────────
-Sales & Operations Planning (S&OP) Tab for Mamanourish Executive Tracker.
+sop_module.py  —  S&OP Tab for Mamanourish Executive Tracker
+─────────────────────────────────────────────────────────────
+Entry point: render_sop_tab(supabase_client, history_df,
+                            master_skus_df, master_chans_df, role)
 
-Entry point:  render_sop_tab(supabase_client, history_df, master_skus_df,
-                             master_chans_df, role)
-
-DESIGN PHILOSOPHY
-─────────────────
-1.  BASE FORECAST  — weighted average DRR from historical sales.
-    Recent weeks are weighted more (exponential decay).  As more history
-    accumulates the model automatically improves.
-
-2.  MARKETING UPLIFT  — user enters planned ₹ spend per channel.
-    Uplift is derived from the observed revenue-per-spend ratio (ROAS)
-    from the marketing history already in the system.  When no marketing
-    data exists a conservative default ROAS is applied.
-
-3.  ATTRIBUTION  — every rupee of delta between the "organic" forecast
-    and the "adjusted" forecast is tagged as "Marketing Driven" so the
-    system always knows WHY a prediction changed.
-
-4.  ACTUAL VS PREDICTED  — as the month progresses, actual sales are
-    fetched from the sales table and overlaid on the forecast.
-    Variance is decomposed into:
-        • Organic variance   (market / demand shift)
-        • Marketing variance (spend came in above / below plan)
-
-5.  PERSISTENCE  — plans are saved to a Supabase table
-    `sop_plans` so history accumulates and comparisons survive reruns.
-
-TABLE SCHEMA (run once in Supabase SQL Editor)
-───────────────────────────────────────────────
+Supabase table required (run once):
+────────────────────────────────────
 CREATE TABLE IF NOT EXISTS sop_plans (
-    id              SERIAL PRIMARY KEY,
-    plan_month      TEXT NOT NULL,          -- 'YYYY-MM'
-    channel         TEXT NOT NULL,
-    item_name       TEXT NOT NULL,
-    base_qty_30d    NUMERIC,               -- organic forecast
-    mkt_uplift_qty  NUMERIC,               -- marketing-driven units
-    total_qty_30d   NUMERIC,               -- base + uplift
-    base_rev_30d    NUMERIC,
-    mkt_uplift_rev  NUMERIC,
-    total_rev_30d   NUMERIC,
-    planned_mkt_spend NUMERIC DEFAULT 0,   -- ₹ budget entered by user
-    assumed_roas    NUMERIC DEFAULT 0,
-    created_at      TIMESTAMPTZ DEFAULT NOW(),
-    updated_at      TIMESTAMPTZ DEFAULT NOW(),
+    id SERIAL PRIMARY KEY,
+    plan_month TEXT NOT NULL,
+    channel TEXT NOT NULL,
+    item_name TEXT NOT NULL,
+    base_qty_30d NUMERIC, mkt_uplift_qty NUMERIC, total_qty_30d NUMERIC,
+    base_rev_30d NUMERIC, mkt_uplift_rev NUMERIC, total_rev_30d NUMERIC,
+    planned_mkt_spend NUMERIC DEFAULT 0,
+    assumed_roas NUMERIC DEFAULT 0,
+    organic_assumption TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
     UNIQUE(plan_month, channel, item_name)
 );
 """
-
 from __future__ import annotations
-
+import calendar as _cal
 import math
-from datetime import date, datetime, timedelta
-from typing import Optional
+from datetime import date, timedelta
 
 import numpy as np
 import pandas as pd
-import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CONSTANTS
-# ─────────────────────────────────────────────────────────────────────────────
-
-_DEFAULT_ROAS          = 3.0    # assumed ROAS when no marketing data available
-_DECAY_HALFLIFE_WEEKS  = 4      # recent weeks weighted 2× more than 4-week-old data
-_MIN_HISTORY_DAYS      = 7      # need at least this many days to build a forecast
-_PLAN_TABLE            = "sop_plans"
+_DEFAULT_ROAS         = 3.0
+_DECAY_HALFLIFE_WEEKS = 4
+_MIN_HISTORY_DAYS     = 7
+_PLAN_TABLE           = "sop_plans"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SUPABASE HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _paginate(sb, table: str, select: str) -> list[dict]:
+    rows, page, SZ = [], 0, 1000
+    while True:
+        res = sb.table(table).select(select).range(page * SZ, (page+1)*SZ - 1).execute()
+        if not res.data:
+            break
+        rows.extend(res.data)
+        if len(res.data) < SZ:
+            break
+        page += 1
+    return rows
+
 
 def _load_plan(sb, plan_month: str) -> pd.DataFrame:
     try:
@@ -87,9 +64,7 @@ def _load_plan(sb, plan_month: str) -> pd.DataFrame:
 
 def _save_plan(sb, rows: list[dict]) -> tuple[bool, str]:
     try:
-        sb.table(_PLAN_TABLE).upsert(
-            rows, on_conflict="plan_month,channel,item_name"
-        ).execute()
+        sb.table(_PLAN_TABLE).upsert(rows, on_conflict="plan_month,channel,item_name").execute()
         return True, ""
     except Exception as e:
         return False, str(e)
@@ -97,99 +72,255 @@ def _save_plan(sb, rows: list[dict]) -> tuple[bool, str]:
 
 def _load_all_plans(sb) -> pd.DataFrame:
     try:
-        res = sb.table(_PLAN_TABLE).select("*").execute()
-        return pd.DataFrame(res.data) if res.data else pd.DataFrame()
+        rows = _paginate(sb, _PLAN_TABLE, "*")
+        return pd.DataFrame(rows) if rows else pd.DataFrame()
     except Exception:
         return pd.DataFrame()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MARKETING DB — fetch ROAS and spend calendar
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _get_mkt_supabase():
+    """Return marketing supabase client or None."""
+    try:
+        from supabase import create_client
+        url = st.secrets.get("MARKETING_SUPABASE_URL")
+        key = st.secrets.get("MARKETING_SUPABASE_KEY")
+        if url and key:
+            return create_client(url, key)
+    except Exception:
+        pass
+    return None
+
+
+def _fetch_performance_df(mkt_sb) -> pd.DataFrame:
+    """
+    Fetch ALL rows from marketing `performance` table.
+    Columns used: date, channel, product, spend, sales
+    """
+    try:
+        rows = _paginate(mkt_sb, "performance", "date, channel, product, spend, sales")
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows)
+        df["spend"] = pd.to_numeric(df["spend"], errors="coerce").fillna(0)
+        df["sales"] = pd.to_numeric(df["sales"], errors="coerce").fillna(0)
+        df["date"]  = pd.to_datetime(df["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def _fetch_channel_map(mkt_sb) -> dict[str, str]:
+    """Returns {sales_channel: mkt_channel} from channel_map table."""
+    result = {}
+    try:
+        res = mkt_sb.table("channel_map").select("mkt_channel, sales_channel").execute()
+        if res.data:
+            for row in res.data:
+                result[str(row["sales_channel"])] = str(row["mkt_channel"])
+    except Exception:
+        pass
+    return result
+
+
+def _fetch_product_map(mkt_sb) -> dict[str, str]:
+    """Returns {sales_item: mkt_product} from product_map table."""
+    result = {}
+    try:
+        res = mkt_sb.table("product_map").select("mkt_product, sales_item").execute()
+        if res.data:
+            for row in res.data:
+                result[str(row["sales_item"])] = str(row["mkt_product"])
+    except Exception:
+        pass
+    return result
+
+
+def get_marketing_data(sales_channels: list[str], sales_items: list[str]) -> dict:
+    """
+    Single entry point that fetches everything from the marketing DB.
+
+    Returns dict with keys:
+        perf_df          — full performance DataFrame (date, channel, product, spend, sales)
+        channel_roas     — {sales_channel: roas}
+        product_roas     — {(sales_channel, sales_item): roas}
+        company_roas     — float (aggregate ROAS across all channels/products)
+        roas_source      — {sales_channel: human-readable source string}
+        spend_by_date    — {date_str: total_spend}  (for organic day detection)
+    """
+    empty = dict(
+        perf_df=pd.DataFrame(),
+        channel_roas={},
+        product_roas={},
+        company_roas=None,
+        roas_source={ch: f"No marketing data — default ({_DEFAULT_ROAS:.1f}×)"
+                     for ch in sales_channels},
+        spend_by_date={},
+    )
+
+    mkt_sb = _get_mkt_supabase()
+    if mkt_sb is None:
+        return empty
+
+    perf_df = _fetch_performance_df(mkt_sb)
+    if perf_df.empty:
+        return empty
+
+    ch_map   = _fetch_channel_map(mkt_sb)    # sales_ch → mkt_ch
+    prod_map = _fetch_product_map(mkt_sb)    # sales_item → mkt_product
+
+    # ── Spend calendar ────────────────────────────────────────────────────────
+    spend_by_date = (
+        perf_df[perf_df["spend"] > 0]
+        .groupby("date")["spend"].sum()
+        .to_dict()
+    )
+
+    # ── Company-level ROAS ────────────────────────────────────────────────────
+    tot_spend = perf_df["spend"].sum()
+    tot_sales = perf_df["sales"].sum()
+    company_roas = round(tot_sales / tot_spend, 2) if tot_spend > 0 else None
+
+    # ── Channel-level ROAS (aggregate across all products) ───────────────────
+    channel_roas: dict[str, float] = {}
+    ch_grp = perf_df.groupby("channel")[["spend", "sales"]].sum()
+    for mkt_ch, row in ch_grp.iterrows():
+        if row["spend"] > 0:
+            channel_roas[str(mkt_ch)] = round(row["sales"] / row["spend"], 2)
+
+    # ── Product-level ROAS per channel ────────────────────────────────────────
+    # Key: (sales_channel, sales_item) → ROAS
+    product_roas: dict[tuple, float] = {}
+    if "product" in perf_df.columns:
+        prod_grp = perf_df.groupby(["channel", "product"])[["spend", "sales"]].sum()
+        for (mkt_ch, mkt_prod), row in prod_grp.iterrows():
+            if row["spend"] > 0:
+                product_roas[(str(mkt_ch), str(mkt_prod))] = round(
+                    row["sales"] / row["spend"], 2
+                )
+
+    # ── Map to sales names ────────────────────────────────────────────────────
+    # Build channel_roas and product_roas keyed by SALES channel/item names
+    ch_roas_by_sales: dict[str, float] = {}
+    for sc in sales_channels:
+        mc = ch_map.get(sc, sc)          # translate to mkt channel name
+        if mc in channel_roas:
+            ch_roas_by_sales[sc] = channel_roas[mc]
+        elif sc in channel_roas:
+            ch_roas_by_sales[sc] = channel_roas[sc]
+
+    prod_roas_by_sales: dict[tuple, float] = {}
+    for sc in sales_channels:
+        mc = ch_map.get(sc, sc)
+        for si in sales_items:
+            mp = prod_map.get(si, si)    # translate to mkt product name
+            key_mkt   = (mc, mp)
+            key_sales = (sc, si)
+            if key_mkt in product_roas:
+                prod_roas_by_sales[key_sales] = product_roas[key_mkt]
+            elif (sc, si) in product_roas:
+                prod_roas_by_sales[key_sales] = product_roas[(sc, si)]
+            elif (mc, si) in product_roas:
+                prod_roas_by_sales[key_sales] = product_roas[(mc, si)]
+
+    # ── Build roas_source strings ─────────────────────────────────────────────
+    roas_source = {}
+    for sc in sales_channels:
+        if sc in ch_roas_by_sales:
+            roas_source[sc] = f"Channel history ({ch_roas_by_sales[sc]:.1f}×)"
+        elif company_roas is not None:
+            roas_source[sc] = f"Company average ({company_roas:.1f}×)"
+        else:
+            roas_source[sc] = f"No marketing data — default ({_DEFAULT_ROAS:.1f}×)"
+
+    return dict(
+        perf_df=perf_df,
+        channel_roas=ch_roas_by_sales,
+        product_roas=prod_roas_by_sales,
+        company_roas=company_roas,
+        roas_source=roas_source,
+        spend_by_date=spend_by_date,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FORECASTING ENGINE
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _weighted_drr(daily: pd.Series, halflife_weeks: int = _DECAY_HALFLIFE_WEEKS) -> float:
-    """
-    Compute a decay-weighted average of a daily time series.
-    More recent days contribute more to the estimate.
-    """
-    if daily.empty:
+def _weighted_drr(series: pd.Series) -> float:
+    """Exponential decay weighted average — recent days weigh more."""
+    if series.empty:
         return 0.0
-    n = len(daily)
-    # Exponential weights: newest day = weight 1, oldest = weight e^(-lambda*n)
-    lam = math.log(2) / (halflife_weeks * 7)
-    weights = np.array([math.exp(-lam * (n - 1 - i)) for i in range(n)])
-    weights /= weights.sum()
-    return float(np.dot(weights, daily.fillna(0).values))
+    n   = len(series)
+    lam = math.log(2) / (_DECAY_HALFLIFE_WEEKS * 7)
+    w   = np.array([math.exp(-lam * (n - 1 - i)) for i in range(n)])
+    w  /= w.sum()
+    return float(np.dot(w, series.fillna(0).values))
 
 
 def build_base_forecast(
-    history_df:   pd.DataFrame,
+    history_df: pd.DataFrame,
     forecast_days: int = 30,
-    lookback_days: int = 90,
-    mkt_spend_by_date: dict | None = None,   # {date_str: total_spend} from marketing DB
+    spend_by_date: dict | None = None,
 ) -> pd.DataFrame:
     """
-    Compute a decay-weighted ORGANIC baseline forecast per (channel, item_name).
+    Organic baseline forecast per (channel, item_name).
 
-    ORGANIC DRR LOGIC
-    ─────────────────
-    Total sales on any day = organic + marketing-driven sales.
-    We want the pure organic component so the marketing uplift is not
-    double-counted when we later add it back.
+    KEY DESIGN DECISIONS (all shown transparently to user):
 
-    Strategy (in order of preference):
-      A) Use only zero-spend days (days with no marketing budget) to
-         compute DRR — these are uncontaminated organic observations.
-      B) If A gives < _MIN_HISTORY_DAYS, use all days but deflate DRR
-         by the channel's historical organic_share:
-             organic_share = revenue on zero-spend days / total revenue
-         This preserves the correct SKU × Channel split ratios.
-      C) If zero-spend days don't exist at all, use full DRR as proxy
-         (conservative — will be refined as data accumulates).
+    1. NO LOOKBACK WINDOW — uses every available day of history so
+       even sparse data contributes.  More history = more accurate.
 
-    SKU REVENUE SHARE is computed within each channel so the relative
-    mix is preserved regardless of the absolute DRR level.
+    2. ORGANIC SEPARATION:
+       The performance table tells us which dates had marketing spend.
+       Days with zero spend are "clean" organic observations.
+       Strategy A: ≥7 clean days → use clean-day DRR directly.
+       Strategy B: 1-6 clean days → scale total DRR by organic_share %.
+       Strategy C: 0 clean days (always running ads) → use total DRR
+                   (conservative; labelled clearly).
 
-    Returns DataFrame with columns:
+    3. ORGANIC ASSUMPTION TEXT — every row gets a plain-English string
+       explaining exactly how its forecast was derived.
+
+    4. GROWTH ADJUSTMENT — compares last 30d DRR vs full-history DRR.
+       If last 30d > history avg, applies a weighted growth factor.
+       This makes the number evidence-based, not arbitrary.
+
+    Returns columns:
         channel, item_name,
         base_qty_30d, base_rev_30d,        ← organic forecast
-        total_qty_30d_hist, total_rev_30d_hist,  ← total historical DRR × 30
-        rev_share_in_channel,              ← this SKU's % of channel revenue
-        organic_share,                     ← % of revenue from zero-spend days
-        avg_price, drr_qty, history_days_used
+        hist_monthly_avg_qty,              ← simple monthly average (reference)
+        growth_factor,                     ← applied growth multiplier
+        organic_share, organic_days_used,
+        drr_qty, avg_price,
+        history_days_used, organic_assumption,
+        rev_share_in_channel               ← for budget allocation
     """
     if history_df.empty:
         return pd.DataFrame()
 
     df = history_df.copy()
-
-    # Ensure key columns are plain Python str (not StringDtype with pd.NA)
     for col in ["channel", "item_name"]:
         if col in df.columns:
             df[col] = df[col].astype(object).fillna("").astype(str).str.strip()
-    df = df[df["channel"] != ""]
-    df = df[df["item_name"] != ""]
+    df = df[(df["channel"] != "") & (df["item_name"] != "")]
 
     if "date_dt" not in df.columns:
         df["date_dt"] = pd.to_datetime(df["date"], errors="coerce")
     df = df.dropna(subset=["date_dt"])
 
-    # Use whatever data is available within the lookback window.
-    # If lookback exceeds available history, use all history (no truncation error).
-    latest = df["date_dt"].max().date()
-    cutoff = latest - timedelta(days=lookback_days)
-    df = df[df["date_dt"].dt.date >= cutoff]
-
     if df.empty:
         return pd.DataFrame()
 
-    # Build set of zero-spend dates (dates with no marketing spend)
-    zero_spend_dates: set = set()
-    if mkt_spend_by_date:
-        all_dates_in_window = set(df["date_dt"].dt.strftime("%Y-%m-%d").unique())
-        zero_spend_dates    = all_dates_in_window - set(mkt_spend_by_date.keys())
+    # Zero-spend (organic) dates from marketing DB
+    zero_spend_dates: set[str] = set()
+    if spend_by_date:
+        all_dates = set(df["date_dt"].dt.strftime("%Y-%m-%d").unique())
+        zero_spend_dates = all_dates - set(spend_by_date.keys())
     else:
-        # No marketing data at all → treat all dates as organic
         zero_spend_dates = set(df["date_dt"].dt.strftime("%Y-%m-%d").unique())
 
     rows = []
@@ -202,55 +333,104 @@ def build_base_forecast(
         if history_days < _MIN_HISTORY_DAYS:
             continue
 
-        # ── Total DRR (includes all days) ──────────────────────────────────
+        # ── Full-period weighted DRR ──────────────────────────────────────────
         drr_qty_total = _weighted_drr(daily_qty)
         drr_rev_total = _weighted_drr(daily_rev)
         avg_price     = round(drr_rev_total / drr_qty_total, 2) if drr_qty_total > 0 else 0.0
 
-        # ── Organic DRR ─────────────────────────────────────────────────────
-        zero_mask = pd.Series(
+        # ── Historical monthly average (simple reference, not used in forecast) ─
+        hist_monthly_avg = daily_qty.sum() / max(history_days / 30, 1)
+
+        # ── Recent trend vs history for growth factor ─────────────────────────
+        last30_qty  = daily_qty.iloc[-30:].mean() if len(daily_qty) >= 30 else daily_qty.mean()
+        older_qty   = daily_qty.mean()
+        growth_factor = round(last30_qty / older_qty, 3) if older_qty > 0 else 1.0
+        growth_factor = min(max(growth_factor, 0.5), 2.0)   # cap at 50%–200%
+
+        # ── Organic DRR ────────────────────────────────────────────────────────
+        zero_mask         = pd.Series(
             [d.strftime("%Y-%m-%d") in zero_spend_dates for d in date_range],
             index=date_range,
         )
-        organic_qty_days = daily_qty[zero_mask]
-        organic_rev_days = daily_rev[zero_mask]
+        organic_qty_days  = daily_qty[zero_mask]
+        organic_rev_days  = daily_rev[zero_mask]
+        n_organic_days    = int(zero_mask.sum())
 
-        if len(organic_qty_days) >= _MIN_HISTORY_DAYS:
-            # Strategy A: enough clean days → use zero-spend DRR directly
-            drr_qty_org = _weighted_drr(organic_qty_days)
-            drr_rev_org = _weighted_drr(organic_rev_days)
-            organic_share = (
+        if n_organic_days >= _MIN_HISTORY_DAYS:
+            # Strategy A — clean days only
+            drr_qty_org    = _weighted_drr(organic_qty_days)
+            drr_rev_org    = _weighted_drr(organic_rev_days)
+            organic_share  = (
                 organic_rev_days.sum() / daily_rev.sum()
                 if daily_rev.sum() > 0 else 1.0
             )
-        elif len(organic_qty_days) > 0:
-            # Strategy B: some clean days but < MIN_HISTORY_DAYS
-            # Use organic_share ratio to deflate full-period DRR
-            organic_share = (
+            strategy = "A"
+        elif n_organic_days > 0:
+            # Strategy B — scale by organic share
+            organic_share  = (
                 organic_rev_days.sum() / daily_rev.sum()
                 if daily_rev.sum() > 0 else 1.0
             )
-            drr_qty_org = drr_qty_total * organic_share
-            drr_rev_org = drr_rev_total * organic_share
+            drr_qty_org    = drr_qty_total * organic_share
+            drr_rev_org    = drr_rev_total * organic_share
+            strategy = "B"
         else:
-            # Strategy C: no zero-spend days — use total as proxy
-            organic_share = 1.0
-            drr_qty_org   = drr_qty_total
-            drr_rev_org   = drr_rev_total
+            # Strategy C — all days are ad days, use total as proxy
+            organic_share  = 1.0
+            drr_qty_org    = drr_qty_total
+            drr_rev_org    = drr_rev_total
+            strategy = "C"
+
+        # ── Apply growth factor to organic DRR ────────────────────────────────
+        drr_qty_final = drr_qty_org * growth_factor
+        drr_rev_final = drr_rev_org * growth_factor
+
+        base_qty = round(drr_qty_final * forecast_days, 1)
+        base_rev = round(drr_rev_final * forecast_days, 1)
+
+        # ── Plain-English assumption text ─────────────────────────────────────
+        hist_avg_monthly = round(hist_monthly_avg, 1)
+        if strategy == "A":
+            assumption = (
+                f"Using {n_organic_days} zero-ad days out of {history_days} total. "
+                f"Organic DRR = {drr_qty_org:.2f} units/day. "
+                f"Recent trend vs history: {growth_factor:.2f}× "
+                f"({'↑ growth' if growth_factor > 1.02 else '↓ decline' if growth_factor < 0.98 else '≈ flat'}). "
+                f"Forecast = {drr_qty_org:.2f} × {growth_factor:.2f} × {forecast_days}d = {base_qty:.0f} units. "
+                f"Hist monthly avg: {hist_avg_monthly:.0f} units."
+            )
+        elif strategy == "B":
+            assumption = (
+                f"Only {n_organic_days} zero-ad day(s) available — not enough for direct DRR. "
+                f"Using total DRR ({drr_qty_total:.2f}/day) × organic share ({organic_share:.1%}) = "
+                f"{drr_qty_org:.2f}/day organic. "
+                f"Growth factor {growth_factor:.2f}×. "
+                f"Forecast = {base_qty:.0f} units. "
+                f"Hist monthly avg: {hist_avg_monthly:.0f} units."
+            )
+        else:
+            assumption = (
+                f"No zero-ad days found in {history_days} days of history — "
+                f"marketing ran every day. Using total DRR ({drr_qty_total:.2f}/day) as organic proxy. "
+                f"Growth factor {growth_factor:.2f}×. "
+                f"Forecast = {base_qty:.0f} units. "
+                f"Hist monthly avg: {hist_avg_monthly:.0f} units. "
+                f"⚠️ Upload zero-spend days to improve organic separation."
+            )
 
         rows.append({
-            "channel":               channel,
-            "item_name":             item,
-            "base_qty_30d":          round(drr_qty_org   * forecast_days, 2),
-            "base_rev_30d":          round(drr_rev_org   * forecast_days, 2),
-            "total_qty_30d_hist":    round(drr_qty_total * forecast_days, 2),
-            "total_rev_30d_hist":    round(drr_rev_total * forecast_days, 2),
-            "drr_qty":               round(drr_qty_org,   3),
-            "drr_rev":               round(drr_rev_org,   2),
-            "avg_price":             avg_price,
-            "organic_share":         round(organic_share, 3),
-            "history_days_used":     history_days,
-            "organic_days_used":     int(zero_mask.sum()),
+            "channel":              channel,
+            "item_name":            item,
+            "base_qty_30d":         base_qty,
+            "base_rev_30d":         base_rev,
+            "hist_monthly_avg_qty": round(hist_monthly_avg, 1),
+            "growth_factor":        growth_factor,
+            "organic_share":        round(organic_share, 3),
+            "organic_days_used":    n_organic_days,
+            "drr_qty":              round(drr_qty_org, 3),
+            "avg_price":            avg_price,
+            "history_days_used":    history_days,
+            "organic_assumption":   assumption,
         })
 
     if not rows:
@@ -258,232 +438,94 @@ def build_base_forecast(
 
     result = pd.DataFrame(rows)
 
-    # ── Revenue share within each channel (used for budget allocation) ───────
+    # Revenue share within channel — used to allocate channel budget across SKUs
     chan_total = result.groupby("channel")["base_rev_30d"].transform("sum")
     result["rev_share_in_channel"] = np.where(
         chan_total > 0,
         (result["base_rev_30d"] / chan_total).round(4),
-        1.0 / result.groupby("channel")["base_rev_30d"].transform("count"),
+        (1.0 / result.groupby("channel")["base_rev_30d"].transform("count")),
     )
-
     return result
 
 
 def apply_marketing_uplift(
-    base_df:        pd.DataFrame,
-    channel_budgets: dict[str, float],   # channel → total planned ₹ spend
-    channel_roas:    dict[str, float],   # channel → ROAS
+    base_df:         pd.DataFrame,
+    channel_budgets: dict[str, float],
+    channel_roas:    dict[str, float],
+    product_roas:    dict[tuple, float],
+    company_roas:    float | None,
 ) -> pd.DataFrame:
     """
-    Allocate the per-channel marketing budget across SKUs proportionally
-    to their organic revenue share, then compute incremental uplift.
+    Allocate per-channel budget across SKUs using PRODUCT-LEVEL ROAS from
+    the marketing DB, then compute uplift.
 
-    KEY FIX vs original:
-    ────────────────────
-    The budget is entered at CHANNEL level (e.g. ₹1,00,000 for Swiggy).
-    It must be split across SKUs in proportion to each SKU's share of
-    that channel's organic revenue — NOT given in full to every SKU.
+    Budget allocation:
+        Each SKU within a channel gets a share of the channel budget
+        proportional to:
+          • Product-level ROAS (if available) × organic revenue share
+        This means higher-ROAS products get more budget — which reflects
+        actual marketing performance.
 
-    Formula per SKU:
-        sku_budget     = channel_budget × rev_share_in_channel
-        uplift_rev     = sku_budget × ROAS
-        uplift_qty     = uplift_rev / avg_price
-
-    Attribution:
-        Every rupee of uplift is tagged "marketing-driven" so the split
-        between organic and marketing is always traceable.
+    Uplift:
+        sku_budget  = channel_budget × sku_weight / Σ(sku_weights)
+        uplift_rev  = sku_budget × product_roas (or channel/company fallback)
+        uplift_qty  = uplift_rev / avg_price
     """
     if base_df.empty:
         return base_df
 
     df = base_df.copy()
 
-    # Ensure rev_share_in_channel exists (fallback: equal split)
-    if "rev_share_in_channel" not in df.columns:
-        df["rev_share_in_channel"] = (
-            1.0 / df.groupby("channel")["channel"].transform("count")
-        )
+    # ── Compute allocation weights per SKU ────────────────────────────────────
+    def sku_roas(ch, item):
+        """Best available ROAS for this SKU."""
+        if (ch, item) in product_roas:
+            return product_roas[(ch, item)]
+        if ch in channel_roas:
+            return channel_roas[ch]
+        if company_roas is not None:
+            return company_roas
+        return _DEFAULT_ROAS
 
-    # Allocate budget proportionally across SKUs within each channel
+    df["sku_roas"] = df.apply(lambda r: sku_roas(r["channel"], r["item_name"]), axis=1)
+
+    # Weight = organic_rev_share × sku_roas  (higher-performing SKUs get more budget)
+    df["alloc_weight"] = df["rev_share_in_channel"] * df["sku_roas"]
+
+    # Normalise within channel so weights sum to 1
+    ch_weight_sum = df.groupby("channel")["alloc_weight"].transform("sum")
+    df["budget_share"] = np.where(
+        ch_weight_sum > 0,
+        df["alloc_weight"] / ch_weight_sum,
+        df["rev_share_in_channel"],   # fallback: equal split by revenue
+    )
+
     df["channel_total_budget"] = df["channel"].map(channel_budgets).fillna(0.0)
-    df["planned_mkt_spend"]    = (df["channel_total_budget"] * df["rev_share_in_channel"]).round(2)
-    df["assumed_roas"]         = df["channel"].map(channel_roas).fillna(_DEFAULT_ROAS)
+    df["planned_mkt_spend"]    = (df["channel_total_budget"] * df["budget_share"]).round(2)
+    df["assumed_roas"]         = df["sku_roas"]
 
     df["mkt_uplift_rev"] = (df["planned_mkt_spend"] * df["assumed_roas"]).round(2)
     df["mkt_uplift_qty"] = np.where(
         df["avg_price"] > 0,
-        df["mkt_uplift_rev"] / df["avg_price"],
+        (df["mkt_uplift_rev"] / df["avg_price"]).round(1),
         0.0,
-    ).round(2)
+    )
 
-    df["total_qty_30d"] = (df["base_qty_30d"] + df["mkt_uplift_qty"]).round(2)
-    df["total_rev_30d"] = (df["base_rev_30d"] + df["mkt_uplift_rev"]).round(2)
+    df["total_qty_30d"] = (df["base_qty_30d"] + df["mkt_uplift_qty"]).round(1)
+    df["total_rev_30d"] = (df["base_rev_30d"] + df["mkt_uplift_rev"]).round(1)
 
     return df
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MARKETING ROAS HELPER
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _estimate_roas_from_marketing_db(
-    sb,
-    channels: list[str],
-) -> tuple[dict[str, float], dict[str, str]]:
-    """
-    Compute ROAS estimates from the marketing `performance` table.
-
-    Priority hierarchy (never fall back to hardcoded default if any real data exists):
-      1. Channel-level ROAS  — performance.channel matches sales channel exactly
-                               OR via channel_map (mkt_channel → sales_channel)
-      2. Company-level ROAS  — aggregate across all channels in performance table
-      3. _DEFAULT_ROAS        — only if performance table is empty / unavailable
-
-    Uses ALL available history (no date window cap) so even short histories
-    are utilised rather than ignored.
-
-    Returns:
-        roas_map    — {sales_channel: roas_value}
-        roas_source — {sales_channel: human-readable source label}
-    """
-    roas_map:     dict[str, float] = {}
-    roas_source:  dict[str, str]   = {}
-    channel_roas: dict[str, float] = {}
-    company_roas: float | None     = None
-
-    try:
-        from supabase import create_client
-        mkt_url = st.secrets.get("MARKETING_SUPABASE_URL")
-        mkt_key = st.secrets.get("MARKETING_SUPABASE_KEY")
-        if not mkt_url or not mkt_key:
-            raise KeyError("no marketing secrets")
-        mkt_sb = create_client(mkt_url, mkt_key)
-
-        # ── Fetch all performance records (spend + sales per channel) ─────────
-        # The marketing module uses: table "performance", columns: channel, spend, sales
-        all_rows = []
-        page, PAGE_SIZE = 0, 1000
-        while True:
-            res = mkt_sb.table("performance").select(
-                "channel, spend, sales"
-            ).range(page * PAGE_SIZE, (page + 1) * PAGE_SIZE - 1).execute()
-            if not res.data:
-                break
-            all_rows.extend(res.data)
-            if len(res.data) < PAGE_SIZE:
-                break
-            page += 1
-
-        if all_rows:
-            mdf = pd.DataFrame(all_rows)
-            mdf["spend"] = pd.to_numeric(mdf["spend"], errors="coerce").fillna(0)
-            mdf["sales"] = pd.to_numeric(mdf["sales"], errors="coerce").fillna(0)
-
-            # Channel-level ROAS (using marketing channel names as-is)
-            grp = mdf.groupby("channel")[["spend", "sales"]].sum()
-            for mkt_ch, row in grp.iterrows():
-                if row["spend"] > 0:
-                    channel_roas[str(mkt_ch)] = round(row["sales"] / row["spend"], 2)
-
-            # Company-level ROAS
-            tot_spend = mdf["spend"].sum()
-            tot_sales = mdf["sales"].sum()
-            if tot_spend > 0:
-                company_roas = round(tot_sales / tot_spend, 2)
-
-        # ── Fetch channel_map to translate mkt_channel → sales_channel ────────
-        # e.g. "Swiggy Instamart" in marketing → "Swiggy" in sales
-        reverse_ch_map: dict[str, str] = {}  # sales_channel → mkt_channel
-        try:
-            cmap_res = mkt_sb.table("channel_map").select(
-                "mkt_channel, sales_channel"
-            ).execute()
-            if cmap_res.data:
-                for row in cmap_res.data:
-                    reverse_ch_map[str(row["sales_channel"])] = str(row["mkt_channel"])
-        except Exception:
-            pass
-
-    except Exception:
-        pass
-
-    # ── Assign ROAS to each sales channel ─────────────────────────────────────
-    for ch in channels:
-        # Try exact match first, then via channel_map translation
-        mkt_ch_name = reverse_ch_map.get(ch, ch)   # sales_ch → mkt_ch name
-        if mkt_ch_name in channel_roas:
-            roas_map[ch]    = channel_roas[mkt_ch_name]
-            roas_source[ch] = f"Channel history ({channel_roas[mkt_ch_name]:.1f}×)"
-        elif ch in channel_roas:
-            roas_map[ch]    = channel_roas[ch]
-            roas_source[ch] = f"Channel history ({channel_roas[ch]:.1f}×)"
-        elif company_roas is not None:
-            roas_map[ch]    = company_roas
-            roas_source[ch] = f"Company average ({company_roas:.1f}×)"
-        else:
-            roas_map[ch]    = _DEFAULT_ROAS
-            roas_source[ch] = f"No marketing data — default ({_DEFAULT_ROAS:.1f}×)"
-
-    return roas_map, roas_source
-
-
-def _get_marketing_spend_by_date(sb) -> dict[str, float]:
-    """
-    Return {date_str: total_spend} for all dates that had marketing spend.
-    Used to identify zero-spend (pure organic) days.
-    Empty dict if marketing DB unavailable.
-    """
-    result: dict[str, float] = {}
-    try:
-        from supabase import create_client
-        mkt_url = st.secrets.get("MARKETING_SUPABASE_URL")
-        mkt_key = st.secrets.get("MARKETING_SUPABASE_KEY")
-        if not mkt_url or not mkt_key:
-            return result
-        mkt_sb = create_client(mkt_url, mkt_key)
-        # Uses performance table (same as marketing module): channel, spend, sales, date
-        all_rows = []
-        page, PAGE_SIZE = 0, 1000
-        while True:
-            res = mkt_sb.table("performance").select("date, spend").range(
-                page * PAGE_SIZE, (page + 1) * PAGE_SIZE - 1
-            ).execute()
-            if not res.data:
-                break
-            all_rows.extend(res.data)
-            if len(res.data) < PAGE_SIZE:
-                break
-            page += 1
-        if all_rows:
-            mdf = pd.DataFrame(all_rows)
-            mdf["spend"] = pd.to_numeric(mdf["spend"], errors="coerce").fillna(0)
-            mdf = mdf[mdf["spend"] > 0]
-            if "date" in mdf.columns:
-                mdf["date"] = pd.to_datetime(mdf["date"], errors="coerce").dt.strftime("%Y-%m-%d")
-                result = mdf.groupby("date")["spend"].sum().to_dict()
-    except Exception:
-        pass
-    return result
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ACTUAL vs PREDICTED COMPARISON
+# ACTUAL vs PREDICTED
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_actuals_vs_plan(
-    history_df:  pd.DataFrame,
-    plan_df:     pd.DataFrame,
-    plan_month:  str,                    # 'YYYY-MM'
-    channel_budgets: dict[str, float],   # planned budget per channel
+    history_df: pd.DataFrame,
+    plan_df:    pd.DataFrame,
+    plan_month: str,
 ) -> pd.DataFrame:
-    """
-    Compare plan vs actuals for the current plan month (or any past month).
-
-    Variance decomposition:
-        organic_var  = actual - base_qty_30d          ← demand shift
-        mkt_var      = (actual mkt spend × ROAS) - mkt_uplift_qty  ← spend variance
-    (These two should approximately sum to total variance.)
-    """
     if history_df.empty or plan_df.empty:
         return pd.DataFrame()
 
@@ -492,42 +534,33 @@ def build_actuals_vs_plan(
         df["date_dt"] = pd.to_datetime(df["date"], errors="coerce")
     df = df.dropna(subset=["date_dt"])
 
-    year, month = int(plan_month[:4]), int(plan_month[5:7])
-    month_mask = (df["date_dt"].dt.year == year) & (df["date_dt"].dt.month == month)
+    yr, mo = int(plan_month[:4]), int(plan_month[5:7])
+    mask   = (df["date_dt"].dt.year == yr) & (df["date_dt"].dt.month == mo)
     actuals = (
-        df[month_mask]
+        df[mask]
         .groupby(["channel", "item_name"])
-        .agg(actual_qty=("qty_sold", "sum"), actual_rev=("revenue", "sum"))
+        .agg(actual_qty=("qty_sold","sum"), actual_rev=("revenue","sum"))
         .reset_index()
     )
 
-    merged = plan_df.merge(actuals, on=["channel", "item_name"], how="outer")
-    for col in ["base_qty_30d", "mkt_uplift_qty", "total_qty_30d",
-                "base_rev_30d", "mkt_uplift_rev", "total_rev_30d",
-                "planned_mkt_spend", "assumed_roas",
-                "actual_qty", "actual_rev"]:
+    merged = plan_df.merge(actuals, on=["channel","item_name"], how="outer")
+    for col in ["base_qty_30d","mkt_uplift_qty","total_qty_30d",
+                "base_rev_30d","mkt_uplift_rev","total_rev_30d",
+                "planned_mkt_spend","assumed_roas","actual_qty","actual_rev"]:
         if col not in merged.columns:
             merged[col] = 0.0
         merged[col] = merged[col].fillna(0.0)
 
-    # Days elapsed in plan month (for progress context)
     today = date.today()
-    if today.year == year and today.month == month:
-        days_elapsed = today.day
-    else:
-        import calendar
-        days_elapsed = calendar.monthrange(year, month)[1]
+    dim   = _cal.monthrange(yr, mo)[1]
+    days_elapsed = today.day if (today.year == yr and today.month == mo) else dim
 
-    merged["days_elapsed"]    = days_elapsed
-    merged["total_variance"]  = (merged["actual_qty"] - merged["total_qty_30d"]).round(2)
-    merged["organic_var"]     = (merged["actual_qty"] - merged["base_qty_30d"]).round(2)
-    merged["mkt_var"]         = (merged["mkt_uplift_qty"]).round(2)  # proxy: planned uplift
-    merged["attainment_pct"]  = np.where(
-        merged["total_qty_30d"] > 0,
-        (merged["actual_qty"] / merged["total_qty_30d"] * 100).round(1),
-        0.0,
-    )
-
+    merged["days_elapsed"]   = days_elapsed
+    merged["prorated_plan"]  = (merged["total_qty_30d"] * days_elapsed / dim).round(1)
+    merged["variance"]       = (merged["actual_qty"] - merged["prorated_plan"]).round(1)
+    merged["attainment_pct"] = np.where(
+        merged["prorated_plan"] > 0,
+        (merged["actual_qty"] / merged["prorated_plan"] * 100).round(1), 0.0)
     return merged
 
 
@@ -535,78 +568,59 @@ def build_actuals_vs_plan(
 # HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _month_options(history_df: pd.DataFrame, future_months: int = 2) -> list[str]:
-    """Return months from earliest history to N months ahead, newest first."""
+def _month_options(df: pd.DataFrame, future: int = 2) -> list[str]:
     today = date.today()
-    end   = date(today.year + (today.month + future_months - 1) // 12,
-                 (today.month + future_months - 1) % 12 + 1, 1)
-    if not history_df.empty and "date_dt" in history_df.columns:
-        start = history_df["date_dt"].min().date().replace(day=1)
-    else:
-        start = date(today.year, today.month, 1)
-
-    months = []
-    cur = start
+    end   = date(today.year + (today.month + future - 1) // 12,
+                 (today.month + future - 1) % 12 + 1, 1)
+    start = df["date_dt"].min().date().replace(day=1) if not df.empty else today.replace(day=1)
+    months, cur = [], start
     while cur <= end:
         months.append(cur.strftime("%Y-%m"))
-        # Advance one month
         m = cur.month + 1
         y = cur.year + (m - 1) // 12
-        m = (m - 1) % 12 + 1
-        cur = date(y, m, 1)
-
+        cur = date(y, (m - 1) % 12 + 1, 1)
     return sorted(months, reverse=True)
 
 
-def _fmt_num(v, prefix="₹", decimals=0) -> str:
-    if v >= 1_00_000:
-        return f"{prefix}{v/1_00_000:.1f}L"
-    if v >= 1_000:
-        return f"{prefix}{v/1_000:.1f}K"
-    return f"{prefix}{v:,.{decimals}f}"
+def _fmt(v: float, prefix="₹") -> str:
+    if v >= 1_00_000: return f"{prefix}{v/1_00_000:.1f}L"
+    if v >= 1_000:    return f"{prefix}{v/1_000:.1f}K"
+    return f"{prefix}{v:,.0f}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MAIN RENDER FUNCTION
+# RENDER
 # ─────────────────────────────────────────────────────────────────────────────
 
-def render_sop_tab(
-    supabase_client,
-    history_df:      pd.DataFrame,
-    master_skus_df:  pd.DataFrame,
-    master_chans_df: pd.DataFrame,
-    role:            str,
-) -> None:
+def render_sop_tab(supabase_client, history_df, master_skus_df, master_chans_df, role):
     st.subheader("📋 S&OP — Sales & Operations Planning")
-    st.caption(
-        "30-day product-level demand forecast, marketing budget planning, "
-        "and actual vs predicted tracking. As history grows, predictions improve automatically."
-    )
+    st.caption("30-day demand forecast with transparent organic assumptions and marketing uplift per product.")
 
     if history_df.empty:
-        st.info("No sales data available yet. Upload data via Smart Upload first.")
+        st.info("No sales data yet. Upload data via Smart Upload first.")
         return
 
-    # Ensure date_dt parsed
     df = history_df.copy()
+    for col in ["channel", "item_name"]:
+        if col in df.columns:
+            df[col] = df[col].astype(object).fillna("").astype(str).str.strip()
+    df = df[(df["channel"] != "") & (df["item_name"] != "")]
     if "date_dt" not in df.columns:
         df["date_dt"] = pd.to_datetime(df["date"], errors="coerce")
-        df = df.dropna(subset=["date_dt"])
+    df = df.dropna(subset=["date_dt"])
 
-    channels     = sorted(df["channel"].unique().tolist())
-    all_items    = sorted(df["item_name"].unique().tolist())
-    month_opts   = _month_options(df, future_months=2)
-    today        = date.today()
-    current_month = today.strftime("%Y-%m")
+    if df.empty:
+        st.warning("Sales data found but no valid dates. Check data format.")
+        return
 
-    # ── Section selector ──────────────────────────────────────────────────────
-    section = st.radio(
-        "View:",
-        ["📊 Forecast & Plan", "📈 Actual vs Predicted", "📚 Plan History"],
-        horizontal=True,
-        key="sop_section",
-    )
+    channels    = sorted(df["channel"].unique())
+    items       = sorted(df["item_name"].unique())
+    month_opts  = _month_options(df)
+    today       = date.today()
+    cur_month   = today.strftime("%Y-%m")
 
+    section = st.radio("View:", ["📊 Forecast & Plan", "📈 Actual vs Predicted", "📚 Plan History"],
+                       horizontal=True, key="sop_section")
     st.divider()
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -614,246 +628,238 @@ def render_sop_tab(
     # ══════════════════════════════════════════════════════════════════════════
     if section == "📊 Forecast & Plan":
 
-        # ── Plan month picker ─────────────────────────────────────────────────
         plan_month = st.selectbox(
             "Plan month", month_opts,
-            index=month_opts.index(current_month) if current_month in month_opts else 0,
+            index=month_opts.index(cur_month) if cur_month in month_opts else 0,
             key="sop_plan_month",
         )
 
-        # ── Lookback window for forecast ──────────────────────────────────────
-        lookback = st.select_slider(
-            "Historical window for forecast",
-            options=[30, 45, 60, 90, 120],
-            value=60,
-            key="sop_lookback",
-            help="How many past days to use when computing the baseline DRR. "
-                 "Longer windows are more stable; shorter ones react faster to trends.",
-        )
+        sel_channels = st.multiselect("Channels", channels, default=channels, key="sop_channels")
+        if not sel_channels:
+            st.warning("Select at least one channel.")
+            return
 
-        # ── Build base forecast ───────────────────────────────────────────────
-        # Build marketing spend calendar (which dates had spend) for organic separation
-        with st.spinner("Fetching marketing spend calendar…"):
-            mkt_spend_by_date = _get_marketing_spend_by_date(supabase_client)
+        # ── Fetch ALL marketing data upfront ──────────────────────────────────
+        with st.spinner("Loading marketing performance data…"):
+            mkt = get_marketing_data(sel_channels, items)
 
-        with st.spinner("Building baseline forecast…"):
+        # ── Build base forecast (NO lookback window — uses all history) ───────
+        with st.spinner("Building organic baseline forecast…"):
             try:
-                base_df = build_base_forecast(
-                    df, forecast_days=30, lookback_days=lookback,
-                    mkt_spend_by_date=mkt_spend_by_date,
-                )
-            except Exception as _e:
-                st.error(f"Forecast error: {_e}")
+                base_df = build_base_forecast(df, forecast_days=30,
+                                              spend_by_date=mkt["spend_by_date"])
+            except Exception as e:
+                st.error(f"Forecast error: {e}")
                 base_df = pd.DataFrame()
 
         if base_df.empty:
-            st.warning(f"Not enough history (need ≥ {_MIN_HISTORY_DAYS} days per SKU-channel). Upload more data.")
+            st.warning(f"Not enough history (need ≥ {_MIN_HISTORY_DAYS} days per SKU-channel).")
             return
 
-        # ── Channel filters ───────────────────────────────────────────────────
-        sel_channels = st.multiselect(
-            "Channels to include", channels, default=channels, key="sop_channels"
-        )
         base_df = base_df[base_df["channel"].isin(sel_channels)]
-
         if base_df.empty:
             st.warning("No forecast data for selected channels.")
             return
 
         # ── Marketing budget inputs ───────────────────────────────────────────
-        st.markdown("#### 💰 Marketing Budget Plan (₹)")
+        st.markdown("#### 💰 Marketing Budget Plan")
         st.caption(
-            "Enter planned marketing spend per channel for the forecast month. "
-            "Leave 0 for organic-only forecast. "
-            "The system uses historical ROAS to convert spend → incremental units."
+            "Enter total planned spend per channel. Budget is automatically allocated "
+            "across products proportional to their historical ROAS contribution — "
+            "higher-performing products receive more budget."
         )
 
-        # Try to load ROAS from marketing DB; fall back to defaults
-        with st.spinner("Fetching historical ROAS…"):
-            roas_map, roas_source = _estimate_roas_from_marketing_db(supabase_client, sel_channels)
-
-        budget_cols = st.columns(min(len(sel_channels), 4))
+        ncols = min(len(sel_channels), 4)
+        bcols = st.columns(ncols)
         channel_budgets: dict[str, float] = {}
         channel_roas_overrides: dict[str, float] = {}
 
         for i, ch in enumerate(sel_channels):
-            with budget_cols[i % len(budget_cols)]:
+            with bcols[i % ncols]:
                 st.markdown(f"**{ch}**")
-                budget = st.number_input(
-                    f"Spend (₹)", min_value=0.0, step=1000.0,
-                    value=0.0, key=f"sop_budget_{ch}",
+                st.caption(f"📊 {mkt['roas_source'].get(ch, 'No data')}")
+                roas_val = mkt["channel_roas"].get(ch,
+                           mkt["company_roas"] if mkt["company_roas"] else _DEFAULT_ROAS)
+                channel_budgets[ch] = st.number_input(
+                    "Budget (₹)", min_value=0.0, step=1000.0, value=0.0,
+                    key=f"sop_budget_{ch}",
                 )
-                roas_default = roas_map.get(ch, _DEFAULT_ROAS)
-                roas_label   = roas_source.get(ch, "Default")
-                st.caption(f"📊 {roas_label}")
-                roas_override = st.number_input(
-                    f"ROAS", min_value=0.1, step=0.1,
-                    value=float(roas_default),
+                channel_roas_overrides[ch] = st.number_input(
+                    "Channel ROAS", min_value=0.1, step=0.1,
+                    value=float(round(roas_val, 1)),
                     key=f"sop_roas_{ch}",
-                    help=f"Source: {roas_label}. Edit to model a different scenario.",
+                    help="Override ROAS if needed. Product-level ROAS from marketing DB is used per SKU.",
                 )
-                channel_budgets[ch]       = budget
-                channel_roas_overrides[ch] = roas_override
 
         # ── Apply marketing uplift ────────────────────────────────────────────
-        forecast_df = apply_marketing_uplift(base_df, channel_budgets, channel_roas_overrides)
+        forecast_df = apply_marketing_uplift(
+            base_df, channel_budgets, channel_roas_overrides,
+            mkt["product_roas"], mkt["company_roas"],
+        )
 
         total_budget = sum(channel_budgets.values())
-        has_marketing = total_budget > 0
 
         # ── Top-line metrics ──────────────────────────────────────────────────
         st.divider()
         st.markdown(f"#### 📊 30-Day Forecast — {plan_month}")
-
         m1, m2, m3, m4, m5 = st.columns(5)
-        m1.metric(
-            "Organic Units",
-            f"{forecast_df['base_qty_30d'].sum():,.0f}",
-            help="Units expected from organic demand alone",
-        )
-        m2.metric(
-            "Mkt-Driven Units",
-            f"{forecast_df['mkt_uplift_qty'].sum():,.0f}",
-            delta=f"+{forecast_df['mkt_uplift_qty'].sum():,.0f}" if has_marketing else None,
-            help="Incremental units from planned marketing spend",
-        )
-        m3.metric(
-            "Total Units",
-            f"{forecast_df['total_qty_30d'].sum():,.0f}",
-        )
-        m4.metric(
-            "Total Revenue",
-            _fmt_num(forecast_df["total_rev_30d"].sum()),
-        )
-        m5.metric(
-            "Marketing Budget",
-            _fmt_num(total_budget),
-            help="Total planned spend across all channels",
+        m1.metric("Organic Units",   f"{forecast_df['base_qty_30d'].sum():,.0f}")
+        m2.metric("Mkt-Driven Units",f"{forecast_df['mkt_uplift_qty'].sum():,.0f}",
+                  delta=f"+{forecast_df['mkt_uplift_qty'].sum():,.0f}" if total_budget > 0 else None)
+        m3.metric("Total Units",     f"{forecast_df['total_qty_30d'].sum():,.0f}")
+        m4.metric("Total Revenue",   _fmt(forecast_df["total_rev_30d"].sum()))
+        m5.metric("Marketing Budget",_fmt(total_budget))
+
+        # ── Product × Channel pivot table ─────────────────────────────────────
+        st.divider()
+        st.markdown("#### 📦 Product × Channel Forecast Table")
+
+        view = st.radio(
+            "Show values as:",
+            ["Total Units", "Total Revenue (₹)", "Organic Units", "Organic Revenue (₹)",
+             "Marketing Units", "Marketing Revenue (₹)"],
+            horizontal=True, key="sop_pivot_view",
         )
 
-        # ── Product × Channel pivot tables ───────────────────────────────────
-        st.markdown("##### 📦 Product × Channel Forecast")
-        st.caption(
-            "Each cell = 30-day forecast for that SKU on that channel. "
-            "Switch views to see Total Units, Revenue, Organic-only, or Organic %."
-        )
+        col_map = {
+            "Total Units":             "total_qty_30d",
+            "Total Revenue (₹)":       "total_rev_30d",
+            "Organic Units":           "base_qty_30d",
+            "Organic Revenue (₹)":     "base_rev_30d",
+            "Marketing Units":         "mkt_uplift_qty",
+            "Marketing Revenue (₹)":   "mkt_uplift_rev",
+        }
+        is_rev = "Revenue" in view
+        val_col = col_map[view]
 
-        pivot_metric = st.radio(
-            "Pivot view:", ["Total Units", "Total Revenue (₹)", "Organic Units", "Organic %"],
-            horizontal=True, key="sop_pivot_metric",
-        )
-
-        def _build_pivot(df, val_col):
-            if df.empty:
-                return pd.DataFrame()
+        if val_col in forecast_df.columns:
             piv = (
-                df.pivot_table(index="item_name", columns="channel",
-                               values=val_col, aggfunc="sum")
+                forecast_df
+                .pivot_table(index="item_name", columns="channel",
+                             values=val_col, aggfunc="sum")
                 .fillna(0)
+                .round(0 if is_rev else 1)
             )
             piv["TOTAL"] = piv.sum(axis=1)
-            return piv.sort_values("TOTAL", ascending=False)
+            piv = piv.sort_values("TOTAL", ascending=False)
 
-        if pivot_metric == "Total Units":
-            piv = _build_pivot(forecast_df, "total_qty_30d")
-            fmt = {c: "{:,.1f}" for c in piv.columns}
-            color_subset = [c for c in piv.columns if c != "TOTAL"]
-        elif pivot_metric == "Total Revenue (₹)":
-            piv = _build_pivot(forecast_df, "total_rev_30d")
-            fmt = {c: "₹{:,.0f}" for c in piv.columns}
-            color_subset = [c for c in piv.columns if c != "TOTAL"]
-        elif pivot_metric == "Organic Units":
-            piv = _build_pivot(forecast_df, "base_qty_30d")
-            fmt = {c: "{:,.1f}" for c in piv.columns}
-            color_subset = [c for c in piv.columns if c != "TOTAL"]
-        else:  # Organic %
-            piv_base  = _build_pivot(forecast_df, "base_qty_30d")
-            piv_total = _build_pivot(forecast_df, "total_qty_30d")
-            piv = (piv_base / piv_total.replace(0, np.nan) * 100).fillna(0).round(1)
-            fmt = {c: "{:.1f}%" for c in piv.columns}
-            color_subset = [c for c in piv.columns if c != "TOTAL"]
+            ch_totals = piv.sum().rename("CHANNEL TOTAL")
+            piv_display = pd.concat([piv, ch_totals.to_frame().T])
 
-        if not piv.empty:
+            fmt_str = "₹{:,.0f}" if is_rev else "{:,.1f}"
+            color_cols = [c for c in piv.columns if c != "TOTAL"]
+
             st.dataframe(
-                piv.style.format(fmt).background_gradient(
-                    cmap="Blues", axis=None, subset=color_subset
-                ),
+                piv_display.style
+                    .format(fmt_str)
+                    .background_gradient(cmap="Blues", axis=None,
+                                         subset=pd.IndexSlice[piv.index, color_cols]),
                 use_container_width=True,
             )
 
+        # ── Detailed assumptions table ─────────────────────────────────────────
         st.divider()
-
-        # ── Detailed assumptions table ────────────────────────────────────────
-        st.markdown("##### 🔍 Detailed Assumptions by SKU × Channel")
+        st.markdown("#### 🔍 Organic Forecast Assumptions — How Each Number Was Built")
         st.caption(
-            "Shows exactly how each number was built: "
-            "organic DRR from zero-spend days, ROAS source, budget allocated."
+            "Every organic forecast is built from actual history. "
+            "The 'Assumption' column explains the exact logic used for that SKU × Channel."
         )
 
-        detail_cols = [
+        assump_cols = [
             "channel", "item_name",
-            "base_qty_30d", "mkt_uplift_qty", "total_qty_30d",
-            "organic_share", "drr_qty", "avg_price",
-            "planned_mkt_spend", "assumed_roas",
-            "organic_days_used", "history_days_used",
+            "base_qty_30d", "hist_monthly_avg_qty", "growth_factor",
+            "drr_qty", "organic_share", "organic_days_used", "history_days_used",
+            "organic_assumption",
         ]
-        show_cols = [c for c in detail_cols if c in forecast_df.columns]
-        col_rename = {
+        assump_show = [c for c in assump_cols if c in forecast_df.columns]
+        assump_rename = {
             "channel": "Channel", "item_name": "SKU",
-            "base_qty_30d": "Organic Units", "mkt_uplift_qty": "Mkt Units",
-            "total_qty_30d": "Total Units",
-            "organic_share": "Organic %", "drr_qty": "Organic DRR/day",
-            "avg_price": "Avg Price (₹)",
-            "planned_mkt_spend": "Budget Allocated (₹)", "assumed_roas": "ROAS Used",
-            "organic_days_used": "Organic Days", "history_days_used": "History Days",
+            "base_qty_30d": "Organic Forecast",
+            "hist_monthly_avg_qty": "Hist Monthly Avg",
+            "growth_factor": "Growth Factor",
+            "drr_qty": "Organic DRR/day",
+            "organic_share": "Organic %",
+            "organic_days_used": "Organic Days",
+            "history_days_used": "Total History Days",
+            "organic_assumption": "Assumption",
         }
-        disp = (
-            forecast_df[show_cols]
-            .rename(columns=col_rename)
-            .sort_values(["Channel", "Total Units"], ascending=[True, False])
+        assump_df = (
+            forecast_df[assump_show]
+            .rename(columns=assump_rename)
+            .sort_values(["Channel", "Organic Forecast"], ascending=[True, False])
         )
         st.dataframe(
-            disp.style.format({
-                "Organic Units": "{:,.1f}", "Mkt Units": "{:,.1f}", "Total Units": "{:,.1f}",
-                "Organic %": "{:.1%}", "Organic DRR/day": "{:.2f}",
-                "Avg Price (₹)": "₹{:.1f}",
-                "Budget Allocated (₹)": "₹{:,.0f}", "ROAS Used": "{:.2f}×",
-            }).bar(subset=["Total Units"], color="#4C8BF5"),
+            assump_df.style.format({
+                "Organic Forecast": "{:,.1f}",
+                "Hist Monthly Avg": "{:,.1f}",
+                "Growth Factor": "{:.2f}×",
+                "Organic DRR/day": "{:.2f}",
+                "Organic %": "{:.1%}",
+            }),
             use_container_width=True, hide_index=True,
         )
 
-                # ── Save plan ─────────────────────────────────────────────────────────
-        if role == "admin":
+        # ── Marketing allocation table ─────────────────────────────────────────
+        if total_budget > 0:
             st.divider()
-            st.markdown("#### 💾 Save Plan")
+            st.markdown("#### 💸 Marketing Budget Allocation by Product")
             st.caption(
-                "Saving locks in this forecast as the plan for the selected month. "
-                "It will be used as the baseline for Actual vs Predicted tracking."
+                "Budget is split across products by ROAS contribution "
+                "(product ROAS × organic revenue share). "
+                "Higher-performing products receive more budget."
+            )
+            mkt_cols = ["channel", "item_name", "planned_mkt_spend", "assumed_roas",
+                        "mkt_uplift_rev", "mkt_uplift_qty", "rev_share_in_channel"]
+            mkt_show = [c for c in mkt_cols if c in forecast_df.columns]
+            mkt_df = (
+                forecast_df[mkt_show]
+                .rename(columns={
+                    "channel": "Channel", "item_name": "SKU",
+                    "planned_mkt_spend": "Budget Allocated (₹)",
+                    "assumed_roas": "ROAS Used",
+                    "mkt_uplift_rev": "Incremental Rev (₹)",
+                    "mkt_uplift_qty": "Incremental Units",
+                    "rev_share_in_channel": "Revenue Share in Ch",
+                })
+                .sort_values(["Channel", "Budget Allocated (₹)"], ascending=[True, False])
+            )
+            st.dataframe(
+                mkt_df.style.format({
+                    "Budget Allocated (₹)": "₹{:,.0f}",
+                    "ROAS Used": "{:.2f}×",
+                    "Incremental Rev (₹)": "₹{:,.0f}",
+                    "Incremental Units": "{:,.1f}",
+                    "Revenue Share in Ch": "{:.1%}",
+                }),
+                use_container_width=True, hide_index=True,
             )
 
+        # ── Save plan ──────────────────────────────────────────────────────────
+        if role == "admin":
+            st.divider()
             if st.button("💾 Save Plan to Cloud", key="sop_save_plan"):
                 rows = []
                 for _, r in forecast_df.iterrows():
                     rows.append({
-                        "plan_month":       plan_month,
-                        "channel":          r["channel"],
-                        "item_name":        r["item_name"],
-                        "base_qty_30d":     float(r["base_qty_30d"]),
-                        "mkt_uplift_qty":   float(r.get("mkt_uplift_qty", 0)),
-                        "total_qty_30d":    float(r.get("total_qty_30d", r["base_qty_30d"])),
-                        "base_rev_30d":     float(r["base_rev_30d"]),
-                        "mkt_uplift_rev":   float(r.get("mkt_uplift_rev", 0)),
-                        "total_rev_30d":    float(r.get("total_rev_30d", r["base_rev_30d"])),
-                        "planned_mkt_spend": float(channel_budgets.get(r["channel"], 0)),
-                        "assumed_roas":      float(channel_roas_overrides.get(r["channel"], _DEFAULT_ROAS)),
+                        "plan_month":         plan_month,
+                        "channel":            r["channel"],
+                        "item_name":          r["item_name"],
+                        "base_qty_30d":       float(r["base_qty_30d"]),
+                        "mkt_uplift_qty":     float(r.get("mkt_uplift_qty", 0)),
+                        "total_qty_30d":      float(r.get("total_qty_30d", r["base_qty_30d"])),
+                        "base_rev_30d":       float(r["base_rev_30d"]),
+                        "mkt_uplift_rev":     float(r.get("mkt_uplift_rev", 0)),
+                        "total_rev_30d":      float(r.get("total_rev_30d", r["base_rev_30d"])),
+                        "planned_mkt_spend":  float(channel_budgets.get(r["channel"], 0)),
+                        "assumed_roas":       float(r.get("assumed_roas", _DEFAULT_ROAS)),
+                        "organic_assumption": str(r.get("organic_assumption", "")),
                     })
-
                 ok, err = _save_plan(supabase_client, rows)
                 if ok:
-                    st.success(f"✅ Plan for {plan_month} saved — {len(rows)} SKU-channel records.")
+                    st.success(f"✅ Plan for {plan_month} saved — {len(rows)} records.")
                 else:
                     st.error(f"Save failed: {err}")
-                    st.info("If the `sop_plans` table doesn't exist yet, run the SQL in the module docstring in Supabase.")
+                    st.info("Ensure the `sop_plans` table exists in Supabase (see module docstring).")
 
     # ══════════════════════════════════════════════════════════════════════════
     # SECTION 2 — ACTUAL vs PREDICTED
@@ -861,271 +867,159 @@ def render_sop_tab(
     elif section == "📈 Actual vs Predicted":
 
         plan_month_avp = st.selectbox(
-            "Select plan month to review",
-            month_opts, key="sop_avp_month",
-            index=month_opts.index(current_month) if current_month in month_opts else 0,
+            "Select plan month", month_opts, key="sop_avp_month",
+            index=month_opts.index(cur_month) if cur_month in month_opts else 0,
         )
 
-        with st.spinner("Loading saved plan…"):
-            plan_df = _load_plan(supabase_client, plan_month_avp)
-
+        plan_df = _load_plan(supabase_client, plan_month_avp)
         if plan_df.empty:
-            st.info(
-                f"No saved plan found for {plan_month_avp}. "
-                "Go to **Forecast & Plan**, build a forecast and save it first."
-            )
+            st.info(f"No saved plan for {plan_month_avp}. Build and save a plan first.")
             return
 
-        year, month = int(plan_month_avp[:4]), int(plan_month_avp[5:7])
-        import calendar as _cal
-        days_in_month = _cal.monthrange(year, month)[1]
-        is_current = (today.year == year and today.month == month)
-        days_elapsed = today.day if is_current else days_in_month
-        pct_elapsed  = days_elapsed / days_in_month * 100
+        yr, mo      = int(plan_month_avp[:4]), int(plan_month_avp[5:7])
+        dim         = _cal.monthrange(yr, mo)[1]
+        is_current  = (today.year == yr and today.month == mo)
+        days_el     = today.day if is_current else dim
+        pct_el      = days_el / dim * 100
 
         st.info(
-            f"📅 {_cal.month_name[month]} {year} — "
-            f"**{days_elapsed} of {days_in_month} days elapsed** ({pct_elapsed:.0f}%)"
-            + (" ← month in progress" if is_current else " ← month complete")
+            f"📅 {_cal.month_name[mo]} {yr} — "
+            f"**{days_el}/{dim} days elapsed ({pct_el:.0f}%)**"
+            + (" ← in progress" if is_current else " ← complete")
         )
 
-        # Load budgets from plan
-        channel_budgets_avp = (
-            plan_df.groupby("channel")["planned_mkt_spend"].first().to_dict()
-        )
-        avp_df = build_actuals_vs_plan(df, plan_df, plan_month_avp, channel_budgets_avp)
-
+        avp_df = build_actuals_vs_plan(df, plan_df, plan_month_avp)
         if avp_df.empty:
-            st.warning("Could not build comparison. Check data.")
+            st.warning("Could not build comparison.")
             return
 
-        # Pro-rate plan to days elapsed for fair comparison
-        avp_df["prorated_plan"] = (avp_df["total_qty_30d"] * days_elapsed / days_in_month).round(1)
-        avp_df["vs_prorated"]   = (avp_df["actual_qty"] - avp_df["prorated_plan"]).round(1)
-
-        # ── Top metrics ───────────────────────────────────────────────────────
         tot_plan   = avp_df["prorated_plan"].sum()
         tot_actual = avp_df["actual_qty"].sum()
-        tot_var    = tot_actual - tot_plan
-        attain_pct = (tot_actual / tot_plan * 100) if tot_plan > 0 else 0
+        attain     = (tot_actual / tot_plan * 100) if tot_plan > 0 else 0
 
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Pro-rated Plan", f"{tot_plan:,.0f} units",
-                  help=f"Full-month plan × ({days_elapsed}/{days_in_month} days)")
+        m1.metric("Pro-rated Plan", f"{tot_plan:,.0f} units")
         m2.metric("Actual to Date", f"{tot_actual:,.0f} units")
-        m3.metric("Variance", f"{tot_var:+,.0f} units",
-                  delta=f"{tot_var:+,.0f}", delta_color="normal")
-        m4.metric("Attainment", f"{attain_pct:.1f}%",
-                  delta=f"{attain_pct-100:+.1f}pp vs plan")
+        m3.metric("Variance",       f"{tot_actual - tot_plan:+,.0f} units",
+                  delta=f"{tot_actual - tot_plan:+,.0f}", delta_color="normal")
+        m4.metric("Attainment",     f"{attain:.1f}%",
+                  delta=f"{attain - 100:+.1f}pp")
 
         st.divider()
 
-        # ── Waterfall chart — variance decomposition ──────────────────────────
-        st.markdown("#### 🔍 Variance Decomposition")
-        st.caption(
-            "Green = marketing-driven uplift was planned. "
-            "Blue = organic demand variance. "
-            "Total bar = actual vs full-month plan."
+        # Attainment pivot — Product × Channel
+        st.markdown("#### 📋 Attainment: Actual vs Plan by Product × Channel")
+        avp_view = st.radio(
+            "Show:", ["Actual Units", "Plan Units", "Variance", "Attainment %"],
+            horizontal=True, key="sop_avp_view",
         )
+        avp_col_map = {
+            "Actual Units":  "actual_qty",
+            "Plan Units":    "prorated_plan",
+            "Variance":      "variance",
+            "Attainment %":  "attainment_pct",
+        }
+        vc = avp_col_map[avp_view]
+        if vc in avp_df.columns:
+            apiv = (
+                avp_df.pivot_table(index="item_name", columns="channel",
+                                   values=vc, aggfunc="sum")
+                .fillna(0).round(1)
+            )
+            apiv["TOTAL"] = apiv.sum(axis=1)
+            apiv = apiv.sort_values("TOTAL", ascending=False)
+            is_pct = "%" in avp_view
+            afmt   = "{:.1f}%" if is_pct else "{:+.1f}" if "Variance" in avp_view else "{:,.1f}"
+            color_cols = [c for c in apiv.columns if c != "TOTAL"]
+            cmap = "RdYlGn" if "Variance" in avp_view or "Attainment" in avp_view else "Blues"
+            st.dataframe(
+                apiv.style.format(afmt)
+                    .background_gradient(cmap=cmap, axis=None,
+                                         subset=pd.IndexSlice[apiv.index, color_cols]),
+                use_container_width=True,
+            )
 
-        ch_avp = avp_df.groupby("channel").agg(
-            prorated_plan=("prorated_plan", "sum"),
-            actual_qty=("actual_qty", "sum"),
-            mkt_uplift_qty=("mkt_uplift_qty", "sum"),
-        ).reset_index()
-        ch_avp["organic_base"]  = ch_avp["prorated_plan"] - ch_avp["mkt_uplift_qty"] * days_elapsed / days_in_month
-        ch_avp["organic_var"]   = ch_avp["actual_qty"] - ch_avp["organic_base"]
-        ch_avp["mkt_var"]       = ch_avp["mkt_uplift_qty"] * days_elapsed / days_in_month
-
-        fig_waterfall = go.Figure()
-        fig_waterfall.add_bar(
-            name="Organic Base",
-            x=ch_avp["channel"], y=ch_avp["organic_base"].round(0),
-            marker_color="#4C8BF5",
-        )
-        fig_waterfall.add_bar(
-            name="Mkt Uplift (planned)",
-            x=ch_avp["channel"], y=ch_avp["mkt_var"].round(0),
-            marker_color="#F4A261",
-        )
-        fig_waterfall.add_bar(
-            name="Organic Variance",
-            x=ch_avp["channel"], y=ch_avp["organic_var"].round(0),
-            marker_color=["#2E9E4F" if v >= 0 else "#E63946" for v in ch_avp["organic_var"]],
-        )
-        fig_waterfall.update_layout(
-            barmode="stack", height=380,
-            xaxis_title="Channel", yaxis_title="Units",
-            legend=dict(orientation="h", yanchor="bottom", y=1.02),
-            margin=dict(t=40),
-        )
-        st.plotly_chart(fig_waterfall, use_container_width=True)
-
-        # ── Attainment table ──────────────────────────────────────────────────
-        st.markdown("#### 📋 SKU × Channel Attainment")
-
-        avp_display = avp_df[[
-            "channel", "item_name",
-            "prorated_plan", "actual_qty", "vs_prorated", "attainment_pct",
-            "base_qty_30d", "mkt_uplift_qty", "total_qty_30d",
-        ]].copy().rename(columns={
-            "channel": "Channel", "item_name": "SKU",
-            "prorated_plan": "Plan (pro-rated)", "actual_qty": "Actual",
-            "vs_prorated": "Variance", "attainment_pct": "Attainment %",
-            "base_qty_30d": "Full Organic Plan", "mkt_uplift_qty": "Mkt Uplift Plan",
-            "total_qty_30d": "Full Month Plan",
-        }).sort_values(["Channel", "Actual"], ascending=[True, False])
-
-        def _color_var(v):
-            if isinstance(v, (int, float)):
-                return "color: green" if v >= 0 else "color: red"
-            return ""
-
-        st.dataframe(
-            avp_display.style.format({
-                "Plan (pro-rated)": "{:,.1f}", "Actual": "{:,.1f}",
-                "Variance": "{:+,.1f}", "Attainment %": "{:.1f}%",
-                "Full Organic Plan": "{:,.1f}", "Mkt Uplift Plan": "{:,.1f}",
-                "Full Month Plan": "{:,.1f}",
-            }).map(_color_var, subset=["Variance"]),
-            use_container_width=True, hide_index=True,
-        )
-
-        # ── Trend chart — daily actuals vs implied daily plan ─────────────────
+        # Daily trajectory chart
         st.markdown("#### 📅 Daily Actuals vs Plan Trajectory")
-
-        month_mask = (df["date_dt"].dt.year == year) & (df["date_dt"].dt.month == month)
-        daily_actuals = (
-            df[month_mask]
-            .groupby("date_dt")[["qty_sold", "revenue"]]
-            .sum()
-            .reset_index()
-            .sort_values("date_dt")
-        )
-
-        if not daily_actuals.empty:
-            daily_plan_units = avp_df["total_qty_30d"].sum() / days_in_month
-
-            fig_trend = go.Figure()
-            fig_trend.add_bar(
-                x=daily_actuals["date_dt"], y=daily_actuals["qty_sold"],
-                name="Actual Units", marker_color="#4C8BF5", opacity=0.7,
-            )
-            fig_trend.add_hline(
-                y=daily_plan_units, line_dash="dash", line_color="#E63946",
-                annotation_text=f"Daily Plan ({daily_plan_units:.1f} units)",
-                annotation_position="top right",
-            )
-            # Cumulative actual vs plan line
-            daily_actuals["cum_actual"] = daily_actuals["qty_sold"].cumsum()
-            cum_plan = [(i + 1) * daily_plan_units for i in range(len(daily_actuals))]
-            fig_trend.add_scatter(
-                x=daily_actuals["date_dt"], y=daily_actuals["cum_actual"],
-                name="Cumulative Actual", mode="lines+markers",
-                line=dict(color="#2E9E4F", width=2), yaxis="y2",
-            )
-            fig_trend.add_scatter(
-                x=daily_actuals["date_dt"], y=cum_plan,
-                name="Cumulative Plan", mode="lines",
-                line=dict(color="#E63946", width=2, dash="dot"), yaxis="y2",
-            )
-            fig_trend.update_layout(
-                height=420, barmode="overlay",
-                yaxis=dict(title="Daily Units"),
-                yaxis2=dict(title="Cumulative Units", overlaying="y", side="right"),
-                legend=dict(orientation="h", yanchor="bottom", y=1.02),
-                hovermode="x unified",
-            )
-            st.plotly_chart(fig_trend, use_container_width=True)
+        mm = (df["date_dt"].dt.year == yr) & (df["date_dt"].dt.month == mo)
+        da = df[mm].groupby("date_dt")[["qty_sold","revenue"]].sum().reset_index().sort_values("date_dt")
+        if not da.empty:
+            daily_plan = avp_df["total_qty_30d"].sum() / dim
+            da["cum_actual"] = da["qty_sold"].cumsum()
+            cum_plan = [(i+1)*daily_plan for i in range(len(da))]
+            fig = go.Figure()
+            fig.add_bar(x=da["date_dt"], y=da["qty_sold"], name="Actual", marker_color="#4C8BF5", opacity=0.7)
+            fig.add_hline(y=daily_plan, line_dash="dash", line_color="#E63946",
+                          annotation_text=f"Daily Plan ({daily_plan:.1f})")
+            fig.add_scatter(x=da["date_dt"], y=da["cum_actual"], name="Cumulative Actual",
+                            mode="lines+markers", line=dict(color="#2E9E4F", width=2), yaxis="y2")
+            fig.add_scatter(x=da["date_dt"], y=cum_plan, name="Cumulative Plan",
+                            mode="lines", line=dict(color="#E63946", width=2, dash="dot"), yaxis="y2")
+            fig.update_layout(height=400, yaxis=dict(title="Daily Units"),
+                              yaxis2=dict(title="Cumulative", overlaying="y", side="right"),
+                              legend=dict(orientation="h", y=1.1), hovermode="x unified")
+            st.plotly_chart(fig, use_container_width=True)
         else:
-            st.info(f"No sales data recorded yet for {_cal.month_name[month]} {year}.")
+            st.info(f"No sales data yet for {_cal.month_name[mo]} {yr}.")
 
     # ══════════════════════════════════════════════════════════════════════════
     # SECTION 3 — PLAN HISTORY
     # ══════════════════════════════════════════════════════════════════════════
     else:
         st.markdown("#### 📚 All Saved S&OP Plans")
-
-        with st.spinner("Loading plan history…"):
-            all_plans = _load_all_plans(supabase_client)
-
+        all_plans = _load_all_plans(supabase_client)
         if all_plans.empty:
-            st.info("No plans saved yet. Go to Forecast & Plan and save a plan first.")
+            st.info("No plans saved yet.")
             return
 
-        # Summary by month
         summary = (
             all_plans.groupby("plan_month").agg(
-                sku_channels=("item_name", "count"),
-                total_organic=("base_qty_30d", "sum"),
-                total_mkt_uplift=("mkt_uplift_qty", "sum"),
-                total_plan=("total_qty_30d", "sum"),
-                total_rev=("total_rev_30d", "sum"),
-                total_budget=("planned_mkt_spend", "sum"),
+                records     =("item_name", "count"),
+                organic_qty =("base_qty_30d", "sum"),
+                mkt_qty     =("mkt_uplift_qty", "sum"),
+                total_qty   =("total_qty_30d", "sum"),
+                total_rev   =("total_rev_30d", "sum"),
+                budget      =("planned_mkt_spend", "sum"),
             ).reset_index().sort_values("plan_month", ascending=False)
         )
-
         st.dataframe(
             summary.rename(columns={
-                "plan_month": "Month", "sku_channels": "SKU-Channels",
-                "total_organic": "Organic Units", "total_mkt_uplift": "Mkt Units",
-                "total_plan": "Total Units", "total_rev": "Total Rev (₹)",
-                "total_budget": "Mkt Budget (₹)",
+                "plan_month":"Month","records":"SKU-Ch",
+                "organic_qty":"Organic Units","mkt_qty":"Mkt Units",
+                "total_qty":"Total Units","total_rev":"Total Rev (₹)","budget":"Budget (₹)",
             }).style.format({
-                "Organic Units": "{:,.0f}", "Mkt Units": "{:,.0f}",
-                "Total Units": "{:,.0f}", "Total Rev (₹)": "₹{:,.0f}",
-                "Mkt Budget (₹)": "₹{:,.0f}",
+                "Organic Units":"{:,.0f}","Mkt Units":"{:,.0f}","Total Units":"{:,.0f}",
+                "Total Rev (₹)":"₹{:,.0f}","Budget (₹)":"₹{:,.0f}",
             }),
             use_container_width=True, hide_index=True,
         )
 
-        # Trend chart across saved plans
-        if len(summary) >= 2:
-            fig_hist = px.bar(
-                summary.sort_values("plan_month"),
-                x="plan_month", y=["total_organic", "total_mkt_uplift"],
-                barmode="stack", height=350,
-                color_discrete_map={
-                    "total_organic":     "#4C8BF5",
-                    "total_mkt_uplift":  "#F4A261",
-                },
-                labels={"plan_month": "Month", "value": "Units", "variable": "Type"},
-            )
-            fig_hist.update_layout(
-                legend=dict(orientation="h", yanchor="bottom", y=1.02),
-                margin=dict(t=40),
-            )
-            st.plotly_chart(fig_hist, use_container_width=True)
+        drill = st.selectbox("Drill into month", all_plans["plan_month"].unique(), key="sop_drill")
+        ddf   = all_plans[all_plans["plan_month"] == drill]
 
-        # Drill into a specific plan month
-        st.markdown("#### 🔎 Drill into a Plan Month")
-        drill_month = st.selectbox(
-            "Select month", all_plans["plan_month"].unique().tolist(),
-            key="sop_drill_month",
+        drill_view = st.radio(
+            "Show:", ["Total Units","Total Revenue (₹)","Organic Units","Organic Revenue (₹)"],
+            horizontal=True, key="sop_drill_view",
         )
-        drill_df = all_plans[all_plans["plan_month"] == drill_month].copy()
-        st.dataframe(
-            drill_df[[
-                "channel", "item_name", "base_qty_30d", "mkt_uplift_qty",
-                "total_qty_30d", "total_rev_30d", "planned_mkt_spend", "assumed_roas",
-            ]].rename(columns={
-                "channel": "Channel", "item_name": "SKU",
-                "base_qty_30d": "Organic", "mkt_uplift_qty": "Mkt Uplift",
-                "total_qty_30d": "Total Units", "total_rev_30d": "Total Rev (₹)",
-                "planned_mkt_spend": "Budget (₹)", "assumed_roas": "ROAS",
-            }).style.format({
-                "Organic": "{:,.1f}", "Mkt Uplift": "{:,.1f}",
-                "Total Units": "{:,.1f}", "Total Rev (₹)": "₹{:,.0f}",
-                "Budget (₹)": "₹{:,.0f}", "ROAS": "{:.1f}",
-            }),
-            use_container_width=True, hide_index=True,
-        )
+        dvcm = {"Total Units":"total_qty_30d","Total Revenue (₹)":"total_rev_30d",
+                "Organic Units":"base_qty_30d","Organic Revenue (₹)":"base_rev_30d"}
+        dvc  = dvcm[drill_view]
+        if dvc in ddf.columns:
+            dpiv = (
+                ddf.pivot_table(index="item_name", columns="channel",
+                                values=dvc, aggfunc="sum")
+                .fillna(0).round(1 if "Units" in drill_view else 0)
+            )
+            dpiv["TOTAL"] = dpiv.sum(axis=1)
+            dpiv = dpiv.sort_values("TOTAL", ascending=False)
+            dfmt = "₹{:,.0f}" if "Revenue" in drill_view else "{:,.1f}"
+            st.dataframe(dpiv.style.format(dfmt), use_container_width=True)
 
         if role == "admin":
-            if st.button("🗑️ Delete this plan", key="sop_delete_plan"):
+            if st.button("🗑️ Delete this plan", key="sop_delete"):
                 try:
-                    supabase_client.table(_PLAN_TABLE).delete().eq("plan_month", drill_month).execute()
-                    st.success(f"Deleted plan for {drill_month}.")
+                    supabase_client.table(_PLAN_TABLE).delete().eq("plan_month", drill).execute()
+                    st.success(f"Deleted plan for {drill}.")
                     st.rerun()
                 except Exception as e:
                     st.error(f"Delete failed: {e}")
