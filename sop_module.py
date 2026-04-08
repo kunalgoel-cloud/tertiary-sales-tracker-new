@@ -318,12 +318,25 @@ def apply_marketing_uplift(
 # MARKETING ROAS HELPER
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _estimate_roas_from_marketing_db(sb, channels: list[str]) -> tuple[dict[str, float], dict[str, str]]:
+def _estimate_roas_from_marketing_db(
+    sb,
+    channels: list[str],
+) -> tuple[dict[str, float], dict[str, str]]:
     """
-    Try to pull historical ROAS from the marketing supabase DB.
-    Falls back to _DEFAULT_ROAS per channel if unavailable.
+    Compute ROAS estimates with a strict priority hierarchy:
+      1. Channel-level ROAS from marketing DB (ALL available history)
+      2. Company-level ROAS from marketing DB (aggregate across all channels)
+      3. Hardcoded _DEFAULT_ROAS  ← only if absolutely no data exists anywhere
+
+    Returns:
+        roas_map    — {channel: roas_value}
+        roas_source — {channel: human-readable source label}
     """
-    roas_map: dict[str, float] = {}
+    roas_map:    dict[str, float] = {}
+    roas_source: dict[str, str]   = {}
+    channel_roas: dict[str, float] = {}
+    company_roas: float | None     = None
+
     try:
         from supabase import create_client
         mkt_url = st.secrets.get("MARKETING_SUPABASE_URL")
@@ -331,26 +344,44 @@ def _estimate_roas_from_marketing_db(sb, channels: list[str]) -> tuple[dict[str,
         if not mkt_url or not mkt_key:
             raise ValueError("no marketing secrets")
         mkt_sb = create_client(mkt_url, mkt_key)
-        # Pull last 90 days of spend + sales from marketing DB
+
+        # Fetch ALL campaign records — no date filter so partial history is used
         res = mkt_sb.table("campaigns").select(
             "channel, total_spend, attributed_revenue"
         ).execute()
+
         if res.data:
             mdf = pd.DataFrame(res.data)
-            mdf["total_spend"]         = pd.to_numeric(mdf["total_spend"],         errors="coerce").fillna(0)
-            mdf["attributed_revenue"]  = pd.to_numeric(mdf["attributed_revenue"],  errors="coerce").fillna(0)
+            mdf["total_spend"]        = pd.to_numeric(mdf["total_spend"],        errors="coerce").fillna(0)
+            mdf["attributed_revenue"] = pd.to_numeric(mdf["attributed_revenue"], errors="coerce").fillna(0)
+
+            # Channel-level ROAS
             grp = mdf.groupby("channel")[["total_spend", "attributed_revenue"]].sum()
             for ch, row in grp.iterrows():
                 if row["total_spend"] > 0:
-                    roas_map[ch] = round(row["attributed_revenue"] / row["total_spend"], 2)
+                    channel_roas[ch] = round(row["attributed_revenue"] / row["total_spend"], 2)
+
+            # Company-level ROAS (aggregate)
+            tot_spend = mdf["total_spend"].sum()
+            tot_rev   = mdf["attributed_revenue"].sum()
+            if tot_spend > 0:
+                company_roas = round(tot_rev / tot_spend, 2)
     except Exception:
         pass
 
-    # Fill missing channels with default
+    # Assign ROAS using priority hierarchy
     for ch in channels:
-        if ch not in roas_map:
-            roas_map[ch] = _DEFAULT_ROAS
-    return roas_map
+        if ch in channel_roas:
+            roas_map[ch]    = channel_roas[ch]
+            roas_source[ch] = f"Channel history ({channel_roas[ch]:.1f}×)"
+        elif company_roas is not None:
+            roas_map[ch]    = company_roas
+            roas_source[ch] = f"Company average ({company_roas:.1f}×)"
+        else:
+            roas_map[ch]    = _DEFAULT_ROAS
+            roas_source[ch] = f"Default — no marketing data ({_DEFAULT_ROAS:.1f}×)"
+
+    return roas_map, roas_source
 
 
 def _get_marketing_spend_by_date(sb) -> dict[str, float]:
