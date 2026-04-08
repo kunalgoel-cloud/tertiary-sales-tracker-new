@@ -16,9 +16,19 @@ CREATE TABLE IF NOT EXISTS sop_plans (
     planned_mkt_spend NUMERIC DEFAULT 0,
     assumed_roas NUMERIC DEFAULT 0,
     organic_assumption TEXT,
+    growth_factor NUMERIC DEFAULT 1,
+    growth_factor_model NUMERIC DEFAULT 1,
+    growth_overridden BOOLEAN DEFAULT FALSE,
+    roas_overridden BOOLEAN DEFAULT FALSE,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     UNIQUE(plan_month, channel, item_name)
 );
+
+-- If the table already exists, add the new columns with:
+-- ALTER TABLE sop_plans ADD COLUMN IF NOT EXISTS growth_factor NUMERIC DEFAULT 1;
+-- ALTER TABLE sop_plans ADD COLUMN IF NOT EXISTS growth_factor_model NUMERIC DEFAULT 1;
+-- ALTER TABLE sop_plans ADD COLUMN IF NOT EXISTS growth_overridden BOOLEAN DEFAULT FALSE;
+-- ALTER TABLE sop_plans ADD COLUMN IF NOT EXISTS roas_overridden BOOLEAN DEFAULT FALSE;
 """
 from __future__ import annotations
 import calendar as _cal
@@ -332,6 +342,7 @@ def build_base_forecast(
     history_df: pd.DataFrame,
     forecast_days: int = 30,
     spend_by_date: dict | None = None,
+    growth_overrides: dict | None = None,
 ) -> pd.DataFrame:
     """
     Organic baseline forecast per (channel, item_name).
@@ -411,8 +422,17 @@ def build_base_forecast(
         # ── Recent trend vs history for growth factor ─────────────────────────
         last30_qty  = daily_qty.iloc[-30:].mean() if len(daily_qty) >= 30 else daily_qty.mean()
         older_qty   = daily_qty.mean()
-        growth_factor = round(last30_qty / older_qty, 3) if older_qty > 0 else 1.0
-        growth_factor = min(max(growth_factor, 0.5), 2.0)   # cap at 50%–200%
+        growth_factor_model = round(last30_qty / older_qty, 3) if older_qty > 0 else 1.0
+        growth_factor_model = min(max(growth_factor_model, 0.5), 2.0)   # cap at 50%–200%
+
+        # Apply user override if provided (still cap at 0.1×–5.0× for sanity)
+        _override_key = (channel, item)
+        if growth_overrides and _override_key in growth_overrides:
+            growth_factor = min(max(float(growth_overrides[_override_key]), 0.1), 5.0)
+            growth_overridden = True
+        else:
+            growth_factor = growth_factor_model
+            growth_overridden = False
 
         # ── Organic DRR ────────────────────────────────────────────────────────
         zero_mask         = pd.Series(
@@ -492,6 +512,8 @@ def build_base_forecast(
             "base_rev_30d":         base_rev,
             "hist_monthly_avg_qty": round(hist_monthly_avg, 1),
             "growth_factor":        growth_factor,
+            "growth_factor_model":  growth_factor_model,
+            "growth_overridden":    growth_overridden,
             "organic_share":        round(organic_share, 3),
             "organic_days_used":    n_organic_days,
             "drr_qty":              round(drr_qty_org, 3),
@@ -516,11 +538,12 @@ def build_base_forecast(
 
 
 def apply_marketing_uplift(
-    base_df:         pd.DataFrame,
-    channel_budgets: dict[str, float],
-    channel_roas:    dict[str, float],
-    product_roas:    dict[tuple, float],
-    company_roas:    float | None,
+    base_df:           pd.DataFrame,
+    channel_budgets:   dict[str, float],
+    channel_roas:      dict[str, float],
+    product_roas:      dict[tuple, float],
+    company_roas:      float | None,
+    sku_roas_overrides: dict | None = None,
 ) -> pd.DataFrame:
     """
     Allocate per-channel budget across SKUs using PRODUCT-LEVEL ROAS from
@@ -532,6 +555,9 @@ def apply_marketing_uplift(
           • Product-level ROAS (if available) × organic revenue share
         This means higher-ROAS products get more budget — which reflects
         actual marketing performance.
+
+    sku_roas_overrides: {(channel, item_name): float}
+        User-edited ROAS values that take precedence over all other sources.
 
     Uplift:
         sku_budget  = channel_budget × sku_weight / Σ(sku_weights)
@@ -545,7 +571,9 @@ def apply_marketing_uplift(
 
     # ── Compute allocation weights per SKU ────────────────────────────────────
     def sku_roas(ch, item):
-        """Best available ROAS for this SKU."""
+        """Best available ROAS for this SKU (user override takes top priority)."""
+        if sku_roas_overrides and (ch, item) in sku_roas_overrides:
+            return sku_roas_overrides[(ch, item)]
         if (ch, item) in product_roas:
             return product_roas[(ch, item)]
         if ch in channel_roas:
@@ -555,6 +583,10 @@ def apply_marketing_uplift(
         return _DEFAULT_ROAS
 
     df["sku_roas"] = df.apply(lambda r: sku_roas(r["channel"], r["item_name"]), axis=1)
+    df["roas_overridden"] = df.apply(
+        lambda r: bool(sku_roas_overrides and (r["channel"], r["item_name"]) in sku_roas_overrides),
+        axis=1,
+    )
 
     # Weight = organic_rev_share × sku_roas  (higher-performing SKUs get more budget)
     df["alloc_weight"] = df["rev_share_in_channel"] * df["sku_roas"]
@@ -710,11 +742,20 @@ def render_sop_tab(supabase_client, history_df, master_skus_df, master_chans_df,
         with st.spinner("Loading marketing performance data…"):
             mkt = get_marketing_data(sel_channels, items)
 
-        # ── Build base forecast (NO lookback window — uses all history) ───────
+        # ── Session-state keys for overrides (persist until page refresh) ─────
+        _gf_key   = f"sop_growth_overrides_{plan_month}"
+        _roas_key = f"sop_roas_overrides_{plan_month}"
+        if _gf_key   not in st.session_state: st.session_state[_gf_key]   = {}
+        if _roas_key not in st.session_state: st.session_state[_roas_key] = {}
+
+        # ── Build base forecast (uses session growth overrides) ───────────────
         with st.spinner("Building organic baseline forecast…"):
             try:
-                base_df = build_base_forecast(df, forecast_days=30,
-                                              spend_by_date=mkt["spend_by_date"])
+                base_df = build_base_forecast(
+                    df, forecast_days=30,
+                    spend_by_date=mkt["spend_by_date"],
+                    growth_overrides=st.session_state[_gf_key],
+                )
             except Exception as e:
                 st.error(f"Forecast error: {e}")
                 base_df = pd.DataFrame()
@@ -758,10 +799,11 @@ def render_sop_tab(supabase_client, history_df, master_skus_df, master_chans_df,
                     help="Override ROAS if needed. Product-level ROAS from marketing DB is used per SKU.",
                 )
 
-        # ── Apply marketing uplift ────────────────────────────────────────────
+        # ── Apply marketing uplift (uses session ROAS overrides per SKU) ──────
         forecast_df = apply_marketing_uplift(
             base_df, channel_budgets, channel_roas_overrides,
             mkt["product_roas"], mkt["company_roas"],
+            sku_roas_overrides=st.session_state[_roas_key],
         )
 
         total_budget = sum(channel_budgets.values())
@@ -825,6 +867,74 @@ def render_sop_tab(supabase_client, history_df, master_skus_df, master_chans_df,
                 use_container_width=True,
             )
 
+        # ── Editable Growth Factor table ──────────────────────────────────────
+        st.divider()
+        st.markdown("#### ✏️ Growth Factor Assumptions")
+        st.caption(
+            "**How growth factor is calculated:** The model computes the average daily units "
+            "sold over the last 30 days vs. the full history average. "
+            "If the last 30d average is 20% higher than the overall average, "
+            "growth factor = 1.20×. It is capped between 0.50× and 2.00× to prevent extremes. "
+            "You can override it below — your changes persist until the page is refreshed."
+        )
+
+        gf_editor_cols = ["channel", "item_name", "growth_factor_model",
+                          "growth_factor", "drr_qty", "base_qty_30d", "history_days_used"]
+        gf_show = [c for c in gf_editor_cols if c in forecast_df.columns]
+        gf_rename = {
+            "channel": "Channel", "item_name": "SKU",
+            "growth_factor_model": "Model GF",
+            "growth_factor": "Applied GF ✏️",
+            "drr_qty": "Organic DRR/day",
+            "base_qty_30d": "Organic Forecast",
+            "history_days_used": "History Days",
+        }
+        gf_edit_df = (
+            forecast_df[gf_show]
+            .rename(columns=gf_rename)
+            .sort_values(["Channel", "Organic Forecast"], ascending=[True, False])
+            .reset_index(drop=True)
+        )
+
+        edited_gf = st.data_editor(
+            gf_edit_df,
+            use_container_width=True,
+            hide_index=True,
+            key="sop_gf_editor",
+            column_config={
+                "Channel":          st.column_config.TextColumn(disabled=True),
+                "SKU":              st.column_config.TextColumn(disabled=True),
+                "Model GF":         st.column_config.NumberColumn(
+                                        "Model GF", format="%.3f×",
+                                        help="Model-computed growth factor (last 30d avg ÷ full history avg, capped 0.5–2.0)",
+                                        disabled=True),
+                "Applied GF ✏️":    st.column_config.NumberColumn(
+                                        "Applied GF ✏️", format="%.3f×",
+                                        min_value=0.1, max_value=5.0, step=0.05,
+                                        help="Edit to override. Values outside 0.1–5.0 are clamped."),
+                "Organic DRR/day":  st.column_config.NumberColumn(format="%.3f", disabled=True),
+                "Organic Forecast": st.column_config.NumberColumn(format="%.1f units", disabled=True),
+                "History Days":     st.column_config.NumberColumn(disabled=True),
+            },
+        )
+
+        # Detect edits and persist to session state
+        if edited_gf is not None:
+            new_gf_overrides = {}
+            for _, row in edited_gf.iterrows():
+                ch, sku = row["Channel"], row["SKU"]
+                applied = float(row["Applied GF ✏️"])
+                # Look up model value from forecast_df
+                model_rows = forecast_df[
+                    (forecast_df["channel"] == ch) & (forecast_df["item_name"] == sku)
+                ]
+                model_val = float(model_rows["growth_factor_model"].iloc[0]) if not model_rows.empty else applied
+                if abs(applied - model_val) > 0.001:  # user changed it
+                    new_gf_overrides[(ch, sku)] = applied
+            if new_gf_overrides != st.session_state[_gf_key]:
+                st.session_state[_gf_key] = new_gf_overrides
+                st.rerun()
+
         # ── Detailed assumptions table ─────────────────────────────────────────
         st.divider()
         st.markdown("#### 🔍 Organic Forecast Assumptions — How Each Number Was Built")
@@ -860,47 +970,97 @@ def render_sop_tab(supabase_client, history_df, master_skus_df, master_chans_df,
             assump_df.style.format({
                 "Organic Forecast": "{:,.1f}",
                 "Hist Monthly Avg": "{:,.1f}",
-                "Growth Factor": "{:.2f}×",
-                "Organic DRR/day": "{:.2f}",
+                "Growth Factor": "{:.3f}×",
+                "Organic DRR/day": "{:.3f}",
                 "Organic %": "{:.1%}",
             }),
             use_container_width=True, hide_index=True,
         )
 
-        # ── Marketing allocation table ─────────────────────────────────────────
+        # ── Marketing allocation table (editable ROAS per SKU) ────────────────
         if total_budget > 0:
             st.divider()
             st.markdown("#### 💸 Marketing Budget Allocation by Product")
             st.caption(
                 "Budget is split across products by ROAS contribution "
                 "(product ROAS × organic revenue share). "
-                "Higher-performing products receive more budget."
+                "Higher-performing products receive more budget. "
+                "**Edit the ROAS column** to test assumptions — changes persist until page refresh."
             )
-            mkt_cols = ["channel", "item_name", "planned_mkt_spend", "assumed_roas",
-                        "mkt_uplift_rev", "mkt_uplift_qty", "rev_share_in_channel"]
+            mkt_cols = ["channel", "item_name", "planned_mkt_spend", "sku_roas",
+                        "mkt_uplift_rev", "mkt_uplift_qty", "rev_share_in_channel", "roas_overridden"]
             mkt_show = [c for c in mkt_cols if c in forecast_df.columns]
-            mkt_df = (
+            mkt_edit_df = (
                 forecast_df[mkt_show]
                 .rename(columns={
                     "channel": "Channel", "item_name": "SKU",
                     "planned_mkt_spend": "Budget Allocated (₹)",
-                    "assumed_roas": "ROAS Used",
+                    "sku_roas": "ROAS ✏️",
                     "mkt_uplift_rev": "Incremental Rev (₹)",
                     "mkt_uplift_qty": "Incremental Units",
                     "rev_share_in_channel": "Revenue Share in Ch",
+                    "roas_overridden": "User Edited?",
                 })
                 .sort_values(["Channel", "Budget Allocated (₹)"], ascending=[True, False])
+                .reset_index(drop=True)
             )
-            st.dataframe(
-                mkt_df.style.format({
-                    "Budget Allocated (₹)": "₹{:,.0f}",
-                    "ROAS Used": "{:.2f}×",
-                    "Incremental Rev (₹)": "₹{:,.0f}",
-                    "Incremental Units": "{:,.1f}",
-                    "Revenue Share in Ch": "{:.1%}",
-                }),
-                use_container_width=True, hide_index=True,
+
+            edited_mkt = st.data_editor(
+                mkt_edit_df,
+                use_container_width=True,
+                hide_index=True,
+                key="sop_mkt_editor",
+                column_config={
+                    "Channel":              st.column_config.TextColumn(disabled=True),
+                    "SKU":                  st.column_config.TextColumn(disabled=True),
+                    "Budget Allocated (₹)": st.column_config.NumberColumn(format="₹%.0f", disabled=True),
+                    "ROAS ✏️":              st.column_config.NumberColumn(
+                                                "ROAS ✏️", format="%.2f×",
+                                                min_value=0.1, max_value=50.0, step=0.1,
+                                                help="Edit to override ROAS for this SKU. "
+                                                     "Affects budget allocation weight and incremental revenue."),
+                    "Incremental Rev (₹)":  st.column_config.NumberColumn(format="₹%.0f", disabled=True),
+                    "Incremental Units":    st.column_config.NumberColumn(format="%.1f", disabled=True),
+                    "Revenue Share in Ch":  st.column_config.NumberColumn(format="%.1%", disabled=True),
+                    "User Edited?":         st.column_config.CheckboxColumn(disabled=True),
+                },
             )
+
+            # Detect ROAS edits and persist to session state
+            if edited_mkt is not None:
+                new_roas_overrides = dict(st.session_state[_roas_key])  # start from existing
+                for _, row in edited_mkt.iterrows():
+                    ch, sku = row["Channel"], row["SKU"]
+                    edited_roas = float(row["ROAS ✏️"])
+                    # Compare against what the model computed (before any override)
+                    base_rows = forecast_df[
+                        (forecast_df["channel"] == ch) & (forecast_df["item_name"] == sku)
+                    ]
+                    if not base_rows.empty:
+                        # model ROAS = sku_roas ignoring overrides
+                        def _model_roas(r):
+                            if (r["channel"], r["item_name"]) in mkt["product_roas"]:
+                                return mkt["product_roas"][(r["channel"], r["item_name"])]
+                            if r["channel"] in channel_roas_overrides:
+                                return channel_roas_overrides[r["channel"]]
+                            if mkt["company_roas"] is not None:
+                                return mkt["company_roas"]
+                            return _DEFAULT_ROAS
+                        model_roas_val = float(_model_roas(base_rows.iloc[0]))
+                        if abs(edited_roas - model_roas_val) > 0.005:
+                            new_roas_overrides[(ch, sku)] = edited_roas
+                        elif (ch, sku) in new_roas_overrides:
+                            # User reset back to model value — remove override
+                            del new_roas_overrides[(ch, sku)]
+                if new_roas_overrides != st.session_state[_roas_key]:
+                    st.session_state[_roas_key] = new_roas_overrides
+                    st.rerun()
+
+            # Show override summary if any
+            if st.session_state[_roas_key]:
+                n_ov = len(st.session_state[_roas_key])
+                st.info(f"ℹ️ {n_ov} SKU ROAS override(s) active for {plan_month}. "
+                        "Refresh the page to reset all overrides.")
 
         # ── Save plan ──────────────────────────────────────────────────────────
         if role == "admin":
@@ -909,22 +1069,31 @@ def render_sop_tab(supabase_client, history_df, master_skus_df, master_chans_df,
                 rows = []
                 for _, r in forecast_df.iterrows():
                     rows.append({
-                        "plan_month":         plan_month,
-                        "channel":            r["channel"],
-                        "item_name":          r["item_name"],
-                        "base_qty_30d":       float(r["base_qty_30d"]),
-                        "mkt_uplift_qty":     float(r.get("mkt_uplift_qty", 0)),
-                        "total_qty_30d":      float(r.get("total_qty_30d", r["base_qty_30d"])),
-                        "base_rev_30d":       float(r["base_rev_30d"]),
-                        "mkt_uplift_rev":     float(r.get("mkt_uplift_rev", 0)),
-                        "total_rev_30d":      float(r.get("total_rev_30d", r["base_rev_30d"])),
-                        "planned_mkt_spend":  float(channel_budgets.get(r["channel"], 0)),
-                        "assumed_roas":       float(r.get("assumed_roas", _DEFAULT_ROAS)),
-                        "organic_assumption": str(r.get("organic_assumption", "")),
+                        "plan_month":           plan_month,
+                        "channel":              r["channel"],
+                        "item_name":            r["item_name"],
+                        "base_qty_30d":         float(r["base_qty_30d"]),
+                        "mkt_uplift_qty":       float(r.get("mkt_uplift_qty", 0)),
+                        "total_qty_30d":        float(r.get("total_qty_30d", r["base_qty_30d"])),
+                        "base_rev_30d":         float(r["base_rev_30d"]),
+                        "mkt_uplift_rev":       float(r.get("mkt_uplift_rev", 0)),
+                        "total_rev_30d":        float(r.get("total_rev_30d", r["base_rev_30d"])),
+                        "planned_mkt_spend":    float(channel_budgets.get(r["channel"], 0)),
+                        "assumed_roas":         float(r.get("sku_roas", _DEFAULT_ROAS)),
+                        "organic_assumption":   str(r.get("organic_assumption", "")),
+                        # ── Store assumption overrides for audit trail ───────
+                        "growth_factor":        float(r.get("growth_factor", 1.0)),
+                        "growth_factor_model":  float(r.get("growth_factor_model", 1.0)),
+                        "growth_overridden":    bool(r.get("growth_overridden", False)),
+                        "roas_overridden":      bool(r.get("roas_overridden", False)),
                     })
                 ok, err = _save_plan(supabase_client, rows)
                 if ok:
                     st.success(f"✅ Plan for {plan_month} saved — {len(rows)} records.")
+                    st.caption(
+                        "Growth factor overrides and ROAS overrides are embedded in "
+                        "the saved plan for comparison against actuals."
+                    )
                 else:
                     st.error(f"Save failed: {err}")
                     st.info("Ensure the `sop_plans` table exists in Supabase (see module docstring).")
