@@ -21,6 +21,14 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
 
+# ── Global Filter Notes ───────────────────────────────────────────────────────
+# Channel Performance does NOT use the global date/channel filter.
+# Reason: this tab's "Sales Window" (N days back) is an inventory-specific
+# control — it determines Days of Cover (DOC) calculation, not a view filter.
+# Applying a global date range here would break DOC/DRR math.
+# The tab is self-contained; no global_filters import is needed.
+# ─────────────────────────────────────────────────────────────────────────────
+
 # ─────────────────────────────────────────────────────────────────────────────
 # PostgreSQL helpers — SKU mapping persistence
 # ─────────────────────────────────────────────────────────────────────────────
