@@ -37,6 +37,20 @@ from ui_theme import (
     active_filter_pill,
 )
 
+# ── User Management & Access Control ─────────────────────────────────────────
+# Handles custom users, hashed passwords, and per-tab permissions.
+# See user_management.py for full architecture docs and DB schema.
+from user_management import (
+    render_user_management_tab,
+    render_user_login_option,
+    load_user_session,
+    is_tab_allowed,
+    has_tab_access,
+    tab_denied_message,
+    ALL_TABS,
+    ADMIN_ONLY_TABS,
+)
+
 def _fmt_err(e: Exception) -> str:
     """Short readable error — strips 502 HTML bodies."""
     msg = str(e)
@@ -124,17 +138,16 @@ def invalidate_data_cache():
 def check_auth() -> bool:
     if "authenticated" not in st.session_state:
         # ── Styled login page ─────────────────────────────────────────────────
-        # Center the login card using columns
         _, center_col, _ = st.columns([1, 1.2, 1])
         with center_col:
             st.markdown(
                 """
                 <div style="text-align:center; margin-top:2.5rem; margin-bottom:2rem;">
                   <div style="font-family:'DM Serif Display',Georgia,serif;
-                              font-size:2rem; color:#F5A623; margin-bottom:0.3rem;">
+                              font-size:2rem; color:#C47A2B; margin-bottom:0.3rem;">
                     Mamanourish
                   </div>
-                  <div style="font-size:0.75rem; color:#5C6370;
+                  <div style="font-size:0.75rem; color:#A89E95;
                               letter-spacing:0.12em; text-transform:uppercase;">
                     Executive Sales Portal
                   </div>
@@ -143,13 +156,27 @@ def check_auth() -> bool:
                 unsafe_allow_html=True,
             )
 
+            # Role selector now includes "Custom User"
             role_choice = st.selectbox(
                 "Role",
-                ["Select Role", "Admin (Full Access)", "Viewer (View Only)"],
+                ["Select Role", "Admin (Full Access)", "Viewer (View Only)", "Custom User"],
                 label_visibility="collapsed",
                 placeholder="Select your role…",
             )
-            pw = st.text_input("Password", type="password", placeholder="Enter password…", label_visibility="collapsed")
+
+            # Show username field only for Custom User
+            username_input = ""
+            if role_choice == "Custom User":
+                username_input = st.text_input(
+                    "Username", placeholder="Enter your username…",
+                    label_visibility="collapsed",
+                )
+
+            pw = st.text_input(
+                "Password", type="password",
+                placeholder="Enter password…",
+                label_visibility="collapsed",
+            )
 
             if st.button("Sign In →", use_container_width=True):
                 try:
@@ -167,11 +194,17 @@ def check_auth() -> bool:
                     st.session_state["authenticated"] = True
                     st.session_state["role"] = "viewer"
                     st.rerun()
+                elif role_choice == "Custom User":
+                    # Authenticate against app_users table via user_management module
+                    if load_user_session(supabase, username_input.strip(), pw):
+                        st.rerun()
+                    else:
+                        st.error("Invalid username or password.")
                 else:
                     st.error("Incorrect password or role — please try again.")
 
             st.markdown(
-                '<div style="text-align:center; margin-top:1.5rem; font-size:0.7rem; color:#2A2D3A;">Mamanourish © 2025</div>',
+                '<div style="text-align:center;margin-top:1.5rem;font-size:0.7rem;color:#A89E95;">Mamanourish © 2025</div>',
                 unsafe_allow_html=True,
             )
         return False
@@ -321,68 +354,65 @@ with st.sidebar:
                     st.error(f"Reset failed: {e}")
 
     st.divider()
+
+    # ── Global Filters — placed in sidebar for persistent visibility ──────────
+    # In Streamlit, the sidebar is the ONLY area that stays visible while the
+    # user scrolls through tab content. The main area has no reliable sticky
+    # mechanism. So we render the global filter bar here in the sidebar.
+    if not history_df.empty:
+        render_global_filter_bar(history_df)
+
+    st.divider()
     if st.button("Logout"):
         del st.session_state["authenticated"]
         del st.session_state["role"]
         st.rerun()
 
 # ─────────────────────────────────────────────
-# TABS — built dynamically based on role
+# TABS — built dynamically based on role + user permissions
 # ─────────────────────────────────────────────
-# Determine whether any channel actually requires city data
-# (used to gate Marketing + Channel Performance tabs)
-_any_city_channel = True   # tabs are always shown; per-channel gating happens inside them
+# ALL_TABS defines every possible tab as (label, key).
+# Each user's allowed_tabs list (from app_users table) gates visibility.
+# Admin sees all tabs. Viewer sees non-admin tabs. Custom users see only
+# what was granted. The User Management tab is admin-only always.
 
+# Build the ordered list of (label, key) this user can see
+_visible_tabs: list[tuple[str, str]] = []
+for _label, _key in ALL_TABS:
+    if has_tab_access(_key):
+        _visible_tabs.append((_label, _key))
+
+# Admin also sees User Management (always last)
 if role == "admin":
-    tabs = st.tabs([
-        "📊 Trend Analytics",
-        "🔬 Deep Dive",
-        "📣 Performance Marketing",
-        "📤 Smart Upload",
-        "📅 Monthly Channel Upload",
-        "🛠 Configuration",
-        "📦 Channel Performance",
-        "🎰 Vending",
-        "📋 S&OP",
-    ])
-    _TAB_ANALYTICS       = 0
-    _TAB_DEEPDIVE        = 1
-    _TAB_MARKETING       = 2
-    _TAB_UPLOAD          = 3
-    _TAB_MONTHLY_UPLOAD  = 4
-    _TAB_CONFIG          = 5
-    _TAB_CHANPERF        = 6
-    _TAB_VENDING         = 7
-    _TAB_SOP             = 8
-else:
-    tabs = st.tabs([
-        "📊 Trend Analytics",
-        "🔬 Deep Dive",
-        "📣 Performance Marketing",
-        "📦 Channel Performance",
-        "🎰 Vending",
-        "📋 S&OP",
-    ])
-    _TAB_ANALYTICS  = 0
-    _TAB_DEEPDIVE   = 1
-    _TAB_MARKETING  = 2
-    _TAB_CHANPERF   = 3
-    _TAB_VENDING    = 4
-    _TAB_SOP        = 5
+    _visible_tabs.append(("👥 User Management", "user_management"))
 
-# ══════════════════════════════════════════════
-# GLOBAL FILTER BAR — rendered once, affects all data tabs
-# ══════════════════════════════════════════════
-# The global filter bar persists date range, channels, and products
-# across all tab switches via st.session_state["gf_*"].
-# Tabs read filters via get_global_filters() / apply_global_filters().
-if not history_df.empty:
-    render_global_filter_bar(history_df)
+# Build st.tabs from the visible list
+tabs = st.tabs([label for label, _ in _visible_tabs])
+
+# Build a lookup: tab_key → index in tabs list
+_tab_index: dict[str, int] = {key: i for i, (_, key) in enumerate(_visible_tabs)}
+
+# Helper: get tab index safely (-1 if not visible)
+def _tidx(key: str) -> int:
+    return _tab_index.get(key, -1)
+
+# Convenience aliases for the original fixed indices — now dynamic
+_TAB_ANALYTICS      = _tidx("trend_analytics")
+_TAB_DEEPDIVE       = _tidx("deep_dive")
+_TAB_MARKETING      = _tidx("performance_marketing")
+_TAB_UPLOAD         = _tidx("smart_upload")
+_TAB_MONTHLY_UPLOAD = _tidx("monthly_upload")
+_TAB_CONFIG         = _tidx("configuration")
+_TAB_CHANPERF       = _tidx("channel_performance")
+_TAB_VENDING        = _tidx("vending")
+_TAB_SOP            = _tidx("sop")
+_TAB_USERMGMT       = _tidx("user_management")
 
 # ══════════════════════════════════════════════
 # TAB 1 – TREND ANALYTICS  (unchanged)
 # ══════════════════════════════════════════════
-with tabs[_TAB_ANALYTICS]:
+if _TAB_ANALYTICS >= 0:
+  with tabs[_TAB_ANALYTICS]:
     if history_df.empty:
         empty_state("📊", "No data yet", "Admin must upload sales data via the Smart Upload tab first.")
     else:
@@ -483,7 +513,8 @@ with tabs[_TAB_ANALYTICS]:
 # ══════════════════════════════════════════════
 # TAB 2 – DEEP DIVE  (new)
 # ══════════════════════════════════════════════
-with tabs[_TAB_DEEPDIVE]:
+if _TAB_DEEPDIVE >= 0:
+  with tabs[_TAB_DEEPDIVE]:
     if history_df.empty:
         empty_state("📊", "No data yet", "Admin must upload sales data via the Smart Upload tab first.")
     else:
@@ -831,7 +862,8 @@ with tabs[_TAB_DEEPDIVE]:
 # ══════════════════════════════════════════════
 # TAB – PERFORMANCE MARKETING (all roles, index 2)
 # ══════════════════════════════════════════════
-with tabs[_TAB_MARKETING]:
+if _TAB_MARKETING >= 0:
+  with tabs[_TAB_MARKETING]:
     # Check if any channels with city data exist in the sales history
     _has_city_data = (
         not history_df.empty
@@ -1442,7 +1474,8 @@ if role == "admin":
 # ══════════════════════════════════════════════
 # TAB – CHANNEL PERFORMANCE (admin + viewer, last tab)
 # ══════════════════════════════════════════════
-with tabs[_TAB_CHANPERF]:
+if _TAB_CHANPERF >= 0:
+  with tabs[_TAB_CHANPERF]:
     _has_city_data_cp = (
         not history_df.empty
         and "city" in history_df.columns
@@ -1460,11 +1493,23 @@ with tabs[_TAB_CHANPERF]:
 # ══════════════════════════════════════════════
 # TAB – VENDING (admin + viewer)
 # ══════════════════════════════════════════════
-with tabs[_TAB_VENDING]:
+if _TAB_VENDING >= 0:
+  with tabs[_TAB_VENDING]:
     render_vending_tab(role)
 
 # ══════════════════════════════════════════════
 # TAB – S&OP (admin + viewer)
 # ══════════════════════════════════════════════
-with tabs[_TAB_SOP]:
+if _TAB_SOP >= 0:
+  with tabs[_TAB_SOP]:
     render_sop_tab(supabase, history_df, master_skus, master_chans, role)
+
+# ══════════════════════════════════════════════
+# TAB – USER MANAGEMENT (admin only)
+# ══════════════════════════════════════════════
+if _TAB_USERMGMT >= 0:
+  with tabs[_TAB_USERMGMT]:
+    if role != "admin":
+        empty_state("🔒", "Access Denied", "User Management is only available to administrators.")
+    else:
+        render_user_management_tab(supabase)
