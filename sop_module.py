@@ -36,6 +36,17 @@ import math
 from datetime import date, timedelta
 
 import numpy as np
+
+# ── Global Filter Integration ─────────────────────────────────────────────────
+# The SOP module reads channel selection from global filter state so the
+# "Channels" multiselect is pre-seeded with the globally selected channels.
+# The plan_month selector remains LOCAL — it is a planning-horizon control,
+# not a historical data filter, so it should not be globalized.
+try:
+    from global_filters import get_global_filters as _get_global_filters
+    _GLOBAL_FILTERS_AVAILABLE = True
+except ImportError:
+    _GLOBAL_FILTERS_AVAILABLE = False
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -733,7 +744,22 @@ def render_sop_tab(supabase_client, history_df, master_skus_df, master_chans_df,
             key="sop_plan_month",
         )
 
-        sel_channels = st.multiselect("Channels", channels, default=channels, key="sop_channels")
+        # ── Channel filter: seeded from global filter, overridable locally ─────
+        # The global filter sets default channels. Users can further narrow
+        # channels here for the SOP plan without affecting other tabs.
+        # (Channel selection is SOP-specific: you may plan for a subset only.)
+        if _GLOBAL_FILTERS_AVAILABLE:
+            _gf_sop = _get_global_filters()
+            _gf_chans_sop = [c for c in (_gf_sop["channels"] or []) if c in channels] or channels
+        else:
+            _gf_chans_sop = channels
+
+        sel_channels = st.multiselect(
+            "Channels (for this plan)",
+            channels, default=_gf_chans_sop,
+            key="sop_channels",
+            help="Pre-seeded from Global Filter Bar. Adjust here to plan for a specific subset.",
+        )
         if not sel_channels:
             st.warning("Select at least one channel.")
             return
