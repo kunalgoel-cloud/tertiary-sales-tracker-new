@@ -487,6 +487,7 @@ if _TAB_ANALYTICS >= 0:
             fig = px.bar(
                 plot_df, x="date", y=target_col,
                 color=color_theme, barmode="stack", height=480,
+                color_discrete_sequence=brand_color_sequence(),
             )
             fig.add_hline(
                 y=avg_drr, line_dash="dash", line_color="#E74C3C",
@@ -504,9 +505,11 @@ if _TAB_ANALYTICS >= 0:
                     mode="text",
                     textposition="top center",
                     showlegend=False,
-                    textfont=dict(color="#F0F2F5", size=10),
+                    textfont=dict(color="#1C1917", size=10, family="JetBrains Mono"),
                 )
             fig = apply_chart_theme(fig)
+            # Increase top margin so total labels above bars aren't clipped
+            fig.update_layout(margin=dict(l=12, r=12, t=48, b=12))
             st.plotly_chart(fig, use_container_width=True)
             display_cols = [c for c in filtered.columns if c not in ("date_dt", "id")]
             st.dataframe(filtered[display_cols], hide_index=True)
@@ -1496,7 +1499,7 @@ if _TAB_CHANPERF >= 0:
 # ══════════════════════════════════════════════
 if _TAB_VENDING >= 0:
   with tabs[_TAB_VENDING]:
-    render_vending_tab(role)
+    render_vending_tab(role, supabase_client=supabase)
 
 # ══════════════════════════════════════════════
 # TAB – S&OP (admin + viewer)
