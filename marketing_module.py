@@ -23,6 +23,16 @@ import streamlit as st
 from datetime import datetime
 from supabase import create_client, Client
 
+# ── Global Filter Integration ─────────────────────────────────────────────────
+# Marketing module reads date + channel from the global filter state when
+# available. Campaign/product filters remain local (marketing-specific).
+# Import is guarded so the module still works standalone (e.g. in tests).
+try:
+    from global_filters import get_global_filters as _get_global_filters
+    _GLOBAL_FILTERS_AVAILABLE = True
+except ImportError:
+    _GLOBAL_FILTERS_AVAILABLE = False
+
 
 # ─────────────────────────────────────────────────────────────
 # SUPABASE CLIENTS
@@ -492,36 +502,76 @@ def _standardize(df: pd.DataFrame, manual_date=None) -> pd.DataFrame:
 # ─────────────────────────────────────────────────────────────
 
 def _apply_filters(df: pd.DataFrame, key_prefix: str, show_product: bool = True):
+    """
+    Apply filters to a marketing performance DataFrame.
+
+    GLOBAL FILTER INTEGRATION:
+    - Date range and channel filter are read from the global filter state
+      (st.session_state["gf_*"]) when the global filter system is active.
+    - This keeps marketing date/channel in sync with the rest of the app.
+    - The campaign/product filter remains LOCAL (marketing-specific concept,
+      not shared with sales tabs).
+
+    Fallback: if global_filters module is unavailable, renders its own
+    date + channel widgets (backward-compatible).
+    """
     min_date = df["date"].min().date()
     max_date = df["date"].max().date()
 
-    fc1, fc2, fc3 = st.columns([2, 2, 1])
-    with fc1:
-        dr = st.date_input(
-            "Date Range", value=(min_date, max_date),
-            min_value=min_date, max_value=max_date,
-            key=f"{key_prefix}_dr",
-        )
-    with fc2:
+    # ── Read date + channel from global filter state ──────────────────────────
+    if _GLOBAL_FILTERS_AVAILABLE:
+        _gf    = _get_global_filters()
+        start  = _gf["start"] or min_date
+        end    = _gf["end"]   or max_date
+        # Clamp to available data range
+        start  = max(start, min_date)
+        end    = min(end,   max_date)
+        # Channel: use global selection if set; otherwise all marketing channels
         all_channels = sorted(df["channel"].unique())
-        ch_f = st.multiselect("Channels", all_channels, default=all_channels, key=f"{key_prefix}_ch")
-    with fc3:
-        if show_product and "product" in df.columns:
-            all_products = sorted(df["product"].unique())
-            pr_f = st.multiselect("Products", all_products, default=all_products, key=f"{key_prefix}_pr")
-        else:
-            pr_f = []
+        gf_chans     = _gf["channels"]
+        # Only apply global channels that exist in marketing data
+        ch_f = [c for c in (gf_chans or []) if c in all_channels] or all_channels
+        # Show info label so user knows filters are from global bar
+        st.caption(
+            f"📅 Period: **{start}** → **{end}** | "
+            f"Channels: **{', '.join(ch_f) if ch_f != all_channels else 'All'}** "
+            f"_(from Global Filter Bar above tabs)_"
+        )
+    else:
+        # ── Fallback: render local widgets (no global filter system) ──────────
+        fc1, fc2 = st.columns([2, 2])
+        with fc1:
+            dr = st.date_input(
+                "Date Range", value=(min_date, max_date),
+                min_value=min_date, max_value=max_date,
+                key=f"{key_prefix}_dr",
+            )
+        with fc2:
+            all_channels = sorted(df["channel"].unique())
+            ch_f = st.multiselect("Channels", all_channels, default=all_channels, key=f"{key_prefix}_ch")
+        start = dr[0] if len(dr) == 2 else min_date
+        end   = dr[1] if len(dr) == 2 else max_date
 
+    # ── LOCAL filter: Product (marketing-specific, not in global bar) ─────────
+    if show_product and "product" in df.columns:
+        all_products = sorted(df["product"].unique())
+        pr_f = st.multiselect(
+            "Products (local filter)",
+            all_products, default=all_products,
+            key=f"{key_prefix}_pr",
+            help="This product filter is local to the Marketing tab only.",
+        )
+    else:
+        pr_f = []
+
+    # ── Apply all filters ─────────────────────────────────────────────────────
     f = df.copy()
-    if len(dr) == 2:
-        f = f[(f["date"] >= pd.to_datetime(dr[0])) & (f["date"] <= pd.to_datetime(dr[1]))]
+    f = f[(f["date"] >= pd.to_datetime(start)) & (f["date"] <= pd.to_datetime(end))]
     if ch_f:
         f = f[f["channel"].isin(ch_f)]
     if pr_f and "product" in df.columns:
         f = f[f["product"].isin(pr_f)]
 
-    start = dr[0] if len(dr) == 2 else min_date
-    end   = dr[1] if len(dr) == 2 else max_date
     return f, start, end
 
 
