@@ -37,6 +37,15 @@ from datetime import date, timedelta
 
 import numpy as np
 
+try:
+    from ui_theme import apply_chart_theme, brand_color_sequence, section_header
+    _UI_THEME_AVAILABLE = True
+except ImportError:
+    def apply_chart_theme(f, **kw): return f
+    def brand_color_sequence(): return None
+    def section_header(i, t, s=""): import streamlit as st; st.markdown(f"### {i} {t}")
+    _UI_THEME_AVAILABLE = False
+
 # ── Global Filter Integration ─────────────────────────────────────────────────
 # The SOP module reads channel selection from global filter state so the
 # "Channels" multiselect is pre-seeded with the globally selected channels.
@@ -1223,7 +1232,8 @@ def render_sop_tab(supabase_client, history_df, master_skus_df, master_chans_df,
             fig.update_layout(height=400, yaxis=dict(title="Daily Units"),
                               yaxis2=dict(title="Cumulative", overlaying="y", side="right"),
                               legend=dict(orientation="h", y=1.1), hovermode="x unified")
-            st.plotly_chart(fig, use_container_width=True)
+            fig = apply_chart_theme(fig)
+    st.plotly_chart(fig, use_container_width=True)
         else:
             st.info(f"No sales data yet for {_cal.month_name[mo]} {yr}.")
 
