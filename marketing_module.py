@@ -33,6 +33,16 @@ try:
 except ImportError:
     _GLOBAL_FILTERS_AVAILABLE = False
 
+try:
+    from ui_theme import apply_chart_theme, brand_color_sequence, section_header, empty_state
+    _UI_THEME_AVAILABLE = True
+except ImportError:
+    def apply_chart_theme(f, **kw): return f
+    def brand_color_sequence(): return None
+    def section_header(i, t, s=""): import streamlit as st; st.markdown(f"### {i} {t}")
+    def empty_state(i, t, b): import streamlit as st; st.info(f"{i} {t}: {b}")
+    _UI_THEME_AVAILABLE = False
+
 
 # ─────────────────────────────────────────────────────────────
 # SUPABASE CLIENTS
@@ -633,6 +643,7 @@ def _render_dashboard(sb):
                     range=[0, ch_trend["ROAS"].max() * 1.2 if not ch_trend.empty else 10]),
         legend=dict(orientation="h", y=1.2), hovermode="x unified", height=480,
     )
+    fig = apply_chart_theme(fig)
     st.plotly_chart(fig, use_container_width=True)
     st.divider()
 
@@ -1135,7 +1146,8 @@ def _render_deep_dive(sb):
                                       font=dict(color=color, size=12))
 
             fig_rv.update_layout(hovermode="closest")
-            st.plotly_chart(fig_rv, use_container_width=True)
+            fig_rv = apply_chart_theme(fig_rv)
+    st.plotly_chart(fig_rv, use_container_width=True)
 
             # Summary table sorted by ROAS desc, volatility asc
             summary = plot_df[["Campaign","Spend (₹)","ROAS","Volatility","Trend","Verdict"]]\
@@ -1343,6 +1355,7 @@ def _render_forecast(sb):
         legend=dict(orientation="h", y=1.1),
         hovermode="x unified",
     )
+    fig_alloc = apply_chart_theme(fig_alloc)
     st.plotly_chart(fig_alloc, use_container_width=True)
 
     # ── What-if simulator ────────────────────────────────────
@@ -1387,6 +1400,7 @@ def _render_forecast(sb):
         name="Current Budget",
     )
     fig_sc.update_layout(hovermode="x unified")
+    fig_sc = apply_chart_theme(fig_sc)
     st.plotly_chart(fig_sc, use_container_width=True)
 
     st.dataframe(
@@ -1764,6 +1778,7 @@ def _render_acos_tacos(sb):
         legend=dict(orientation="h", y=1.15),
         hovermode="x unified",
     )
+    fig_trend = apply_chart_theme(fig_trend)
     st.plotly_chart(fig_trend, use_container_width=True)
     st.divider()
 
@@ -1859,7 +1874,8 @@ def _render_acos_tacos(sb):
         )
         fig_org.update_traces(textposition="inside")
         fig_org.update_layout(hovermode="x unified", legend=dict(orientation="h", y=1.1))
-        st.plotly_chart(fig_org, use_container_width=True)
+        fig_org = apply_chart_theme(fig_org)
+    st.plotly_chart(fig_org, use_container_width=True)
 
 
 # ─────────────────────────────────────────────────────────────
