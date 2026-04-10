@@ -429,7 +429,7 @@ def _render_analysis(df_raw: pd.DataFrame, price_map: dict,
         fig_ch.add_vline(x=STR_SCALE, line_dash="dot", line_color="#22c55e",
                          annotation_text=f"Scale >{STR_SCALE}%", annotation_position="top right")
         fig_ch = apply_chart_theme(fig_ch)
-    st.plotly_chart(fig_ch, use_container_width=True)
+        st.plotly_chart(fig_ch, use_container_width=True)
 
         st.divider()
 
@@ -483,7 +483,7 @@ def _render_analysis(df_raw: pd.DataFrame, price_map: dict,
             fig_bub.add_vline(x=DOC_OVER,  line_dash="dot", line_color="#3b82f6")
             fig_bub.add_hline(y=VEL_LOW,   line_dash="dot", line_color="#f59e0b")
             fig_bub = apply_chart_theme(fig_bub)
-    st.plotly_chart(fig_bub, use_container_width=True)
+            st.plotly_chart(fig_bub, use_container_width=True)
         else:
             st.success("✅ All city×product combinations are within normal stock range.")
 
@@ -535,8 +535,8 @@ def _render_analysis(df_raw: pd.DataFrame, price_map: dict,
             )
             fig_pc.add_vline(x=DOC_UNDER, line_dash="dot", line_color="#ef4444")
             fig_pc.add_vline(x=DOC_OVER,  line_dash="dot", line_color="#3b82f6")
-            fig_pc = apply_chart_theme(fig_pc)
-    st.plotly_chart(fig_pc, use_container_width=True)
+        fig_pc = apply_chart_theme(fig_pc)
+        st.plotly_chart(fig_pc, use_container_width=True)
 
         st.divider()
 
@@ -612,7 +612,7 @@ def _render_analysis(df_raw: pd.DataFrame, price_map: dict,
         fig_quad.add_hline(y=DOC_OVER,  line_dash="dash", line_color="#3b82f6",
                            annotation_text=f"DOC {DOC_OVER}d")
         fig_quad = apply_chart_theme(fig_quad)
-    st.plotly_chart(fig_quad, use_container_width=True)
+        st.plotly_chart(fig_quad, use_container_width=True)
 
         st.divider()
 
