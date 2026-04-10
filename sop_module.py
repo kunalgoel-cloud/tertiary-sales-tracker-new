@@ -1233,7 +1233,7 @@ def render_sop_tab(supabase_client, history_df, master_skus_df, master_chans_df,
                               yaxis2=dict(title="Cumulative", overlaying="y", side="right"),
                               legend=dict(orientation="h", y=1.1), hovermode="x unified")
             fig = apply_chart_theme(fig)
-    st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True)
         else:
             st.info(f"No sales data yet for {_cal.month_name[mo]} {yr}.")
 
