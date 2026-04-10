@@ -400,7 +400,7 @@ def apply_chart_theme(fig: go.Figure, height: int = None) -> go.Figure:
             bordercolor = "#E2DDD8",
             font        = dict(family="DM Sans", color="#1C1917", size=12),
         ),
-        margin = dict(l=12, r=12, t=36, b=12),
+        margin = dict(l=12, r=12, t=12, b=12),
     )
     if height:
         updates["height"] = height
