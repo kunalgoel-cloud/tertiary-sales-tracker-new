@@ -37,6 +37,21 @@ from ui_theme import (
     active_filter_pill,
 )
 
+# ── Performance Optimisation Layer ────────────────────────────────────────────
+# Smart filter caching, upload progress bars, skeleton loaders, lazy sections.
+# See performance.py for full architecture docs.
+from performance import (
+    inject_perf_css,
+    should_recompute,
+    get_filtered_df,
+    upload_progress_bar,
+    skeleton_metrics,
+    skeleton_chart,
+    lazy_section,
+    is_lazy_skip,
+    cached_agg,
+)
+
 # ── User Management & Access Control ─────────────────────────────────────────
 # Handles custom users, hashed passwords, and per-tab permissions.
 # See user_management.py for full architecture docs and DB schema.
@@ -70,6 +85,9 @@ st.set_page_config(
 # ── Activate the Mamanourish Design System ────────────────────────────────────
 # Injects fonts, CSS custom properties, and all component overrides.
 inject_css()
+# ── Activate Performance Layer ────────────────────────────────────────────────
+# Top loading bar, skeleton shimmers, upload progress CSS, fade-in animations.
+inject_perf_css()
 
 @st.cache_resource
 def get_supabase() -> Client:
@@ -103,8 +121,14 @@ def sanitize(text: str) -> str:
     """Strip dangerous characters from user-supplied names."""
     return re.sub(r"[<>\"'%;()&+]", "", str(text)).strip()[:200]
 
-@st.cache_data(ttl=120)
+@st.cache_data(ttl=120, show_spinner=False)
 def get_table(table: str, default_cols: tuple) -> pd.DataFrame:
+    """
+    Paginated Supabase fetch with 120s cache (show_spinner=False keeps the
+    UI clean — the top loading bar from performance.py handles perceived load).
+    Master/config tables (skus, channels, item_map) could use a longer TTL
+    but share this function for simplicity.
+    """
     """Fetch a Supabase table with pagination (cached 120s); return empty DataFrame on failure."""
     try:
         all_rows = []
@@ -446,21 +470,24 @@ if _TAB_ANALYTICS >= 0:
         # Styled active-filter pill row
         active_filter_pill(start_date, end_date, _gf_chans, _gf_prods)
 
-        # Apply date filter
-        mask     = (history_df["date_dt"].dt.date >= start_date) & (history_df["date_dt"].dt.date <= end_date)
-        range_df = history_df[mask].copy()
+        # ── SMART FILTER CACHE ────────────────────────────────────────────────
+        # get_filtered_df() checks a hash of (start, end, channels, products).
+        # If the hash matches the previous render, it returns the cached slice
+        # without re-scanning history_df — making filter changes instant.
+        filtered = get_filtered_df(
+            "analytics", history_df,
+            start_date, end_date, _gf_chans, _gf_prods,
+        )
 
-        # Apply channel filter (global)
-        if _gf_chans:
-            range_df = range_df[range_df["channel"].isin(_gf_chans)]
-
-        # Apply product filter (global)
-        filtered = range_df.copy()
-        if _gf_prods:
-            filtered = filtered[filtered["item_name"].isin(_gf_prods)]
+        # range_df is the channel-filtered (pre-product) slice — used for
+        # sel_chan/sel_item backward compat with chart color-theme logic.
+        range_df = get_filtered_df(
+            "analytics_range", history_df,
+            start_date, end_date, _gf_chans, None,  # no product filter
+        )
 
         # Keep sel_item/sel_chan variables for backward-compatible chart logic below
-        sel_chan = _gf_chans or sorted(range_df["channel"].unique())
+        sel_chan = _gf_chans or sorted(range_df["channel"].unique()) if not range_df.empty else []
         sel_item = _gf_prods or []
 
         total_val     = filtered[target_col].sum()
@@ -539,16 +566,14 @@ if _TAB_DEEPDIVE >= 0:
         # Styled active-filter pill row
         active_filter_pill(dd_start, dd_end, _gf_dd["channels"], _gf_dd["products"])
 
-        dd_mask = (history_df["date_dt"].dt.date >= dd_start) & (history_df["date_dt"].dt.date <= dd_end)
-        dd_df   = history_df[dd_mask].copy()
-
-        # Apply channel filter from global state
-        if _gf_dd["channels"]:
-            dd_df = dd_df[dd_df["channel"].isin(_gf_dd["channels"])]
-
-        # Apply product filter from global state
-        if _gf_dd["products"]:
-            dd_df = dd_df[dd_df["item_name"].isin(_gf_dd["products"])]
+        # ── SMART FILTER CACHE (Deep Dive) ───────────────────────────────────
+        # Same hash-check pattern: only re-scans history_df when the
+        # filter state actually changed. Display-toggle reruns (WoW metric,
+        # heatmap metric) skip this expensive Boolean mask entirely.
+        dd_df = get_filtered_df(
+            "deep_dive", history_df,
+            dd_start, dd_end, _gf_dd["channels"], _gf_dd["products"],
+        )
 
         if dd_df.empty:
             st.warning("No data in the selected period.")
@@ -676,13 +701,20 @@ if _TAB_DEEPDIVE >= 0:
             wow_metric = st.radio("WoW Metric:", ["Revenue (₹)", "Quantity (Units)"], horizontal=True, key="wow_metric")
             wow_col    = "revenue" if "Revenue" in wow_metric else "qty_sold"
             wow_prefix = "₹" if "Revenue" in wow_metric else ""
-    
-            weekly = (
-                dd_df.groupby(["week_label", "channel"])[wow_col]
-                .sum()
-                .reset_index()
-                .sort_values("week_label")
-            )
+
+            # lazy_section: skip heavy groupby if only display metric changed
+            # but data (dd_df) and metric (wow_col) are the same
+            _wow_dep = (id(dd_df), wow_col, dd_start, dd_end)
+            with lazy_section("wow_chart", depends_on=_wow_dep):
+              if not is_lazy_skip("wow_chart"):
+                weekly = (
+                  dd_df.groupby(["week_label", "channel"])[wow_col]
+                  .sum()
+                  .reset_index()
+                  .sort_values("week_label")
+                )
+                st.session_state["_wow_weekly"] = weekly
+              weekly = st.session_state.get("_wow_weekly", pd.DataFrame())
     
             fig_wow = px.line(
                 weekly, x="week_label", y=wow_col, color="channel",
@@ -1065,17 +1097,21 @@ if role == "admin":
                                   .reset_index()
                               )
 
-                              with st.spinner(f"Uploading {len(final_df)} records to Supabase…"):
-                                  try:
-                                      final_df["qty_sold"] = final_df["qty_sold"].fillna(0.0)
-                                      final_df["revenue"]  = final_df["revenue"].fillna(0.0)
-                                      final_df["city"]     = (
-                                          final_df["city"]
-                                          .astype(object)
-                                          .where(final_df["city"].notna(), other=None)
-                                      )
-                                      CHUNK   = 500
-                                      records = final_df.to_dict(orient="records")
+                              try:
+                                  final_df["qty_sold"] = final_df["qty_sold"].fillna(0.0)
+                                  final_df["revenue"]  = final_df["revenue"].fillna(0.0)
+                                  final_df["city"]     = (
+                                      final_df["city"]
+                                      .astype(object)
+                                      .where(final_df["city"].notna(), other=None)
+                                  )
+                                  CHUNK   = 500
+                                  records = final_df.to_dict(orient="records")
+                                  # ── Progress bar upload ───────────────────
+                                  with upload_progress_bar(
+                                      len(records), chunk_size=CHUNK,
+                                      label=f"Uploading to Supabase ({selected_channel})"
+                                  ) as tick:
                                       for i in range(0, len(records), CHUNK):
                                           chunk = records[i : i + CHUNK]
                                           res   = supabase.table("sales").upsert(
@@ -1084,8 +1120,9 @@ if role == "admin":
                                           ).execute()
                                           if hasattr(res, "error") and res.error:
                                               errors.append(f"Upsert chunk {i//CHUNK+1} error: {res.error}")
-                                  except Exception as e:
-                                      errors.append(f"Upload failed: {e}")
+                                          tick()
+                              except Exception as e:
+                                  errors.append(f"Upload failed: {e}")
 
                               if errors:
                                   for err in errors:
@@ -1299,16 +1336,20 @@ if role == "admin":
                                           mc_final["qty_sold"] = mc_final["qty_sold"].fillna(0.0)
                                           mc_final["revenue"]  = mc_final["revenue"].fillna(0.0)
                                           mc_final["city"]     = mc_final["city"].astype(object).where(mc_final["city"].notna(), other=None)
-                                          with st.spinner(f"Uploading {len(mc_final)} records…"):
-                                              try:
-                                                  CHUNK = 500
-                                                  recs = mc_final.to_dict(orient="records")
+                                          try:
+                                              CHUNK = 500
+                                              recs = mc_final.to_dict(orient="records")
+                                              with upload_progress_bar(
+                                                  len(recs), chunk_size=CHUNK,
+                                                  label=f"Monthly upload ({mc_channel})"
+                                              ) as tick:
                                                   for i in range(0, len(recs), CHUNK):
                                                       res = supabase.table("sales").upsert(recs[i:i+CHUNK], on_conflict="date,channel,item_name,city").execute()
                                                       if hasattr(res, "error") and res.error:
                                                           mc_errors.append(f"Chunk {i//CHUNK+1}: {res.error}")
-                                              except Exception as e:
-                                                  mc_errors.append(f"Upload failed: {e}")
+                                                      tick()
+                                          except Exception as e:
+                                              mc_errors.append(f"Upload failed: {e}")
                                           if mc_errors:
                                               for err in mc_errors: st.error(err)
                                           else:
@@ -1389,16 +1430,20 @@ if role == "admin":
                                   mc_m_final["qty_sold"] = mc_m_final["qty_sold"].fillna(0.0)
                                   mc_m_final["revenue"]  = mc_m_final["revenue"].fillna(0.0)
                                   mc_m_final["city"]     = mc_m_final["city"].astype(object).where(mc_m_final["city"].notna(), other=None)
-                                  with st.spinner(f"Uploading {len(mc_m_final)} records…"):
-                                      try:
-                                          CHUNK = 500
-                                          recs = mc_m_final.to_dict(orient="records")
+                                  try:
+                                      CHUNK = 500
+                                      recs = mc_m_final.to_dict(orient="records")
+                                      with upload_progress_bar(
+                                          len(recs), chunk_size=CHUNK,
+                                          label=f"Manual upload ({mc_channel})"
+                                      ) as tick:
                                           for i in range(0, len(recs), CHUNK):
                                               res = supabase.table("sales").upsert(recs[i:i+CHUNK], on_conflict="date,channel,item_name,city").execute()
                                               if hasattr(res, "error") and res.error:
                                                   mc_m_errors.append(f"Chunk {i//CHUNK+1}: {res.error}")
-                                      except Exception as e:
-                                          mc_m_errors.append(f"Upload failed: {e}")
+                                              tick()
+                                  except Exception as e:
+                                      mc_m_errors.append(f"Upload failed: {e}")
                                   if mc_m_errors:
                                       for err in mc_m_errors: st.error(err)
                                   else:
