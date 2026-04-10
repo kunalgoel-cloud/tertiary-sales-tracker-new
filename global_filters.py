@@ -127,20 +127,23 @@ def render_global_filter_bar(history_df: pd.DataFrame) -> None:
     avail_channels = sorted(history_df["channel"].dropna().unique().tolist())
     avail_products = sorted(history_df["item_name"].dropna().unique().tolist())
 
-    # ── Visual container ────────────────────────────────────────────────────
+    # ── Visual container ─────────────────────────────────────────────────────
+    # The mn-sticky-bar class (defined in ui_theme.py) makes this container
+    # position:sticky; top:0; z-index:999 so it stays fixed on scroll.
     with st.container():
         st.markdown(
             """
-            <div style="display:flex; align-items:center; gap:0.5rem;
-                        margin-bottom:0.5rem;">
-              <span style="font-size:0.65rem; font-weight:700;
-                           letter-spacing:0.12em; text-transform:uppercase;
-                           color:#5C6370;">🌐 Global Filters</span>
-              <span style="flex:1; height:1px; background:linear-gradient(90deg,
-                    #2A2D3A, transparent);"></span>
-              <span style="font-size:0.65rem; color:#2A2D3A;">
-                applies to all data tabs
-              </span>
+            <div class="mn-sticky-bar">
+              <div style="display:flex; align-items:center; gap:0.5rem;">
+                <span style="font-size:0.65rem; font-weight:700;
+                             letter-spacing:0.12em; text-transform:uppercase;
+                             color:#A89E95;">🌐 Global Filters</span>
+                <span style="flex:1; height:1px; background:linear-gradient(90deg,
+                      #E2DDD8, transparent);"></span>
+                <span style="font-size:0.65rem; color:#A89E95;">
+                  applies to all data tabs
+                </span>
+              </div>
             </div>
             """,
             unsafe_allow_html=True,
