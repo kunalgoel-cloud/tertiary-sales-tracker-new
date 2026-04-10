@@ -249,8 +249,107 @@ hr, [data-testid="stDivider"] > hr { border:none !important; border-top:1px soli
 .role-badge { display:inline-flex;align-items:center;gap:0.4rem;background:rgba(196,122,43,.08);border:1px solid rgba(196,122,43,.2);border-radius:var(--radius-md);padding:0.3rem 0.7rem;font-size:0.72rem;font-weight:700;color:var(--accent);letter-spacing:0.05em;margin-bottom:0.5rem; }
 [data-testid="stToast"] { background:var(--surface) !important;border:1px solid var(--border) !important;border-radius:var(--radius-md) !important;color:var(--text1) !important;font-family:var(--font-ui) !important;box-shadow:var(--shadow-lg) !important; }
 *:focus-visible { outline:2px solid var(--accent) !important; outline-offset:2px !important; }
+
+/* ═══════════════════════════════════════════════════
+   STICKY GLOBAL FILTER — targets the stMarkdown block
+   that contains the .mn-sticky-bar div. We cannot use
+   a pure-Streamlit container for sticky, so we target
+   via CSS attribute selectors.
+═══════════════════════════════════════════════════ */
+
+/* The global filter renders BEFORE st.tabs(), so it sits in the main
+   vertical block. We target any stMarkdown that wraps .mn-sticky-bar */
+.mn-sticky-bar {
+  position: sticky !important;
+  top: 0 !important;
+  z-index: 1000 !important;
+  background: rgba(247,245,242,0.97) !important;
+  border-bottom: 1px solid #E2DDD8 !important;
+  padding: 0.5rem 0 0.25rem !important;
+  margin-bottom: 0.5rem !important;
+  backdrop-filter: blur(10px) !important;
+  -webkit-backdrop-filter: blur(10px) !important;
+  box-shadow: 0 2px 16px rgba(0,0,0,.07) !important;
+}
+
+/* Lift the stMarkdown parent that wraps the sticky bar */
+[data-testid="stMarkdown"]:has(.mn-sticky-bar) {
+  position: sticky !important;
+  top: 0 !important;
+  z-index: 1000 !important;
+  background: rgba(247,245,242,0.97) !important;
+  padding: 0 !important;
+  margin: 0 0 0.5rem !important;
+}
+
+/* The stVerticalBlock that wraps the entire filter section */
+[data-testid="stVerticalBlock"]:has(.mn-sticky-bar) {
+  position: sticky !important;
+  top: 0 !important;
+  z-index: 1000 !important;
+  background: rgba(247,245,242,0.97) !important;
+}
+
+/* Ensure tabs strip doesn't cover the filter bar */
+[data-testid="stTabs"] {
+  position: relative;
+  z-index: 990;
+}
 </style>
 """,
+        unsafe_allow_html=True,
+    )
+
+    # JavaScript to physically move the filter bar to the top of the page
+    # This runs once after Streamlit renders, finding .mn-sticky-bar and
+    # inserting it before the main content block.
+    st.markdown(
+        """
+        <script>
+        (function moveStickyBar() {
+          function tryMove() {
+            var bar = document.querySelector('.mn-sticky-bar');
+            if (!bar) { setTimeout(tryMove, 120); return; }
+
+            // Walk up to find the stMarkdown wrapper
+            var wrapper = bar;
+            while (wrapper && !wrapper.hasAttribute('data-testid')) {
+              wrapper = wrapper.parentElement;
+            }
+            if (!wrapper) { setTimeout(tryMove, 120); return; }
+
+            // Find the main block-container
+            var main = document.querySelector('.main .block-container');
+            if (!main) { setTimeout(tryMove, 120); return; }
+
+            // Create a sticky sentinel div at the very top
+            var sentinel = document.createElement('div');
+            sentinel.id  = 'mn-filter-sentinel';
+            sentinel.style.cssText = [
+              'position:sticky', 'top:0', 'z-index:1000',
+              'background:rgba(247,245,242,0.97)',
+              'border-bottom:1px solid #E2DDD8',
+              'box-shadow:0 2px 16px rgba(0,0,0,.07)',
+              'backdrop-filter:blur(10px)',
+              'padding:0.5rem 0 0.25rem',
+              'margin-bottom:0.5rem',
+            ].join(';');
+
+            // Move wrapper clone to top if not already moved
+            if (!document.getElementById('mn-filter-sentinel')) {
+              main.insertBefore(sentinel, main.firstChild);
+              sentinel.appendChild(wrapper);
+            }
+          }
+          // Run after Streamlit hydration
+          if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', tryMove);
+          } else {
+            setTimeout(tryMove, 200);
+          }
+        })();
+        </script>
+        """,
         unsafe_allow_html=True,
     )
 
