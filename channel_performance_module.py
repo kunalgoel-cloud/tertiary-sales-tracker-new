@@ -70,9 +70,13 @@ def _load_item_map(supabase_client) -> pd.DataFrame:
         return pd.DataFrame(columns=["raw_name", "master_name"])
 
 
+@st.cache_data(ttl=120, show_spinner=False)
 def _get_sales(_supabase, days: int) -> pd.DataFrame:
     """
     Pull last `days` days of sales from Supabase.
+    Cached for 120s — changing the N-days selector triggers a fresh fetch,
+    but re-renders from inventory file parsing reuse the cached result.
+    Leading underscore on _supabase prevents Streamlit from hashing the client.
     Returns: date, channel, item_name, city (nullable), qty_sold, revenue
     """
     try:
