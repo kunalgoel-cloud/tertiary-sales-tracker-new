@@ -104,14 +104,17 @@ def init_global_filters(history_df: pd.DataFrame) -> None:
 
 def render_global_filter_bar(history_df: pd.DataFrame) -> None:
     """
-    Renders the sticky Global Filter Bar at the top of the app.
-    Call this AFTER st.tabs() but BEFORE rendering tab content
-    (Streamlit evaluates top-level widget calls in order).
+    Renders the Global Filter Bar — designed for sidebar placement.
+
+    Call this inside `with st.sidebar:` to ensure it stays visible
+    while users scroll through tab content. The sidebar is the only
+    reliably always-visible area in Streamlit.
 
     The bar contains:
-      Row 1: Period preset radio buttons
+      Row 1: Period preset radio buttons (stacked vertically for sidebar width)
       Row 2 (if Custom): date range picker
-      Row 3: Channel multiselect | Product multiselect
+      Row 3: Channel multiselect
+      Row 4: Product multiselect
 
     All selections are persisted in st.session_state[KEY_*].
     """
@@ -127,23 +130,18 @@ def render_global_filter_bar(history_df: pd.DataFrame) -> None:
     avail_channels = sorted(history_df["channel"].dropna().unique().tolist())
     avail_products = sorted(history_df["item_name"].dropna().unique().tolist())
 
-    # ── Visual container ─────────────────────────────────────────────────────
-    # The mn-sticky-bar class (defined in ui_theme.py) makes this container
-    # position:sticky; top:0; z-index:999 so it stays fixed on scroll.
+    # ── Sidebar-friendly compact filter container ────────────────────────────
+    # The sidebar stays visible while the user scrolls — making it the correct
+    # location for persistent global filters in Streamlit.
     with st.container():
         st.markdown(
             """
-            <div class="mn-sticky-bar">
-              <div style="display:flex; align-items:center; gap:0.5rem;">
-                <span style="font-size:0.65rem; font-weight:700;
-                             letter-spacing:0.12em; text-transform:uppercase;
-                             color:#A89E95;">🌐 Global Filters</span>
-                <span style="flex:1; height:1px; background:linear-gradient(90deg,
-                      #E2DDD8, transparent);"></span>
-                <span style="font-size:0.65rem; color:#A89E95;">
-                  applies to all data tabs
-                </span>
-              </div>
+            <div style="margin-bottom:0.5rem;">
+              <span style="font-size:0.62rem; font-weight:700;
+                           letter-spacing:0.12em; text-transform:uppercase;
+                           color:#A89E95;">🌐 Global Filters</span>
+              <div style="height:1px; background:linear-gradient(90deg,
+                    #E2DDD8, transparent); margin-top:0.3rem;"></div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -181,22 +179,19 @@ def render_global_filter_bar(history_df: pd.DataFrame) -> None:
                 chosen_preset, data_start, effective_end
             )
 
-        # ── Row 3: Channel + Product multiselects ────────────────────────────
-        f_col1, f_col2 = st.columns(2)
-
+        # ── Channel + Product multiselects (stacked for sidebar width) ─────────
         # Channels: saved selection or all channels
         saved_chans = st.session_state.get(KEY_CHANNELS) or avail_channels
         # Guard against stale selections (channels removed from data)
         saved_chans = [c for c in saved_chans if c in avail_channels] or avail_channels
 
-        with f_col1:
-            chosen_channels = st.multiselect(
-                "Channels",
-                avail_channels,
-                default=saved_chans,
-                key=f"{_PFX}chan_select",
-                placeholder="All channels",
-            )
+        chosen_channels = st.multiselect(
+            "Channels",
+            avail_channels,
+            default=saved_chans,
+            key=f"{_PFX}chan_select",
+            placeholder="All channels",
+        )
 
         # Products: derive from channels selection for relevance
         # Only show products that appear in the chosen channels
@@ -207,16 +202,13 @@ def render_global_filter_bar(history_df: pd.DataFrame) -> None:
         # Keep only products still relevant to current channels
         saved_prods = [p for p in saved_prods if p in avail_products]
 
-        with f_col2:
-            chosen_products = st.multiselect(
-                "Products",
-                avail_products,
-                default=saved_prods,
-                key=f"{_PFX}prod_select",
-                placeholder="All products (no filter)",
-            )
-
-        st.divider()
+        chosen_products = st.multiselect(
+            "Products",
+            avail_products,
+            default=saved_prods,
+            key=f"{_PFX}prod_select",
+            placeholder="All products (no filter)",
+        )
 
     # ── Persist resolved values to session_state ─────────────────────────────
     # These are the canonical values that every tab reads via get_global_filters()
