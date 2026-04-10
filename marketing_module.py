@@ -1147,7 +1147,7 @@ def _render_deep_dive(sb):
 
             fig_rv.update_layout(hovermode="closest")
             fig_rv = apply_chart_theme(fig_rv)
-    st.plotly_chart(fig_rv, use_container_width=True)
+            st.plotly_chart(fig_rv, use_container_width=True)
 
             # Summary table sorted by ROAS desc, volatility asc
             summary = plot_df[["Campaign","Spend (₹)","ROAS","Volatility","Trend","Verdict"]]\
@@ -1874,7 +1874,7 @@ def _render_acos_tacos(sb):
         )
         fig_org.update_traces(textposition="inside")
         fig_org.update_layout(hovermode="x unified", legend=dict(orientation="h", y=1.1))
-        fig_org = apply_chart_theme(fig_org)
+    fig_org = apply_chart_theme(fig_org)
     st.plotly_chart(fig_org, use_container_width=True)
 
 
