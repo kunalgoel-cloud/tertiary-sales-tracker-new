@@ -371,14 +371,15 @@ with st.sidebar:
 # ─────────────────────────────────────────────
 # TABS — built dynamically based on role + user permissions
 # ─────────────────────────────────────────────
-# ALL_TABS defines every possible tab as (label, key).
+# ALL_TABS defines every possible tab as (key, label) — see user_management.py.
 # Each user's allowed_tabs list (from app_users table) gates visibility.
 # Admin sees all tabs. Viewer sees non-admin tabs. Custom users see only
 # what was granted. The User Management tab is admin-only always.
 
-# Build the ordered list of (label, key) this user can see
+# Build the ordered list of (label, key) this user can see.
+# ALL_TABS tuples are (key, label) — unpack accordingly.
 _visible_tabs: list[tuple[str, str]] = []
-for _label, _key in ALL_TABS:
+for _key, _label in ALL_TABS:
     if has_tab_access(_key):
         _visible_tabs.append((_label, _key))
 
