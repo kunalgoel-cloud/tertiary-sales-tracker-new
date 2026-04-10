@@ -21,6 +21,15 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
+# ── Global Filter Notes ───────────────────────────────────────────────────────
+# Vending does NOT consume the global date/channel filter.
+# Reason: vending data is uploaded as monthly Excel workbooks (not from the
+# shared sales DB) and the user selects month/year per uploaded workbook.
+# The customer selector and month/year are dataset identifiers, not view
+# filters — globalizing them would conflict with the upload workflow.
+# This tab is intentionally self-contained.
+# ─────────────────────────────────────────────────────────────────────────────
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CONSTANTS
 # ─────────────────────────────────────────────────────────────────────────────
