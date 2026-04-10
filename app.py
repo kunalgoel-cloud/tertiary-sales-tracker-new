@@ -11,6 +11,17 @@ from channel_performance_module import render_channel_performance_tab
 from vending_module import render_vending_tab
 from sop_module import render_sop_tab
 
+# ── Global Filter System ──────────────────────────────────────────────────────
+# Centralized filter state management. All tabs share these filter values
+# via st.session_state. See global_filters.py for full architecture docs.
+from global_filters import (
+    init_global_filters,
+    render_global_filter_bar,
+    apply_global_filters,
+    get_global_filters,
+    get_date_range,
+)
+
 def _fmt_err(e: Exception) -> str:
     """Short readable error — strips 502 HTML bodies."""
     msg = str(e)
@@ -135,6 +146,13 @@ if not history_df.empty:
         history_df = history_df.copy()
         history_df["date_dt"] = pd.to_datetime(history_df["date"], errors="coerce")
         history_df = history_df.dropna(subset=["date_dt"])
+
+# ── Initialize global filter state (idempotent — safe to call on every rerun) ─
+# Seeds st.session_state["gf_*"] with default values on first load.
+# On subsequent reruns, existing user selections are preserved intact.
+if not history_df.empty:
+    init_global_filters(history_df)
+
 
 # ── Channel attribute helpers ─────────────────────────────────────────────
 def _chan_flag(channel_name: str, flag: str, default: bool) -> bool:
@@ -288,6 +306,15 @@ else:
     _TAB_SOP        = 5
 
 # ══════════════════════════════════════════════
+# GLOBAL FILTER BAR — rendered once, affects all data tabs
+# ══════════════════════════════════════════════
+# The global filter bar persists date range, channels, and products
+# across all tab switches via st.session_state["gf_*"].
+# Tabs read filters via get_global_filters() / apply_global_filters().
+if not history_df.empty:
+    render_global_filter_bar(history_df)
+
+# ══════════════════════════════════════════════
 # TAB 1 – TREND ANALYTICS  (unchanged)
 # ══════════════════════════════════════════════
 with tabs[_TAB_ANALYTICS]:
@@ -310,51 +337,42 @@ with tabs[_TAB_ANALYTICS]:
         metric_label    = "Revenue"  if "Revenue" in view_metric else "Qty"
         currency_prefix = "₹"        if "Revenue" in view_metric else ""
 
-        st.subheader("Time Filters")
-        today = datetime.now().date()
+        # ── GLOBAL FILTER: Date + Channel + Product ───────────────────────────
+        # Replaces the local Time Filters section. Values come from the
+        # Global Filter Bar (rendered above the tabs). Users adjust the
+        # period/channel/product once and all tabs update together.
+        _gf         = get_global_filters()
+        start_date  = _gf["start"]
+        end_date    = _gf["end"]
+        _gf_chans   = _gf["channels"]   # None = all channels selected
+        _gf_prods   = _gf["products"]   # None = no product filter
 
-        time_preset = st.radio(
-            "Period:",
-            ["Last 7 Days", "Last 30 Days", "Month to Date", "All Time", "Custom"],
-            horizontal=True,
-            index=3,
+        # Info banner: show currently active global filters
+        _chan_label = ", ".join(_gf_chans) if _gf_chans else "All"
+        _prod_label = ", ".join(_gf_prods) if _gf_prods else "All"
+        st.info(
+            f"🌐 **Active Filters** — "
+            f"Period: **{start_date}** → **{end_date}** | "
+            f"Channels: **{_chan_label}** | "
+            f"Products: **{_prod_label}**"
         )
 
-        # Cap end_date at the latest date with actual data to avoid
-        # diluting DRR with today (which has no sales data yet)
-        last_data_date = history_df["date_dt"].max().date()
-        effective_end  = min(today, last_data_date)
-
-        if time_preset == "Last 7 Days":
-            start_date, end_date = effective_end - timedelta(days=6), effective_end
-        elif time_preset == "Last 30 Days":
-            start_date, end_date = effective_end - timedelta(days=29), effective_end
-        elif time_preset == "Month to Date":
-            start_date, end_date = effective_end.replace(day=1), effective_end
-        elif time_preset == "All Time":
-            start_date = history_df["date_dt"].min().date()
-            end_date   = last_data_date
-        else:
-            dr = st.date_input("Range", value=(history_df["date_dt"].min().date(), effective_end))
-            start_date, end_date = (dr[0], dr[1]) if len(dr) == 2 else (effective_end, effective_end)
-
+        # Apply date filter
         mask     = (history_df["date_dt"].dt.date >= start_date) & (history_df["date_dt"].dt.date <= end_date)
         range_df = history_df[mask].copy()
 
-        f1, f2 = st.columns(2)
-        avail_chans = sorted(range_df["channel"].unique())
-        with f1:
-            sel_chan = st.multiselect("Filter Channels", avail_chans, default=avail_chans)
+        # Apply channel filter (global)
+        if _gf_chans:
+            range_df = range_df[range_df["channel"].isin(_gf_chans)]
 
-        chan_mask   = range_df["channel"].isin(sel_chan)
-        avail_items = sorted(range_df[chan_mask]["item_name"].unique())
-        with f2:
-            sel_item = st.multiselect("Filter Products", avail_items)
+        # Apply product filter (global)
+        filtered = range_df.copy()
+        if _gf_prods:
+            filtered = filtered[filtered["item_name"].isin(_gf_prods)]
 
-        final_mask = chan_mask
-        if sel_item:
-            final_mask &= range_df["item_name"].isin(sel_item)
-        filtered = range_df[final_mask].copy()
+        # Keep sel_item/sel_chan variables for backward-compatible chart logic below
+        sel_chan = _gf_chans or sorted(range_df["channel"].unique())
+        sel_item = _gf_prods or []
 
         total_val     = filtered[target_col].sum()
         intended_days = max((end_date - start_date).days + 1, 1)
@@ -412,35 +430,35 @@ with tabs[_TAB_DEEPDIVE]:
 
         st.subheader("🔬 Deep Dive Analytics")
 
-        # ── Shared filters for this tab ───────────────────────────────
-        today_dd = datetime.now().date()
-        dd_col1, dd_col2 = st.columns([3, 1])
-        with dd_col1:
-            dd_preset = st.radio(
-                "Period:",
-                ["Last 7 Days", "Last 30 Days", "Month to Date", "All Time", "Custom"],
-                horizontal=True,
-                index=3,
-                key="dd_period",
-            )
-        last_data_date_dd = history_df["date_dt"].max().date()
-        effective_end_dd  = min(today_dd, last_data_date_dd)
+        # ── GLOBAL FILTER: Date + Channel + Product ───────────────────────────
+        # The local Period radio and date pickers have been removed.
+        # This tab now reads the shared filter state set in the Global Filter Bar.
+        # To change the date range, channels, or products, adjust the controls
+        # above the tab strip — changes reflect here immediately.
+        _gf_dd   = get_global_filters()
+        dd_start = _gf_dd["start"]
+        dd_end   = _gf_dd["end"]
 
-        if dd_preset == "Last 7 Days":
-            dd_start, dd_end = effective_end_dd - timedelta(days=6), effective_end_dd
-        elif dd_preset == "Last 30 Days":
-            dd_start, dd_end = effective_end_dd - timedelta(days=29), effective_end_dd
-        elif dd_preset == "Month to Date":
-            dd_start, dd_end = effective_end_dd.replace(day=1), effective_end_dd
-        elif dd_preset == "All Time":
-            dd_start = history_df["date_dt"].min().date()
-            dd_end   = last_data_date_dd
-        else:
-            dd_dr = st.date_input("Custom Range", value=(history_df["date_dt"].min().date(), effective_end_dd), key="dd_range")
-            dd_start, dd_end = (dd_dr[0], dd_dr[1]) if len(dd_dr) == 2 else (effective_end_dd, effective_end_dd)
+        # Info banner: show currently active global filters
+        _dd_chan_label = ", ".join(_gf_dd["channels"]) if _gf_dd["channels"] else "All"
+        _dd_prod_label = ", ".join(_gf_dd["products"]) if _gf_dd["products"] else "All"
+        st.info(
+            f"🌐 **Active Filters** — "
+            f"Period: **{dd_start}** → **{dd_end}** | "
+            f"Channels: **{_dd_chan_label}** | "
+            f"Products: **{_dd_prod_label}**"
+        )
 
         dd_mask = (history_df["date_dt"].dt.date >= dd_start) & (history_df["date_dt"].dt.date <= dd_end)
         dd_df   = history_df[dd_mask].copy()
+
+        # Apply channel filter from global state
+        if _gf_dd["channels"]:
+            dd_df = dd_df[dd_df["channel"].isin(_gf_dd["channels"])]
+
+        # Apply product filter from global state
+        if _gf_dd["products"]:
+            dd_df = dd_df[dd_df["item_name"].isin(_gf_dd["products"])]
 
         if dd_df.empty:
             st.warning("No data in the selected period.")
