@@ -131,23 +131,18 @@ def render_global_filter_bar(history_df: pd.DataFrame) -> None:
     with st.container():
         st.markdown(
             """
-            <style>
-            /* Make global filter bar visually distinct */
-            div[data-testid="stVerticalBlock"] > div:has(> div[data-global-filter-bar]) {
-                background: var(--background-color);
-                border-bottom: 1px solid rgba(128,128,128,0.2);
-                padding-bottom: 0.5rem;
-                margin-bottom: 0.75rem;
-            }
-            </style>
+            <div style="display:flex; align-items:center; gap:0.5rem;
+                        margin-bottom:0.5rem;">
+              <span style="font-size:0.65rem; font-weight:700;
+                           letter-spacing:0.12em; text-transform:uppercase;
+                           color:#5C6370;">🌐 Global Filters</span>
+              <span style="flex:1; height:1px; background:linear-gradient(90deg,
+                    #2A2D3A, transparent);"></span>
+              <span style="font-size:0.65rem; color:#2A2D3A;">
+                applies to all data tabs
+              </span>
+            </div>
             """,
-            unsafe_allow_html=True,
-        )
-
-        st.markdown(
-            "<span style='font-size:0.75rem;font-weight:600;"
-            "letter-spacing:0.06em;color:gray;text-transform:uppercase'>"
-            "🌐 GLOBAL FILTERS — applied across all tabs</span>",
             unsafe_allow_html=True,
         )
 
