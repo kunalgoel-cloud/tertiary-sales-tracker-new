@@ -42,8 +42,9 @@ except ImportError:
 # CONSTANTS
 # ─────────────────────────────────────────────────────────────────────────────
 
-_DB_PATH          = "vending_database.json"
-_PRICE_TABLE      = "vending_sku_prices"   # Supabase table for persistent prices
+_DB_PATH          = "vending_database.json"   # local fallback (ephemeral on Cloud)
+_PRICE_TABLE      = "vending_sku_prices"       # Supabase: SKU prices
+_ANALYSIS_TABLE   = "vending_analyses"         # Supabase: saved analyses
 
 MONTHS = ["Jan","Feb","Mar","Apr","May","Jun",
           "Jul","Aug","Sep","Oct","Nov","Dec"]
@@ -83,22 +84,79 @@ def _init_state():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DATABASE  (JSON file — replace with Supabase for cloud persistence)
+# DATABASE — Supabase primary, local JSON fallback
+# Supabase table schema (run once in SQL Editor):
+#   CREATE TABLE IF NOT EXISTS vending_analyses (
+#     db_key      TEXT PRIMARY KEY,
+#     customer    TEXT,
+#     month       TEXT,
+#     year        INT,
+#     saved_at    TIMESTAMPTZ DEFAULT now(),
+#     price_map   JSONB DEFAULT '{}'::jsonb,
+#     data        JSONB DEFAULT '[]'::jsonb
+#   );
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _load_db() -> dict:
+    """Load saved vending analyses. Tries Supabase first, falls back to local JSON."""
+    sb = _get_supabase()
+    if sb is not None:
+        try:
+            res = sb.table(_ANALYSIS_TABLE).select("*").execute()
+            if res.data:
+                db = {}
+                for row in res.data:
+                    key = row.get("db_key", "")
+                    # data and price_map come back as dicts/lists from Supabase JSONB
+                    db[key] = {
+                        "customer":  row.get("customer", ""),
+                        "month":     row.get("month", ""),
+                        "year":      row.get("year", 0),
+                        "saved_at":  str(row.get("saved_at", "")),
+                        "price_map": row.get("price_map", {}),
+                        "data":      row.get("data", []),
+                    }
+                return db
+        except Exception:
+            pass  # fall through to local file
+
+    # Local JSON fallback (works in local dev; ephemeral on Streamlit Cloud)
     if os.path.exists(_DB_PATH):
         try:
             with open(_DB_PATH, "r") as f:
                 return json.load(f)
         except Exception:
-            return {}
+            pass
     return {}
 
 
 def _save_db(db: dict):
-    with open(_DB_PATH, "w") as f:
-        json.dump(db, f, indent=2)
+    """Save analysis dict. Tries Supabase first (persistent), then local JSON."""
+    sb = _get_supabase()
+    if sb is not None:
+        try:
+            for key, record in db.items():
+                row = {
+                    "db_key":    key,
+                    "customer":  record.get("customer", ""),
+                    "month":     record.get("month", ""),
+                    "year":      int(record.get("year", 0)),
+                    "saved_at":  record.get("saved_at", datetime.datetime.now().isoformat()),
+                    "price_map": record.get("price_map", {}),
+                    "data":      record.get("data", []),
+                }
+                sb.table(_ANALYSIS_TABLE).upsert(row, on_conflict="db_key").execute()
+            return  # saved to Supabase — no need for local file
+        except Exception as e:
+            # Log but don't silently swallow — show in UI
+            st.warning(f"Supabase save failed, using local fallback: {e}")
+
+    # Local JSON fallback
+    try:
+        with open(_DB_PATH, "w") as f:
+            json.dump(db, f, indent=2, default=str)
+    except Exception as e:
+        st.error(f"Could not save analysis: {e}")
 
 
 def _db_key(customer: str, month: str, year: int) -> str:
