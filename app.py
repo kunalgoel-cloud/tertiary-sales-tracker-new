@@ -22,6 +22,21 @@ from global_filters import (
     get_date_range,
 )
 
+# ── UI Design System ──────────────────────────────────────────────────────────
+# All visual styling, Plotly theming, and reusable components live here.
+# Call inject_css() once after set_page_config() to activate the design system.
+from ui_theme import (
+    inject_css,
+    apply_chart_theme,
+    brand_color_sequence,
+    section_header,
+    badge,
+    kpi_row,
+    page_header,
+    empty_state,
+    active_filter_pill,
+)
+
 def _fmt_err(e: Exception) -> str:
     """Short readable error — strips 502 HTML bodies."""
     msg = str(e)
@@ -33,7 +48,14 @@ def _fmt_err(e: Exception) -> str:
 # ─────────────────────────────────────────────
 # 1. CONFIG & DB CONNECTION
 # ─────────────────────────────────────────────
-st.set_page_config(page_title="Mamanourish Executive Tracker", layout="wide")
+st.set_page_config(
+    page_title="Mamanourish Executive Tracker",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+# ── Activate the Mamanourish Design System ────────────────────────────────────
+# Injects fonts, CSS custom properties, and all component overrides.
+inject_css()
 
 @st.cache_resource
 def get_supabase() -> Client:
@@ -101,28 +123,57 @@ def invalidate_data_cache():
 # ─────────────────────────────────────────────
 def check_auth() -> bool:
     if "authenticated" not in st.session_state:
-        st.title("🔐 Mamanourish Sales Portal")
-        role_choice = st.selectbox("I am a…", ["Select Role", "Admin (Full Access)", "Viewer (View Only)"])
-        pw = st.text_input("Enter Password", type="password")
+        # ── Styled login page ─────────────────────────────────────────────────
+        # Center the login card using columns
+        _, center_col, _ = st.columns([1, 1.2, 1])
+        with center_col:
+            st.markdown(
+                """
+                <div style="text-align:center; margin-top:2.5rem; margin-bottom:2rem;">
+                  <div style="font-family:'DM Serif Display',Georgia,serif;
+                              font-size:2rem; color:#F5A623; margin-bottom:0.3rem;">
+                    Mamanourish
+                  </div>
+                  <div style="font-size:0.75rem; color:#5C6370;
+                              letter-spacing:0.12em; text-transform:uppercase;">
+                    Executive Sales Portal
+                  </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
-        if st.button("Login"):
-            try:
-                admin_pw  = st.secrets["ADMIN_PASSWORD"]
-                viewer_pw = st.secrets["VIEWER_PASSWORD"]
-            except KeyError:
-                st.error("ADMIN_PASSWORD / VIEWER_PASSWORD not set in Streamlit Secrets.")
-                return False
+            role_choice = st.selectbox(
+                "Role",
+                ["Select Role", "Admin (Full Access)", "Viewer (View Only)"],
+                label_visibility="collapsed",
+                placeholder="Select your role…",
+            )
+            pw = st.text_input("Password", type="password", placeholder="Enter password…", label_visibility="collapsed")
 
-            if role_choice == "Admin (Full Access)" and pw == admin_pw:
-                st.session_state["authenticated"] = True
-                st.session_state["role"] = "admin"
-                st.rerun()
-            elif role_choice == "Viewer (View Only)" and pw == viewer_pw:
-                st.session_state["authenticated"] = True
-                st.session_state["role"] = "viewer"
-                st.rerun()
-            else:
-                st.error("Incorrect password or role.")
+            if st.button("Sign In →", use_container_width=True):
+                try:
+                    admin_pw  = st.secrets["ADMIN_PASSWORD"]
+                    viewer_pw = st.secrets["VIEWER_PASSWORD"]
+                except KeyError:
+                    st.error("ADMIN_PASSWORD / VIEWER_PASSWORD not set in Streamlit Secrets.")
+                    return False
+
+                if role_choice == "Admin (Full Access)" and pw == admin_pw:
+                    st.session_state["authenticated"] = True
+                    st.session_state["role"] = "admin"
+                    st.rerun()
+                elif role_choice == "Viewer (View Only)" and pw == viewer_pw:
+                    st.session_state["authenticated"] = True
+                    st.session_state["role"] = "viewer"
+                    st.rerun()
+                else:
+                    st.error("Incorrect password or role — please try again.")
+
+            st.markdown(
+                '<div style="text-align:center; margin-top:1.5rem; font-size:0.7rem; color:#2A2D3A;">Mamanourish © 2025</div>',
+                unsafe_allow_html=True,
+            )
         return False
     return True
 
@@ -177,11 +228,25 @@ def requires_city_channel(ch: str) -> bool:
 # SIDEBAR
 # ─────────────────────────────────────────────
 with st.sidebar:
-    st.header(f"👤 {role.upper()}")
+    # ── Branded sidebar header ────────────────────────────────────────────────
+    st.markdown(
+        f"""
+        <div style="margin-bottom:1rem;">
+          <div style="font-family:'DM Serif Display',Georgia,serif;
+                      font-size:1.15rem; color:#F5A623; margin-bottom:0.15rem;">
+            Mamanourish
+          </div>
+          <div class="role-badge">
+            {"🔑 Admin" if role == "admin" else "👁 Viewer"}
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     if role == "admin":
         st.divider()
-        st.subheader("🛠 Data Correction")
+        st.markdown("## 🛠 Data Correction")
 
         with st.expander("Delete Specific Entry"):
             del_mode = st.radio(
@@ -319,7 +384,7 @@ if not history_df.empty:
 # ══════════════════════════════════════════════
 with tabs[_TAB_ANALYTICS]:
     if history_df.empty:
-        st.info("No data found. Admin must upload sales data first.")
+        empty_state("📊", "No data yet", "Admin must upload sales data via the Smart Upload tab first.")
     else:
         # date_dt already parsed at startup — no re-parse needed
 
@@ -347,15 +412,8 @@ with tabs[_TAB_ANALYTICS]:
         _gf_chans   = _gf["channels"]   # None = all channels selected
         _gf_prods   = _gf["products"]   # None = no product filter
 
-        # Info banner: show currently active global filters
-        _chan_label = ", ".join(_gf_chans) if _gf_chans else "All"
-        _prod_label = ", ".join(_gf_prods) if _gf_prods else "All"
-        st.info(
-            f"🌐 **Active Filters** — "
-            f"Period: **{start_date}** → **{end_date}** | "
-            f"Channels: **{_chan_label}** | "
-            f"Products: **{_prod_label}**"
-        )
+        # Styled active-filter pill row
+        active_filter_pill(start_date, end_date, _gf_chans, _gf_prods)
 
         # Apply date filter
         mask     = (history_df["date_dt"].dt.date >= start_date) & (history_df["date_dt"].dt.date <= end_date)
@@ -397,14 +455,16 @@ with tabs[_TAB_ANALYTICS]:
             )
             fig = px.bar(
                 plot_df, x="date", y=target_col,
-                color=color_theme, barmode="stack", height=500,
+                color=color_theme, barmode="stack", height=480,
             )
             fig.add_hline(
-                y=avg_drr, line_dash="dash", line_color="red",
+                y=avg_drr, line_dash="dash", line_color="#E74C3C",
                 annotation_text="Avg DRR",
+                annotation_font_color="#E74C3C",
             )
             if show_labels:
-                fig.update_traces(texttemplate="%{y:.2s}", textposition="inside")
+                fig.update_traces(texttemplate="%{y:.2s}", textposition="inside",
+                                  textfont_size=10)
                 totals = plot_df.groupby("date")[target_col].sum().reset_index()
                 fig.add_scatter(
                     x=totals["date"],
@@ -413,7 +473,9 @@ with tabs[_TAB_ANALYTICS]:
                     mode="text",
                     textposition="top center",
                     showlegend=False,
+                    textfont=dict(color="#F0F2F5", size=10),
                 )
+            fig = apply_chart_theme(fig)
             st.plotly_chart(fig, use_container_width=True)
             display_cols = [c for c in filtered.columns if c not in ("date_dt", "id")]
             st.dataframe(filtered[display_cols], hide_index=True)
@@ -423,7 +485,7 @@ with tabs[_TAB_ANALYTICS]:
 # ══════════════════════════════════════════════
 with tabs[_TAB_DEEPDIVE]:
     if history_df.empty:
-        st.info("No data found. Admin must upload sales data first.")
+        empty_state("📊", "No data yet", "Admin must upload sales data via the Smart Upload tab first.")
     else:
         # Ensure date column is parsed (re-do in case tab 1 was skipped)
         # date_dt already parsed at startup — no re-parse needed
@@ -439,15 +501,8 @@ with tabs[_TAB_DEEPDIVE]:
         dd_start = _gf_dd["start"]
         dd_end   = _gf_dd["end"]
 
-        # Info banner: show currently active global filters
-        _dd_chan_label = ", ".join(_gf_dd["channels"]) if _gf_dd["channels"] else "All"
-        _dd_prod_label = ", ".join(_gf_dd["products"]) if _gf_dd["products"] else "All"
-        st.info(
-            f"🌐 **Active Filters** — "
-            f"Period: **{dd_start}** → **{dd_end}** | "
-            f"Channels: **{_dd_chan_label}** | "
-            f"Products: **{_dd_prod_label}**"
-        )
+        # Styled active-filter pill row
+        active_filter_pill(dd_start, dd_end, _gf_dd["channels"], _gf_dd["products"])
 
         dd_mask = (history_df["date_dt"].dt.date >= dd_start) & (history_df["date_dt"].dt.date <= dd_end)
         dd_df   = history_df[dd_mask].copy()
@@ -464,7 +519,8 @@ with tabs[_TAB_DEEPDIVE]:
             st.warning("No data in the selected period.")
         else:
 
-            dd_days = max((dd_end - dd_start).days + 1, 1)
+            dd_days  = max((dd_end - dd_start).days + 1, 1)
+            today_dd = datetime.now().date()   # needed by Ops Health Check below
             dd_df["week_label"] = dd_df["date_dt"].dt.to_period("W").apply(lambda p: str(p.start_time.date()))
             dd_df["dow"]        = dd_df["date_dt"].dt.day_name()
     
@@ -473,8 +529,7 @@ with tabs[_TAB_DEEPDIVE]:
             # ════════════════════════════════
             # VIEW 1 — Channel Mix Donut
             # ════════════════════════════════
-            st.markdown("### 🍩 Channel Revenue Mix")
-            st.caption("What % of total revenue comes from each platform — spot platform concentration risk at a glance.")
+            section_header("🍩", "Channel Revenue Mix", "revenue & unit share")
     
             chan_rev = dd_df.groupby("channel")["revenue"].sum().reset_index().sort_values("revenue", ascending=False)
             chan_qty = dd_df.groupby("channel")["qty_sold"].sum().reset_index().sort_values("qty_sold", ascending=False)
@@ -486,7 +541,7 @@ with tabs[_TAB_DEEPDIVE]:
                     chan_rev, values="revenue", names="channel",
                     hole=0.55, height=380,
                     title="By Revenue (₹)",
-                    color_discrete_sequence=px.colors.qualitative.Bold,
+                    color_discrete_sequence=brand_color_sequence(),
                 )
                 fig_donut_rev.update_traces(textinfo="label+percent", textposition="outside")
                 fig_donut_rev.update_layout(showlegend=False, margin=dict(t=50, b=10, l=10, r=10))
@@ -496,6 +551,7 @@ with tabs[_TAB_DEEPDIVE]:
                     text=f"₹{total_rev/1000:.1f}K", x=0.5, y=0.5,
                     font=dict(size=18, color="black"), showarrow=False,
                 )
+                fig_donut_rev = apply_chart_theme(fig_donut_rev)
                 st.plotly_chart(fig_donut_rev, use_container_width=True)
     
             with donut_c2:
@@ -503,7 +559,7 @@ with tabs[_TAB_DEEPDIVE]:
                     chan_qty, values="qty_sold", names="channel",
                     hole=0.55, height=380,
                     title="By Units Sold",
-                    color_discrete_sequence=px.colors.qualitative.Bold,
+                    color_discrete_sequence=brand_color_sequence(),
                 )
                 fig_donut_qty.update_traces(textinfo="label+percent", textposition="outside")
                 fig_donut_qty.update_layout(showlegend=False, margin=dict(t=50, b=10, l=10, r=10))
@@ -512,6 +568,7 @@ with tabs[_TAB_DEEPDIVE]:
                     text=f"{total_qty:,.0f} units", x=0.5, y=0.5,
                     font=dict(size=14, color="black"), showarrow=False,
                 )
+                fig_donut_qty = apply_chart_theme(fig_donut_qty)
                 st.plotly_chart(fig_donut_qty, use_container_width=True)
     
             # Channel mix summary table
@@ -534,8 +591,7 @@ with tabs[_TAB_DEEPDIVE]:
             # ════════════════════════════════
             # VIEW 2 — SKU Performance Table
             # ════════════════════════════════
-            st.markdown("### 🏆 SKU Performance Ranking")
-            st.caption("Which products are driving the business — and which need attention.")
+            section_header("🏆", "SKU Performance Ranking", "by revenue")
     
             sku_perf = (
                 dd_df.groupby("item_name")
@@ -562,6 +618,7 @@ with tabs[_TAB_DEEPDIVE]:
             )
             fig_sku.update_traces(textposition="outside")
             fig_sku.update_layout(coloraxis_showscale=False, margin=dict(l=10, r=80, t=20, b=20))
+            fig_sku = apply_chart_theme(fig_sku)
             st.plotly_chart(fig_sku, use_container_width=True)
     
             sku_perf.columns = ["SKU", "Revenue (₹)", "Units", "Rev Share %", "Avg Price (₹)", "DRR (₹)", "Status"]
@@ -579,8 +636,7 @@ with tabs[_TAB_DEEPDIVE]:
             # ════════════════════════════════
             # VIEW 3 — Week-over-Week Trend
             # ════════════════════════════════
-            st.markdown("### 📈 Week-over-Week Performance")
-            st.caption("Are we growing or declining? WoW change per channel reveals momentum shifts.")
+            section_header("📈", "Week-over-Week Performance")
     
             wow_metric = st.radio("WoW Metric:", ["Revenue (₹)", "Quantity (Units)"], horizontal=True, key="wow_metric")
             wow_col    = "revenue" if "Revenue" in wow_metric else "qty_sold"
@@ -597,10 +653,11 @@ with tabs[_TAB_DEEPDIVE]:
                 weekly, x="week_label", y=wow_col, color="channel",
                 markers=True, height=420,
                 labels={"week_label": "Week Starting", wow_col: wow_metric},
-                color_discrete_sequence=px.colors.qualitative.Bold,
+                color_discrete_sequence=brand_color_sequence(),
             )
             fig_wow.update_traces(line_width=2.5, marker_size=8)
             fig_wow.update_layout(xaxis_title="Week", hovermode="x unified")
+            fig_wow = apply_chart_theme(fig_wow)
             st.plotly_chart(fig_wow, use_container_width=True)
     
             # WoW change table — pivot weeks as columns
@@ -633,8 +690,7 @@ with tabs[_TAB_DEEPDIVE]:
             # ════════════════════════════════
             # VIEW 4 — Day-of-Week Heatmap
             # ════════════════════════════════
-            st.markdown("### 🗓️ Day-of-Week Revenue Heatmap")
-            st.caption("When do customers buy? Use this to time promotions and ensure stock is ready on peak days.")
+            section_header("🗓️", "Day-of-Week Heatmap", "when do customers buy?")
     
             dow_metric = st.radio("Heatmap Metric:", ["Revenue (₹)", "Quantity (Units)"], horizontal=True, key="dow_metric")
             dow_col    = "revenue" if "Revenue" in dow_metric else "qty_sold"
@@ -672,6 +728,7 @@ with tabs[_TAB_DEEPDIVE]:
                 yaxis_title="Channel",
                 margin=dict(l=10, r=10, t=20, b=20),
             )
+            fig_heat = apply_chart_theme(fig_heat)
             st.plotly_chart(fig_heat, use_container_width=True)
     
             # Best/worst day callout
@@ -688,8 +745,7 @@ with tabs[_TAB_DEEPDIVE]:
             # ════════════════════════════════
             # VIEW 5 — SKU × Channel Matrix
             # ════════════════════════════════
-            st.markdown("### 📦 SKU × Channel Revenue Matrix")
-            st.caption("Where is each product actually selling? Blank cells = not listed or zero sales on that platform.")
+            section_header("📦", "SKU × Channel Matrix", "distribution gaps")
     
             matrix_metric = st.radio("Matrix Metric:", ["Revenue (₹)", "Quantity (Units)"], horizontal=True, key="matrix_metric")
             mat_col       = "revenue" if "Revenue" in matrix_metric else "qty_sold"
@@ -722,6 +778,7 @@ with tabs[_TAB_DEEPDIVE]:
                 yaxis_title="",
                 margin=dict(l=10, r=10, t=20, b=20),
             )
+            fig_matrix = apply_chart_theme(fig_matrix)
             st.plotly_chart(fig_matrix, use_container_width=True)
     
             # Distribution gap alert
@@ -740,8 +797,7 @@ with tabs[_TAB_DEEPDIVE]:
             # ════════════════════════════════
             # VIEW 6 — Zero-Sales Alert Panel
             # ════════════════════════════════
-            st.markdown("### ⚠️ Ops Health Check")
-            st.caption("SKUs with no sales in the last 7 days, and channels with no recent data uploads.")
+            section_header("⚠️", "Ops Health Check", "last 7 days")
     
             alert_cutoff   = today_dd - timedelta(days=7)
             recent_df      = history_df[history_df["date_dt"].dt.date >= alert_cutoff]
@@ -783,11 +839,10 @@ with tabs[_TAB_MARKETING]:
         and history_df["city"].notna().any()
     )
     if not _has_city_data:
-        st.info(
-            "📣 **Performance Marketing** is based on city-level sales data. "
-            "No city-level data has been uploaded yet, or all active channels "
-            "are configured without city data. "
-            "Upload data from a channel with 'Has city-level data' enabled to use this module."
+        empty_state(
+            "📣", "City-Level Data Required",
+            "Performance Marketing uses city-level sales. Upload data from a channel "
+            "with 'Has city-level data' enabled to unlock this module."
         )
     else:
         render_marketing_tab(role)
@@ -797,7 +852,7 @@ with tabs[_TAB_MARKETING]:
 # ══════════════════════════════════════════════
 if role == "admin":
     with tabs[_TAB_UPLOAD]:
-        st.subheader("Upload Sales Report")
+        page_header("Smart Upload", "Map & sync sales reports to cloud", role="")
 
         channels = master_chans["name"].tolist() if not master_chans.empty else []
         if not channels:
@@ -1013,7 +1068,7 @@ if role == "admin":
     # TAB – MONTHLY CHANNEL UPLOAD  (admin only)
     # ══════════════════════════════════════════
     with tabs[_TAB_MONTHLY_UPLOAD]:
-        st.subheader("📅 Monthly Channel Sales Entry")
+        page_header("Monthly Channel Upload", "Spread channel totals across days", role="")
         st.caption(
             "For channels where daily data is unavailable. "
             "Sales can be entered for a whole month (auto-split across days) "
@@ -1331,7 +1386,7 @@ if role == "admin":
     # TAB – CONFIGURATION  (admin only)
     # ══════════════════════════════════════════
     with tabs[_TAB_CONFIG]:
-        st.subheader("⚙️ System Configuration")
+        page_header("System Configuration", "Manage SKUs, channels, and mappings", role="")
         sc1, sc2 = st.columns(2)
 
         with sc1:
@@ -1394,10 +1449,10 @@ with tabs[_TAB_CHANPERF]:
         and history_df["city"].notna().any()
     )
     if not _has_city_data_cp:
-        st.info(
-            "📦 **Channel Performance** requires city-level sales data. "
-            "No city-level data has been uploaded yet, or all active channels "
-            "are configured without city data."
+        empty_state(
+            "📦", "City-Level Data Required",
+            "Channel Performance requires city-tagged sales records. "
+            "Configure channels with 'Has city-level data' in Settings and upload data."
         )
     else:
         render_channel_performance_tab(supabase, master_skus, role)
