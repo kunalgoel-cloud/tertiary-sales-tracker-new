@@ -381,6 +381,30 @@ with st.sidebar:
         render_global_filter_bar(history_df)
 
     st.divider()
+
+    # ── Refresh button ────────────────────────────────────────────────────────
+    # Clears the Supabase data cache (get_table, _get_performance, _get_sales)
+    # and all filter result caches from performance.py, then forces a rerun.
+    # Use this when data has been uploaded and you want it reflected immediately
+    # without a browser refresh.
+    _last_refresh = st.session_state.get("_last_refresh_time", "Never")
+    st.caption(f"Last refreshed: {_last_refresh}")
+    if st.button("🔄 Refresh Data", use_container_width=True, help="Clear data cache and reload from Supabase"):
+        # Clear Supabase table cache
+        get_table.clear()
+        # Clear performance filter caches (all keys prefixed with _fc_, _fhash_, _agg_)
+        perf_keys = [k for k in st.session_state if
+                     k.startswith(("_fc_", "_fhash_", "_agg_", "_lazy_", "_wow_"))]
+        for k in perf_keys:
+            del st.session_state[k]
+        # Record refresh time
+        from datetime import datetime as _dt
+        st.session_state["_last_refresh_time"] = _dt.now().strftime("%H:%M:%S")
+        # Re-initialize global filters on next load
+        st.session_state.pop("gf_initialized", None)
+        st.rerun()
+
+    st.divider()
     if st.button("Logout"):
         del st.session_state["authenticated"]
         del st.session_state["role"]
