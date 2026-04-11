@@ -70,7 +70,7 @@ def _load_item_map(supabase_client) -> pd.DataFrame:
         return pd.DataFrame(columns=["raw_name", "master_name"])
 
 
-@st.cache_data(ttl=120)
+@st.cache_data(ttl=120, show_spinner=False)
 def _get_sales(_supabase, days: int) -> pd.DataFrame:
     """
     Pull last `days` days of sales from Supabase.
