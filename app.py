@@ -121,7 +121,7 @@ def sanitize(text: str) -> str:
     """Strip dangerous characters from user-supplied names."""
     return re.sub(r"[<>\"'%;()&+]", "", str(text)).strip()[:200]
 
-@st.cache_data(ttl=120, show_spinner=False)
+@st.cache_data(ttl=120)
 def get_table(table: str, default_cols: tuple) -> pd.DataFrame:
     """
     Paginated Supabase fetch with 120s cache (show_spinner=False keeps the
