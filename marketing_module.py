@@ -139,7 +139,7 @@ def _delete_mapping(sb, campaign: str, product_name: str) -> bool:
         return False
 
 
-@st.cache_data(ttl=120)
+@st.cache_data(ttl=120, show_spinner=False)
 def _get_performance(_sb) -> pd.DataFrame:
     """
     Fetch marketing performance data. Cached for 120 s so the 5 sub-tabs
