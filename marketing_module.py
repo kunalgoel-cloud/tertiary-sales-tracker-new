@@ -139,12 +139,18 @@ def _delete_mapping(sb, campaign: str, product_name: str) -> bool:
         return False
 
 
-def _get_performance(sb) -> pd.DataFrame:
+@st.cache_data(ttl=120)
+def _get_performance(_sb) -> pd.DataFrame:
+    """
+    Fetch marketing performance data. Cached for 120 s so the 5 sub-tabs
+    that call this function share a single Supabase round-trip per session.
+    The leading underscore on _sb tells Streamlit not to hash the client object.
+    """
     try:
         all_rows = []
         page, PAGE_SIZE = 0, 1000
         while True:
-            r = sb.table("performance").select("*").order("date", desc=True)\
+            r = _sb.table("performance").select("*").order("date", desc=True)\
                 .range(page * PAGE_SIZE, (page + 1) * PAGE_SIZE - 1).execute()
             if not r.data:
                 break
