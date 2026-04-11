@@ -121,15 +121,9 @@ def sanitize(text: str) -> str:
     """Strip dangerous characters from user-supplied names."""
     return re.sub(r"[<>\"'%;()&+]", "", str(text)).strip()[:200]
 
-@st.cache_data(ttl=120)
+@st.cache_data(ttl=120, show_spinner=False)
 def get_table(table: str, default_cols: tuple) -> pd.DataFrame:
-    """
-    Paginated Supabase fetch with 120s cache (show_spinner=False keeps the
-    UI clean — the top loading bar from performance.py handles perceived load).
-    Master/config tables (skus, channels, item_map) could use a longer TTL
-    but share this function for simplicity.
-    """
-    """Fetch a Supabase table with pagination (cached 120s); return empty DataFrame on failure."""
+    """Fetch a Supabase table with pagination (cached 120 s)."""
     try:
         all_rows = []
         page = 0
