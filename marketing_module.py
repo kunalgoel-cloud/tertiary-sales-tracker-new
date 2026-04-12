@@ -1097,7 +1097,12 @@ def _render_deep_dive(sb):
                         f"</div>",
                         unsafe_allow_html=True,
                     )
-                    st.plotly_chart(fig_spark, use_container_width=True, config={"displayModeBar": False})
+                    st.plotly_chart(
+                        fig_spark,
+                        use_container_width=True,
+                        config={"displayModeBar": False},
+                        key=f"spark_{camp}_{j}",
+                    )
 
     # ════════════════════════════════════════════════════════
     # TAB 4 — VOLATILITY vs RETURN (Risk/Return scatter)
