@@ -720,19 +720,12 @@ if _TAB_DEEPDIVE >= 0:
             wow_col    = "revenue" if "Revenue" in wow_metric else "qty_sold"
             wow_prefix = "₹" if "Revenue" in wow_metric else ""
 
-            # lazy_section: skip heavy groupby if only display metric changed
-            # but data (dd_df) and metric (wow_col) are the same
-            _wow_dep = (id(dd_df), wow_col, dd_start, dd_end)
-            with lazy_section("wow_chart", depends_on=_wow_dep):
-              if not is_lazy_skip("wow_chart"):
-                weekly = (
-                  dd_df.groupby(["week_label", "channel"])[wow_col]
-                  .sum()
-                  .reset_index()
-                  .sort_values("week_label")
-                )
-                st.session_state["_wow_weekly"] = weekly
-              weekly = st.session_state.get("_wow_weekly", pd.DataFrame())
+            weekly = (
+                dd_df.groupby(["week_label", "channel"])[wow_col]
+                .sum()
+                .reset_index()
+                .sort_values("week_label")
+            )
     
             fig_wow = px.line(
                 weekly, x="week_label", y=wow_col, color="channel",
