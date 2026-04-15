@@ -359,15 +359,11 @@ hr, [data-testid="stDivider"] > hr { border:none !important; border-top:1px soli
 
 def apply_chart_theme(fig: go.Figure, height: int = None) -> go.Figure:
     """
-    Apply consistent Mamanourish dark theme to any Plotly figure.
-    Call before st.plotly_chart(fig).
-
-    Usage:
-        fig = px.bar(...)
-        fig = apply_chart_theme(fig)
-        st.plotly_chart(fig, use_container_width=True)
+    Apply consistent Mamanourish light theme to any Plotly figure.
+    Uses update_xaxes/update_yaxes instead of xaxis=dict() in update_layout
+    to avoid wiping layout properties like barmode that px.bar sets internally.
     """
-    updates = dict(
+    fig.update_layout(
         plot_bgcolor  = "rgba(0,0,0,0)",
         paper_bgcolor = "rgba(0,0,0,0)",
         font          = dict(family="DM Sans, system-ui, sans-serif",
@@ -379,22 +375,6 @@ def apply_chart_theme(fig: go.Figure, height: int = None) -> go.Figure:
             borderwidth = 1,
             font        = dict(size=11, color="#6B5F55"),
         ),
-        xaxis = dict(
-            gridcolor    = "#F0EDE8",
-            linecolor    = "#E2DDD8",
-            tickcolor    = "#E2DDD8",
-            tickfont     = dict(color="#A89E95", size=10),
-            title_font   = dict(color="#6B5F55", size=11),
-            zeroline     = False,
-        ),
-        yaxis = dict(
-            gridcolor    = "#F0EDE8",
-            linecolor    = "rgba(0,0,0,0)",
-            tickcolor    = "#E2DDD8",
-            tickfont     = dict(color="#A89E95", size=10),
-            title_font   = dict(color="#6B5F55", size=11),
-            zeroline     = False,
-        ),
         hoverlabel = dict(
             bgcolor     = "#FFFFFF",
             bordercolor = "#E2DDD8",
@@ -402,9 +382,27 @@ def apply_chart_theme(fig: go.Figure, height: int = None) -> go.Figure:
         ),
         margin = dict(l=12, r=12, t=12, b=12),
     )
+    # Use update_xaxes/update_yaxes so we PATCH rather than REPLACE axis settings.
+    # Passing xaxis=dict(...) in update_layout replaces the entire axis object,
+    # which can reset barmode grouping that px.bar stores on the axis internals.
+    fig.update_xaxes(
+        gridcolor  = "#F0EDE8",
+        linecolor  = "#E2DDD8",
+        tickcolor  = "#E2DDD8",
+        tickfont   = dict(color="#A89E95", size=10),
+        title_font = dict(color="#6B5F55", size=11),
+        zeroline   = False,
+    )
+    fig.update_yaxes(
+        gridcolor  = "#F0EDE8",
+        linecolor  = "rgba(0,0,0,0)",
+        tickcolor  = "#E2DDD8",
+        tickfont   = dict(color="#A89E95", size=10),
+        title_font = dict(color="#6B5F55", size=11),
+        zeroline   = False,
+    )
     if height:
-        updates["height"] = height
-    fig.update_layout(**updates)
+        fig.update_layout(height=height)
     return fig
 
 
