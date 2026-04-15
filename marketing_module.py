@@ -521,61 +521,58 @@ def _apply_filters(df: pd.DataFrame, key_prefix: str, show_product: bool = True)
     """
     Apply filters to a marketing performance DataFrame.
 
-    GLOBAL FILTER INTEGRATION:
-    - Date range and channel filter are read from the global filter state
-      (st.session_state["gf_*"]) when the global filter system is active.
-    - This keeps marketing date/channel in sync with the rest of the app.
-    - The campaign/product filter remains LOCAL (marketing-specific concept,
-      not shared with sales tabs).
+    DATE: read from global filter state (keeps date in sync with rest of app).
 
-    Fallback: if global_filters module is unavailable, renders its own
-    date + channel widgets (backward-compatible).
+    CHANNEL: uses a LOCAL multiselect showing MARKETING channel names
+    (e.g. "Amazon", "Swiggy") — NOT the global sales channel names
+    (e.g. "Amazon RKW", "Amazon Seller"). The global channel filter uses
+    sales DB channel names which differ from marketing channel names due to
+    the channel_map (Amazon → Amazon RKW + Amazon Seller). Applying the global
+    channel filter directly would silently exclude "Amazon" because "Amazon RKW"
+    and "Amazon Seller" don't exist in the marketing performance DataFrame.
+
+    PRODUCT: always local (marketing-specific concept).
     """
     min_date = df["date"].min().date()
     max_date = df["date"].max().date()
 
-    # ── Read date + channel from global filter state ──────────────────────────
+    # ── Date: from global filter ──────────────────────────────────────────────
     if _GLOBAL_FILTERS_AVAILABLE:
-        _gf    = _get_global_filters()
-        start  = _gf["start"] or min_date
-        end    = _gf["end"]   or max_date
-        # Clamp to available data range
-        start  = max(start, min_date)
-        end    = min(end,   max_date)
-        # Channel: use global selection if set; otherwise all marketing channels
-        all_channels = sorted(df["channel"].unique())
-        gf_chans     = _gf["channels"]
-        # Only apply global channels that exist in marketing data
-        ch_f = [c for c in (gf_chans or []) if c in all_channels] or all_channels
-        # Show info label so user knows filters are from global bar
-        st.caption(
-            f"📅 Period: **{start}** → **{end}** | "
-            f"Channels: **{', '.join(ch_f) if ch_f != all_channels else 'All'}** "
-            f"_(from Global Filter Bar above tabs)_"
-        )
+        _gf   = _get_global_filters()
+        start = _gf["start"] or min_date
+        end   = _gf["end"]   or max_date
+        start = max(start, min_date)
+        end   = min(end,   max_date)
     else:
-        # ── Fallback: render local widgets (no global filter system) ──────────
-        fc1, fc2 = st.columns([2, 2])
-        with fc1:
-            dr = st.date_input(
-                "Date Range", value=(min_date, max_date),
-                min_value=min_date, max_value=max_date,
-                key=f"{key_prefix}_dr",
-            )
-        with fc2:
-            all_channels = sorted(df["channel"].unique())
-            ch_f = st.multiselect("Channels", all_channels, default=all_channels, key=f"{key_prefix}_ch")
+        dr    = st.date_input(
+            "Date Range", value=(min_date, max_date),
+            min_value=min_date, max_value=max_date,
+            key=f"{key_prefix}_dr",
+        )
         start = dr[0] if len(dr) == 2 else min_date
         end   = dr[1] if len(dr) == 2 else max_date
 
-    # ── LOCAL filter: Product (marketing-specific, not in global bar) ─────────
+    # ── Channel: LOCAL selector using marketing channel names ─────────────────
+    # Must be local because marketing channels ("Amazon") differ from global
+    # sales channels ("Amazon RKW", "Amazon Seller") due to channel_map.
+    all_channels = sorted(df["channel"].unique())
+    ch_f = st.multiselect(
+        "Channels",
+        all_channels,
+        default=all_channels,
+        key=f"{key_prefix}_ch",
+        help="Filter by marketing channel. 'Amazon' includes Amazon RKW + Amazon Seller.",
+    )
+
+    st.caption(f"📅 Date from Global Filters: **{start}** → **{end}**")
+
+    # ── LOCAL filter: Product ─────────────────────────────────────────────────
     if show_product and "product" in df.columns:
         all_products = sorted(df["product"].unique())
         pr_f = st.multiselect(
-            "Products (local filter)",
+            "Products",
             all_products, default=all_products,
             key=f"{key_prefix}_pr",
-            help="This product filter is local to the Marketing tab only.",
         )
     else:
         pr_f = []
