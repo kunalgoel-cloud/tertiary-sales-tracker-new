@@ -924,7 +924,30 @@ if _TAB_MARKETING >= 0:
             "with 'Has city-level data' enabled to unlock this module."
         )
     else:
-        render_marketing_tab(role)
+        # ── Deferred load: render_marketing_tab makes 8+ DB calls.
+        # Show a load button on first visit to avoid startup timeout.
+        # Once loaded, st.session_state["_mkt_loaded"] keeps it rendered.
+        if not st.session_state.get("_mkt_loaded", False):
+            st.markdown(
+                """
+                <div style="text-align:center;padding:3rem 1rem;">
+                  <div style="font-size:2rem;margin-bottom:0.75rem;">📣</div>
+                  <div style="font-weight:600;font-size:1rem;color:#1C1917;
+                              margin-bottom:0.4rem;">Performance Marketing</div>
+                  <div style="font-size:0.82rem;color:#A89E95;margin-bottom:1.5rem;">
+                    Click below to load marketing analytics data
+                  </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            _, btn_col, _ = st.columns([2, 1, 2])
+            with btn_col:
+                if st.button("📊 Load Marketing Data", use_container_width=True):
+                    st.session_state["_mkt_loaded"] = True
+                    st.rerun()
+        else:
+            render_marketing_tab(role)
 
 # ══════════════════════════════════════════════
 # TAB 4 – SMART UPLOAD  (admin only)
