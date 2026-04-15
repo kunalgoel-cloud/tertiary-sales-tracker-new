@@ -59,12 +59,12 @@ def _fmt_err(e: Exception) -> str:
 
 
 @st.cache_resource
+@st.cache_resource
 def _get_marketing_supabase() -> Client:
     try:
         return create_client(st.secrets["MARKETING_SUPABASE_URL"], st.secrets["MARKETING_SUPABASE_KEY"])
     except KeyError:
-        st.error("Add MARKETING_SUPABASE_URL and MARKETING_SUPABASE_KEY to Streamlit Secrets.")
-        st.stop()
+        return None   # handled gracefully in render_marketing_tab
 
 
 @st.cache_resource
@@ -2243,6 +2243,15 @@ def render_marketing_tab(role: str):
     - Sales data (TACOS): SUPABASE_URL / SUPABASE_KEY
     """
     sb = _get_marketing_supabase()
+
+    # Guard: if marketing Supabase secrets are missing, show info instead of crashing
+    if sb is None:
+        st.info(
+            "📣 **Performance Marketing** requires separate Supabase credentials. "
+            "Add `MARKETING_SUPABASE_URL` and `MARKETING_SUPABASE_KEY` to your "
+            "Streamlit Secrets to enable this module."
+        )
+        return
 
     if role == "admin":
         sub_tabs = st.tabs([
