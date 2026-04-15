@@ -553,12 +553,16 @@ if _TAB_ANALYTICS >= 0:
                     textfont=dict(color="#1C1917", size=10, family="JetBrains Mono"),
                 )
             fig = apply_chart_theme(fig)
-            # Re-assert stack mode and increase top margin for total labels
+            # Force categorical x-axis + re-assert stack mode.
+            # Without xaxis_type="category", Plotly can infer a date/linear
+            # axis from string-date values, which renders bars grouped side-by-side
+            # instead of stacked. Categorical forces one column per date.
             fig.update_layout(
                 barmode="stack",
                 bargap=0.15,
                 bargroupgap=0,
                 margin=dict(l=12, r=12, t=48, b=12),
+                xaxis_type="category",
             )
             st.plotly_chart(fig, use_container_width=True)
             display_cols = [c for c in filtered.columns if c not in ("date_dt", "id")]
