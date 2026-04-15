@@ -553,8 +553,13 @@ if _TAB_ANALYTICS >= 0:
                     textfont=dict(color="#1C1917", size=10, family="JetBrains Mono"),
                 )
             fig = apply_chart_theme(fig)
-            # Increase top margin so total labels above bars aren't clipped
-            fig.update_layout(margin=dict(l=12, r=12, t=48, b=12))
+            # Re-assert stack mode and increase top margin for total labels
+            fig.update_layout(
+                barmode="stack",
+                bargap=0.15,
+                bargroupgap=0,
+                margin=dict(l=12, r=12, t=48, b=12),
+            )
             st.plotly_chart(fig, use_container_width=True)
             display_cols = [c for c in filtered.columns if c not in ("date_dt", "id")]
             st.dataframe(filtered[display_cols], hide_index=True)
