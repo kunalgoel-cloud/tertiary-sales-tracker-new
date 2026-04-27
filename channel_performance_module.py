@@ -643,7 +643,9 @@ def _reapply_sales(snap_df: pd.DataFrame, raw_sales: pd.DataFrame,
     return snap_df
 
 
-def _render_dashboard(merged: pd.DataFrame):
+def _render_dashboard(merged: pd.DataFrame,
+                      raw_sales: pd.DataFrame = None,
+                      n_days: int = 30):
 
     st.sidebar.divider()
     st.sidebar.header("📦 Inventory Filters")
@@ -710,7 +712,41 @@ def _render_dashboard(merged: pd.DataFrame):
     else:
         m3.metric(f"Avg Sell-Through %{filter_label}", "0.00%")
 
-    if not table_df.empty and table_df["units_sold"].sum() > 0:
+    # ── Avg DRR — computed from raw channel sales totals, NOT from city-joined
+    # units_sold.  City-joining misses delivery cities that have no matching
+    # inventory row (e.g. Tier-2 cities served by a hub warehouse), which
+    # causes the DRR to be systematically understated.  By summing all sales
+    # for the selected channels and dividing by n_days we exactly replicate the
+    # Trend Analytics DRR formula: total_qty / period_days.
+    #
+    # Inventory channel names → substring used to match Supabase channel values
+    _CH_KEYWORD = {
+        "Amazon":     "amazon",
+        "Blinkit":    "blinkit",
+        "Swiggy":     "swiggy",
+        "Big Basket": "big basket",
+    }
+    _true_drr: float | None = None
+    if raw_sales is not None and not raw_sales.empty and n_days > 0:
+        _total_units = 0.0
+        _matched_any = False
+        for _ch in sel_channels:
+            _kw = _CH_KEYWORD.get(_ch, _ch.lower())
+            _mask = raw_sales["channel"].str.lower().str.contains(_kw, na=False)
+            _ch_qty = raw_sales.loc[_mask, "qty_sold"].sum()
+            if _ch_qty > 0:
+                _total_units += _ch_qty
+                _matched_any = True
+        if _matched_any:
+            _true_drr = _total_units / n_days
+
+    if _true_drr is not None:
+        m4.metric(
+            f"Avg DRR{filter_label}",
+            f"{_true_drr:.2f} units/day",
+            help="Total units sold across selected channels ÷ sales window days. Matches Trend Analytics DRR.",
+        )
+    elif not table_df.empty and table_df["units_sold"].sum() > 0:
         total_u = total_d = 0
         for ch, grp in table_df.groupby("channel"):
             total_u += grp["units_sold"].sum()
@@ -765,9 +801,21 @@ def _render_dashboard(merged: pd.DataFrame):
                 if grp["inventory"].sum() > 0 else 0.0
 
         def _g_drr(grp):
-            # pandas 2.x drops the grouping key from the sub-frame when using
-            # include_groups=False (or implicitly in newer versions).
-            # Re-attach "channel" from the index if it has been removed.
+            # When grouping by Channel: use raw_sales totals (same formula as
+            # the Avg DRR top metric) so the per-channel DRR rows match
+            # Trend Analytics.  For Product / Location groupings, fall back to
+            # the city-joined units_sold which is the best available estimate.
+            if grp_col == "channel":
+                if raw_sales is not None and not raw_sales.empty and n_days > 0:
+                    # grp may have had the grouping key dropped (pandas 2.2+)
+                    ch_names = list(grp["channel"].unique()) if "channel" in grp.columns else list(grp.index.unique())
+                    u = 0.0
+                    for ch_name in ch_names:
+                        _kw = _CH_KEYWORD.get(ch_name, ch_name.lower())
+                        _mask = raw_sales["channel"].str.lower().str.contains(_kw, na=False)
+                        u += raw_sales.loc[_mask, "qty_sold"].sum()
+                    return u / n_days if u > 0 else 0.0
+            # Fallback: city-joined units_sold (used for Product / Location groupings)
             if "channel" not in grp.columns:
                 grp = grp.copy()
                 grp["channel"] = grp.index
@@ -1054,4 +1102,4 @@ def render_channel_performance_tab(supabase_client, master_skus_df: pd.DataFrame
                 st.rerun()
         return
 
-    _render_dashboard(merged)
+    _render_dashboard(merged, raw_sales=raw_sales, n_days=n_days)
