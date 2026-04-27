@@ -694,56 +694,88 @@ def _render_dashboard(merged: pd.DataFrame,
     str_label    = f" | STR {min_str}–{max_str}%" if (min_str > 0 or max_str < 200) else ""
     filter_label = doc_label + str_label
 
-    # ── Metrics ───────────────────────────────────────────────────────────────
-    st.divider()
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric(f"Total Inventory{filter_label}", f"{table_df['inventory'].sum():,.0f} units")
-
-    valid_doc = table_df[(table_df["doc"] > 0) & (table_df["doc"] < 9999)]
-    if not valid_doc.empty and valid_doc["inventory"].sum() > 0:
-        w_doc = (valid_doc["doc"] * valid_doc["inventory"]).sum() / valid_doc["inventory"].sum()
-        m2.metric(f"Avg Days of Cover{filter_label}", f"{w_doc:.1f} days")
-    else:
-        m2.metric(f"Avg Days of Cover{filter_label}", "N/A")
-
-    if not table_df.empty and table_df["inventory"].sum() > 0:
-        w_str = (table_df["str"] * table_df["inventory"]).sum() / table_df["inventory"].sum()
-        m3.metric(f"Avg Sell-Through %{filter_label}", f"{w_str:.2%}")
-    else:
-        m3.metric(f"Avg Sell-Through %{filter_label}", "0.00%")
-
-    # ── Avg DRR — computed from raw channel sales totals, NOT from city-joined
-    # units_sold.  City-joining misses delivery cities that have no matching
-    # inventory row (e.g. Tier-2 cities served by a hub warehouse), which
-    # causes the DRR to be systematically understated.  By summing all sales
-    # for the selected channels and dividing by n_days we exactly replicate the
-    # Trend Analytics DRR formula: total_qty / period_days.
-    #
-    # Inventory channel names → substring used to match Supabase channel values
+    # ── Inventory channel names → substring to match Supabase channel column ──
+    # Defined here (before metrics) so it is available to both the metric cards
+    # and the grouped-table section below.
     _CH_KEYWORD = {
         "Amazon":     "amazon",
         "Blinkit":    "blinkit",
         "Swiggy":     "swiggy",
         "Big Basket": "big basket",
     }
-    _true_drr: float | None = None
-    if raw_sales is not None and not raw_sales.empty and n_days > 0:
-        _total_units = 0.0
-        _matched_any = False
-        for _ch in sel_channels:
-            _kw = _CH_KEYWORD.get(_ch, _ch.lower())
-            _mask = raw_sales["channel"].str.lower().str.contains(_kw, na=False)
-            _ch_qty = raw_sales.loc[_mask, "qty_sold"].sum()
-            if _ch_qty > 0:
-                _total_units += _ch_qty
-                _matched_any = True
-        if _matched_any:
-            _true_drr = _total_units / n_days
 
-    if _true_drr is not None:
+    # ── Compute true channel totals from raw_sales ────────────────────────────
+    # City-joining misses delivery cities that have no matching inventory row
+    # (tier-2 cities served by hub warehouses).  Raw-sales totals are the only
+    # accurate source for DRR, DOC, and STR at the channel level.
+    #
+    # We also respect the product filter (sel_products) so that the metrics
+    # stay consistent when a user has narrowed down to specific SKUs.
+    _true_total_units: float | None = None
+    _true_inv = float(table_df["inventory"].sum())   # always from filtered table
+
+    if raw_sales is not None and not raw_sales.empty and n_days > 0:
+        _rs = raw_sales.copy()
+        # Apply product filter if active (matches item_name to master SKU names)
+        if sel_products:
+            _rs = _rs[_rs["item_name"].isin(sel_products)]
+        _total = 0.0
+        for _ch in sel_channels:
+            _kw   = _CH_KEYWORD.get(_ch, _ch.lower())
+            _mask = _rs["channel"].str.lower().str.contains(_kw, na=False)
+            _total += _rs.loc[_mask, "qty_sold"].sum()
+        if _total > 0:
+            _true_total_units = _total
+
+    # ── Metrics ───────────────────────────────────────────────────────────────
+    st.divider()
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric(f"Total Inventory{filter_label}", f"{_true_inv:,.0f} units")
+
+    # DOC = total_inventory / true_DRR  (true_DRR = raw_units / n_days)
+    # Using city-joined per-row DOC values would overstate DOC because the
+    # city-joined DRR is understated.
+    if _true_total_units is not None and _true_total_units > 0:
+        _true_drr_val = _true_total_units / n_days
+        _true_doc = _true_inv / _true_drr_val if _true_drr_val > 0 else float("nan")
+        m2.metric(
+            f"Avg Days of Cover{filter_label}",
+            f"{_true_doc:.1f} days",
+            help="Total inventory ÷ true DRR (from raw sales). Matches Trend Analytics.",
+        )
+    else:
+        # Fallback: weighted average of city-joined per-row DOC
+        valid_doc = table_df[(table_df["doc"] > 0) & (table_df["doc"] < 9999)]
+        if not valid_doc.empty and valid_doc["inventory"].sum() > 0:
+            w_doc = (valid_doc["doc"] * valid_doc["inventory"]).sum() / valid_doc["inventory"].sum()
+            m2.metric(f"Avg Days of Cover{filter_label}", f"{w_doc:.1f} days")
+        else:
+            m2.metric(f"Avg Days of Cover{filter_label}", "N/A")
+
+    # STR = raw_sales_30d / (raw_sales_30d + total_inventory)
+    # Using city-joined per-row STR would understate because city-joined sales
+    # miss tier-2 delivery cities.
+    if _true_total_units is not None:
+        _sales_30d = _true_total_units * (30.0 / n_days)
+        _true_str  = _sales_30d / (_sales_30d + _true_inv) if (_sales_30d + _true_inv) > 0 else 0.0
+        m3.metric(
+            f"Avg Sell-Through %{filter_label}",
+            f"{_true_str:.2%}",
+            help="Raw sales (30-day normalised) ÷ (sales + inventory). Matches Trend Analytics.",
+        )
+    else:
+        # Fallback: weighted average of city-joined per-row STR
+        if not table_df.empty and table_df["inventory"].sum() > 0:
+            w_str = (table_df["str"] * table_df["inventory"]).sum() / table_df["inventory"].sum()
+            m3.metric(f"Avg Sell-Through %{filter_label}", f"{w_str:.2%}")
+        else:
+            m3.metric(f"Avg Sell-Through %{filter_label}", "0.00%")
+
+    # DRR = raw_units / n_days
+    if _true_total_units is not None:
         m4.metric(
             f"Avg DRR{filter_label}",
-            f"{_true_drr:.2f} units/day",
+            f"{_true_total_units / n_days:.2f} units/day",
             help="Total units sold across selected channels ÷ sales window days. Matches Trend Analytics DRR.",
         )
     elif not table_df.empty and table_df["units_sold"].sum() > 0:
@@ -791,15 +823,8 @@ def _render_dashboard(merged: pd.DataFrame,
             inventory=("inventory", "sum"), units_sold=("units_sold", "sum")
         ).reset_index()
 
-        # When grouping by Channel, replace city-joined units_sold with raw
-        # sales totals from Supabase — same reason as the Avg DRR fix: the
-        # city join misses tier-2 delivery cities served by hub warehouses.
-        if grp_col == "channel" and raw_sales is not None and not raw_sales.empty:
-            for idx, row in agg_df.iterrows():
-                _ch  = row[grp_col]
-                _kw  = _CH_KEYWORD.get(_ch, str(_ch).lower())
-                _mask = raw_sales["channel"].str.lower().str.contains(_kw, na=False)
-                agg_df.at[idx, "units_sold"] = raw_sales.loc[_mask, "qty_sold"].sum()
+        # units_sold for Channel grouping is corrected inside the metric-series
+        # loop below (together with doc / str / drr) — no separate pass needed.
 
         def _w_doc(grp):
             v = grp[(grp["doc"] > 0) & (grp["doc"] < 9999)]
@@ -835,26 +860,44 @@ def _render_dashboard(merged: pd.DataFrame,
         except Exception:
             pass
 
-        # ── Build DRR series for the grouped table ────────────────────────────
-        # For Channel grouping: compute from raw_sales totals per channel so
-        # the values align with Trend Analytics (city-join misses tier-2 cities
-        # served by hub warehouses, so city-joined units_sold is always lower).
-        # For Product / Location groupings: fall back to city-joined units_sold
-        # (raw_sales can't be disaggregated by product or location without the
-        # inventory-level join, so this is the best available estimate).
+        # ── Build metrics series for the grouped table ────────────────────────
+        # For Channel grouping: compute DRR, DOC, and STR directly from
+        # raw_sales per channel.  This avoids the city-join undercount (tier-2
+        # delivery cities not present in inventory files) that affects all three
+        # metrics when derived from city-joined units_sold / per-row doc/str.
+        #
+        # For Product / Location groupings: fall back to city-joined values via
+        # _w_doc / _w_str / _g_drr — raw_sales cannot be disaggregated by
+        # product or location without the inventory-level join.
         if grp_col == "channel" and raw_sales is not None and not raw_sales.empty and n_days > 0:
-            _ch_drr: dict[str, float] = {}
+            # Respect product filter if active (same logic as top metric cards)
+            _rs_grp = raw_sales.copy()
+            if sel_products:
+                _rs_grp = _rs_grp[_rs_grp["item_name"].isin(sel_products)]
+
+            _ch_units: dict[str, float] = {}
+            _ch_doc:   dict[str, float] = {}
+            _ch_str:   dict[str, float] = {}
+            _ch_drr:   dict[str, float] = {}
             for _ch in agg_df[grp_col].tolist():
-                _kw   = _CH_KEYWORD.get(_ch, str(_ch).lower())
-                _mask = raw_sales["channel"].str.lower().str.contains(_kw, na=False)
-                _qty  = raw_sales.loc[_mask, "qty_sold"].sum()
-                _ch_drr[_ch] = _qty / n_days
-            _drr_series = pd.Series(_ch_drr, name="drr")
+                _kw    = _CH_KEYWORD.get(_ch, str(_ch).lower())
+                _mask  = _rs_grp["channel"].str.lower().str.contains(_kw, na=False)
+                _qty   = float(_rs_grp.loc[_mask, "qty_sold"].sum())
+                _inv   = float(agg_df.loc[agg_df[grp_col] == _ch, "inventory"].values[0])
+                _drr_v = _qty / n_days
+                _s30   = _qty * (30.0 / n_days)
+                _ch_units[_ch] = _qty
+                _ch_drr[_ch]   = _drr_v
+                _ch_doc[_ch]   = (_inv / _drr_v) if _drr_v > 0 else float("nan")
+                _ch_str[_ch]   = (_s30 / (_s30 + _inv)) if (_s30 + _inv) > 0 else 0.0
+
+            # Overwrite all four metrics that are affected by the city-join undercount
+            agg_df["units_sold"] = agg_df[grp_col].map(_ch_units)
             agg_df = (
                 agg_df
-                .join(table_df.groupby(grp_col).apply(_w_doc, **_apply_kwargs).rename("doc"), on=grp_col)
-                .join(table_df.groupby(grp_col).apply(_w_str, **_apply_kwargs).rename("str"), on=grp_col)
-                .join(_drr_series, on=grp_col)
+                .join(pd.Series(_ch_doc, name="doc"),  on=grp_col)
+                .join(pd.Series(_ch_str, name="str"),  on=grp_col)
+                .join(pd.Series(_ch_drr, name="drr"),  on=grp_col)
                 .sort_values("inventory", ascending=False).reset_index(drop=True)
             )
         else:
