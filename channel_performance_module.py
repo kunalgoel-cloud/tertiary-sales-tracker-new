@@ -791,6 +791,16 @@ def _render_dashboard(merged: pd.DataFrame,
             inventory=("inventory", "sum"), units_sold=("units_sold", "sum")
         ).reset_index()
 
+        # When grouping by Channel, replace city-joined units_sold with raw
+        # sales totals from Supabase — same reason as the Avg DRR fix: the
+        # city join misses tier-2 delivery cities served by hub warehouses.
+        if grp_col == "channel" and raw_sales is not None and not raw_sales.empty:
+            for idx, row in agg_df.iterrows():
+                _ch  = row[grp_col]
+                _kw  = _CH_KEYWORD.get(_ch, str(_ch).lower())
+                _mask = raw_sales["channel"].str.lower().str.contains(_kw, na=False)
+                agg_df.at[idx, "units_sold"] = raw_sales.loc[_mask, "qty_sold"].sum()
+
         def _w_doc(grp):
             v = grp[(grp["doc"] > 0) & (grp["doc"] < 9999)]
             return (v["doc"] * v["inventory"]).sum() / v["inventory"].sum() \
