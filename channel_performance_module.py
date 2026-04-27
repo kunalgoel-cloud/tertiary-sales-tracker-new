@@ -21,6 +21,58 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
 
+# ─────────────────────────────────────────────────────────────────────────────
+# CITY NORMALISATION
+# ─────────────────────────────────────────────────────────────────────────────
+# Root cause of DRR mismatch: city strings in Supabase (from sales uploads)
+# and city strings in inventory files use different formats:
+#   • "Noida 1"  vs  "Noida"
+#   • "MUM IM3"  vs  "Mumbai"
+#   • "PATIALA 1" vs "Patiala"
+# _norm_city() converts both sides to the same canonical form before joining.
+
+_CITY_ALIASES: dict[str, str] = {
+    # Swiggy hub codes → readable city
+    "mum":       "mumbai",
+    "blr":       "bangalore",
+    "del":       "delhi",
+    "hyd":       "hyderabad",
+    "chn":       "chennai",
+    "kol":       "kolkata",
+    "pun":       "pune",
+    "bng":       "bangalore",
+    # Common spelling variants
+    "bengaluru":  "bangalore",
+    "new delhi":  "delhi",
+    "bombay":     "mumbai",
+    "calcutta":   "kolkata",
+    "madras":     "chennai",
+    "gurugram":   "gurgaon",
+}
+
+def _norm_city(city) -> str:
+    """
+    Normalise a city string so inventory-side and sales-side values match.
+
+    Steps applied in order:
+      1. Cast to str, lowercase, strip whitespace.
+      2. Drop trailing whitespace+alphanumeric codes  ("Noida 1" → "noida",
+         "MUM IM3" → "mum", "Ahmedabad-DC2" → "ahmedabad").
+      3. Strip residual trailing digits/hyphens.
+      4. Apply alias table (hub codes, spelling variants).
+    """
+    if city is None:
+        return ""
+    s = str(city).strip().lower()
+    if s in ("", "nan", "none", "__national__"):
+        return ""
+    # Remove trailing whitespace + alphanumeric suffix (hub codes, DC numbers)
+    s = re.sub(r"[\s\-_]+[a-z0-9]+$", "", s).strip()
+    # Remove any residual trailing digits
+    s = re.sub(r"\s+\d+$", "", s).strip()
+    # Apply alias map
+    return _CITY_ALIASES.get(s, s)
+
 # ── Global Filter Notes ───────────────────────────────────────────────────────
 # Channel Performance does NOT use the global date/channel filter.
 # Reason: this tab's "Sales Window" (N days back) is an inventory-specific
@@ -135,6 +187,10 @@ def _channel_sales(sales_df: pd.DataFrame, channel_keyword: str) -> pd.DataFrame
 
     parts = []
     if not city_rows.empty:
+        # Normalise city names before aggregation so that "Noida 1" and "Noida"
+        # collapse to the same canonical key and join correctly to inventory rows.
+        city_rows = city_rows.copy()
+        city_rows["city"] = city_rows["city"].apply(_norm_city)
         agg = (
             city_rows.groupby(["item_name", "city"])
             .agg(qty_sold=("qty_sold", "sum"), revenue=("revenue", "sum"))
@@ -312,7 +368,8 @@ def _parse_blinkit(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: int, db
         first_word = str(fac).split()[0]
         return NCR_CITY_MAP.get(first_word, first_word)
 
-    inv_df["_city_key"] = inv_df["fac_id"].apply(extract_city)
+    # Apply _norm_city after the NCR-map so both sides share the same format.
+    inv_df["_city_key"] = inv_df["fac_id"].apply(extract_city).apply(_norm_city)
 
     last30 = pd.to_numeric(
         inv_df.get("Last 30 days", pd.Series(0, index=inv_df.index)), errors="coerce"
@@ -328,10 +385,11 @@ def _parse_blinkit(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: int, db
     if not sales_df.empty:
         city_sales = sales_df[sales_df["city"] != "__national__"].copy()
         if not city_sales.empty:
+            city_sales["_city_norm"] = city_sales["city"].apply(_norm_city)
             inv_df = inv_df.merge(
-                city_sales[["item_name", "city", "qty_sold"]].rename(columns={"qty_sold": "units_sold"}),
+                city_sales[["item_name", "_city_norm", "qty_sold"]].rename(columns={"qty_sold": "units_sold"}),
                 left_on=["master_sku", "_city_key"],
-                right_on=["item_name", "city"],
+                right_on=["item_name", "_city_norm"],
                 how="left",
             ).fillna(0)
             sales_val = pd.to_numeric(inv_df["units_sold"], errors="coerce").fillna(0)
@@ -361,8 +419,9 @@ def _parse_swiggy(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: int, db_
     inv_df["channel_sku"] = inv_df["SkuCode"].astype(str).str.strip()
     inv_df["location"]    = inv_df["City"] + " (" + inv_df["FacilityName"] + ")"
     inv_df["inventory"]   = pd.to_numeric(inv_df["WarehouseQtyAvailable"], errors="coerce").fillna(0)
-    # Normalise to UPPER for join — Supabase stores Swiggy CITY exactly as in the sales file
-    inv_df["_city_key"]   = inv_df["City"].astype(str).str.strip().str.upper()
+    # Use _norm_city on inventory side — mirrors the normalisation applied to
+    # Supabase sales cities in _channel_sales(), so "Noida" matches "Noida 1".
+    inv_df["_city_key"]   = inv_df["City"].apply(_norm_city)
 
     doh_fallback = (
         pd.to_numeric(inv_df["DaysOnHand"], errors="coerce").fillna(0).clip(upper=365)
@@ -378,13 +437,16 @@ def _parse_swiggy(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: int, db_
 
     if not sales_df.empty:
         city_sales = sales_df[sales_df["city"] != "__national__"].copy()
-        city_sales["_city_upper"] = city_sales["city"].astype(str).str.strip().str.upper()
+        # Sales cities are already normalised by _channel_sales(); key is named
+        # "city" after aggregation. Apply _norm_city again as a safety guard in
+        # case this function is called with a raw (un-normalised) sales_df.
+        city_sales["_city_norm"] = city_sales["city"].apply(_norm_city)
 
         if not city_sales.empty:
             inv_df = inv_df.merge(
-                city_sales[["item_name", "_city_upper", "qty_sold"]].rename(columns={"qty_sold": "units_sold"}),
+                city_sales[["item_name", "_city_norm", "qty_sold"]].rename(columns={"qty_sold": "units_sold"}),
                 left_on=["master_sku", "_city_key"],
-                right_on=["item_name", "_city_upper"],
+                right_on=["item_name", "_city_norm"],
                 how="left",
             ).fillna(0)
             sales_val = pd.to_numeric(inv_df["units_sold"], errors="coerce").fillna(0)
@@ -430,7 +492,8 @@ def _parse_bigbasket(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: int, 
         city = re.sub(r"[-\s]?DC\d*$", "", str(dc_name), flags=re.IGNORECASE).strip()
         return BB_DC_CITY_MAP.get(city, city)
 
-    inv_df["_city_key"] = inv_df["location"].apply(dc_to_city)
+    # Apply _norm_city after the BB alias map so both sides share the same form.
+    inv_df["_city_key"] = inv_df["location"].apply(dc_to_city).apply(_norm_city)
 
     # Translate channel_sku → master_sku for sales join
     if db_mappings is not None and not db_mappings.empty:
@@ -442,10 +505,11 @@ def _parse_bigbasket(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: int, 
     if not sales_df.empty:
         city_sales = sales_df[sales_df["city"] != "__national__"].copy()
         if not city_sales.empty:
+            city_sales["_city_norm"] = city_sales["city"].apply(_norm_city)
             inv_df = inv_df.merge(
-                city_sales[["item_name", "city", "qty_sold"]].rename(columns={"qty_sold": "units_sold"}),
+                city_sales[["item_name", "_city_norm", "qty_sold"]].rename(columns={"qty_sold": "units_sold"}),
                 left_on=["master_sku", "_city_key"],
-                right_on=["item_name", "city"],
+                right_on=["item_name", "_city_norm"],
                 how="left",
             ).fillna(0)
             sales_val = pd.to_numeric(inv_df["units_sold"], errors="coerce").fillna(0)
@@ -512,10 +576,17 @@ def _reapply_sales(snap_df: pd.DataFrame, raw_sales: pd.DataFrame,
         # City-level join for Blinkit / Swiggy / BigBasket
         # Normalise city keys the same way parsers do
         if channel == "Swiggy":
-            city_sales["_ckey"] = city_sales["city"].astype(str).str.strip().str.upper()
-            snap_df["_ckey"]    = snap_df["location"].astype(str).str.split(" (", regex=False).str[0].str.strip().str.upper()
+            # Inventory location is "City (FacilityName)" — extract the city part
+            # then apply _norm_city to match the normalised sales-side key.
+            city_sales["_ckey"] = city_sales["city"].apply(_norm_city)
+            snap_df["_ckey"]    = (
+                snap_df["location"].astype(str)
+                .str.split(" (", regex=False).str[0]
+                .apply(_norm_city)
+            )
         elif channel == "Big Basket":
-            # Strip "-DC" / "-DC2" suffix and apply city aliases, same as _parse_bigbasket
+            # Strip "-DC" / "-DC2" suffix and apply city aliases (same as _parse_bigbasket),
+            # then _norm_city for consistent casing/suffix handling.
             BB_DC_CITY_MAP = {
                 "Ahmedabad": "Ahmedabad-Gandhinagar", "Bhubaneswar": "Bhubaneshwar-Cuttack",
                 "Kundli": "Gurgaon", "Lucknow": "Lucknow-Kanpur",
@@ -524,11 +595,12 @@ def _reapply_sales(snap_df: pd.DataFrame, raw_sales: pd.DataFrame,
             def _dc_to_city(dc_name):
                 city = re.sub(r"[-\s]?DC\d*$", "", str(dc_name), flags=re.IGNORECASE).strip()
                 return BB_DC_CITY_MAP.get(city, city)
-            city_sales["_ckey"] = city_sales["city"].astype(str).str.strip()
-            snap_df["_ckey"]    = snap_df["location"].astype(str).apply(_dc_to_city)
+            city_sales["_ckey"] = city_sales["city"].apply(_norm_city)
+            snap_df["_ckey"]    = snap_df["location"].astype(str).apply(_dc_to_city).apply(_norm_city)
         else:
-            city_sales["_ckey"] = city_sales["city"].astype(str).str.strip()
-            snap_df["_ckey"]    = snap_df["location"].astype(str).str.strip()
+            # Blinkit and any future channels: normalise both sides uniformly.
+            city_sales["_ckey"] = city_sales["city"].apply(_norm_city)
+            snap_df["_ckey"]    = snap_df["location"].astype(str).apply(_norm_city)
 
         merged = snap_df.merge(
             city_sales[["item_name", "_ckey", "qty_sold"]].rename(columns={"qty_sold": "fresh_units"}),
