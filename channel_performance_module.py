@@ -801,21 +801,10 @@ def _render_dashboard(merged: pd.DataFrame,
                 if grp["inventory"].sum() > 0 else 0.0
 
         def _g_drr(grp):
-            # When grouping by Channel: use raw_sales totals (same formula as
-            # the Avg DRR top metric) so the per-channel DRR rows match
-            # Trend Analytics.  For Product / Location groupings, fall back to
-            # the city-joined units_sold which is the best available estimate.
-            if grp_col == "channel":
-                if raw_sales is not None and not raw_sales.empty and n_days > 0:
-                    # grp may have had the grouping key dropped (pandas 2.2+)
-                    ch_names = list(grp["channel"].unique()) if "channel" in grp.columns else list(grp.index.unique())
-                    u = 0.0
-                    for ch_name in ch_names:
-                        _kw = _CH_KEYWORD.get(ch_name, ch_name.lower())
-                        _mask = raw_sales["channel"].str.lower().str.contains(_kw, na=False)
-                        u += raw_sales.loc[_mask, "qty_sold"].sum()
-                    return u / n_days if u > 0 else 0.0
-            # Fallback: city-joined units_sold (used for Product / Location groupings)
+            # Used for Product / Location groupings only.
+            # For Channel grouping we compute DRR directly from raw_sales below
+            # (avoids the pandas 2.2+ include_groups index problem and the
+            # city-join undercount).
             if "channel" not in grp.columns:
                 grp = grp.copy()
                 grp["channel"] = grp.index
@@ -836,13 +825,36 @@ def _render_dashboard(merged: pd.DataFrame,
         except Exception:
             pass
 
-        agg_df = (
-            agg_df
-            .join(table_df.groupby(grp_col).apply(_w_doc, **_apply_kwargs).rename("doc"), on=grp_col)
-            .join(table_df.groupby(grp_col).apply(_w_str, **_apply_kwargs).rename("str"), on=grp_col)
-            .join(table_df.groupby(grp_col).apply(_g_drr, **_apply_kwargs).rename("drr"), on=grp_col)
-            .sort_values("inventory", ascending=False).reset_index(drop=True)
-        )
+        # ── Build DRR series for the grouped table ────────────────────────────
+        # For Channel grouping: compute from raw_sales totals per channel so
+        # the values align with Trend Analytics (city-join misses tier-2 cities
+        # served by hub warehouses, so city-joined units_sold is always lower).
+        # For Product / Location groupings: fall back to city-joined units_sold
+        # (raw_sales can't be disaggregated by product or location without the
+        # inventory-level join, so this is the best available estimate).
+        if grp_col == "channel" and raw_sales is not None and not raw_sales.empty and n_days > 0:
+            _ch_drr: dict[str, float] = {}
+            for _ch in agg_df[grp_col].tolist():
+                _kw   = _CH_KEYWORD.get(_ch, str(_ch).lower())
+                _mask = raw_sales["channel"].str.lower().str.contains(_kw, na=False)
+                _qty  = raw_sales.loc[_mask, "qty_sold"].sum()
+                _ch_drr[_ch] = _qty / n_days
+            _drr_series = pd.Series(_ch_drr, name="drr")
+            agg_df = (
+                agg_df
+                .join(table_df.groupby(grp_col).apply(_w_doc, **_apply_kwargs).rename("doc"), on=grp_col)
+                .join(table_df.groupby(grp_col).apply(_w_str, **_apply_kwargs).rename("str"), on=grp_col)
+                .join(_drr_series, on=grp_col)
+                .sort_values("inventory", ascending=False).reset_index(drop=True)
+            )
+        else:
+            agg_df = (
+                agg_df
+                .join(table_df.groupby(grp_col).apply(_w_doc, **_apply_kwargs).rename("doc"), on=grp_col)
+                .join(table_df.groupby(grp_col).apply(_w_str, **_apply_kwargs).rename("str"), on=grp_col)
+                .join(table_df.groupby(grp_col).apply(_g_drr, **_apply_kwargs).rename("drr"), on=grp_col)
+                .sort_values("inventory", ascending=False).reset_index(drop=True)
+            )
         st.dataframe(
             agg_df.style.format({**fmt, "units_sold": "{:,.1f}"})
             .map(color_doc, subset=["doc"]),
