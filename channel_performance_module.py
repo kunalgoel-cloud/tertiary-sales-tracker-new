@@ -810,11 +810,34 @@ def _render_dashboard(merged: pd.DataFrame,
                                  "inventory", "drr", "doc", "str"] if c in table_df.columns]
     fmt = {"str": "{:.2%}", "doc": "{:.1f}", "inventory": "{:,.0f}", "drr": "{:.2f}"}
 
+    def _csv_bytes(df: pd.DataFrame) -> bytes:
+        """Format a display DataFrame for CSV export (str → %, doc/drr rounded)."""
+        export = df.copy()
+        if "str" in export.columns:
+            export["str"] = (export["str"] * 100).round(2).astype(str) + "%"
+        if "doc" in export.columns:
+            export["doc"] = export["doc"].round(1)
+        if "drr" in export.columns:
+            export["drr"] = export["drr"].round(2)
+        if "inventory" in export.columns:
+            export["inventory"] = export["inventory"].astype(int)
+        if "units_sold" in export.columns:
+            export["units_sold"] = export["units_sold"].round(1)
+        return export.to_csv(index=False).encode("utf-8")
+
     if group_by == "None":
+        _export_df = table_df[display_cols].sort_values("inventory", ascending=False)
         st.dataframe(
-            table_df[display_cols].sort_values("inventory", ascending=False)
-            .style.format(fmt).map(color_doc, subset=["doc"]),
+            _export_df.style.format(fmt).map(color_doc, subset=["doc"]),
             use_container_width=True,
+        )
+        st.download_button(
+            "⬇️ Download table as CSV",
+            data=_csv_bytes(_export_df),
+            file_name="inventory_performance.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key="cp_dl_none",
         )
     else:
         gcm     = {"Channel": "channel", "Product": "master_sku", "Location": "location"}
@@ -912,6 +935,15 @@ def _render_dashboard(merged: pd.DataFrame,
             agg_df.style.format({**fmt, "units_sold": "{:,.1f}"})
             .map(color_doc, subset=["doc"]),
             use_container_width=True,
+        )
+        _grp_fname = f"inventory_by_{grp_col}.csv"
+        st.download_button(
+            f"⬇️ Download {group_by} summary as CSV",
+            data=_csv_bytes(agg_df),
+            file_name=_grp_fname,
+            mime="text/csv",
+            use_container_width=True,
+            key="cp_dl_grp",
         )
 
     # ── Actionable Quadrants ──────────────────────────────────────────────────
