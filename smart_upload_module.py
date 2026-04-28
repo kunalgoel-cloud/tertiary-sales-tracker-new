@@ -492,9 +492,14 @@ def _build_work_df(
     # ── City ──────────────────────────────────────────────────────────────────
     c_col = col_map.get("city")
     if c_col and c_col in df.columns:
-        df["__city__"] = df[c_col].astype(str).str.strip().replace({"nan": None, "": None})
+        # Has a city column — use it, fall back to "National" for blank/missing values
+        df["__city__"] = (
+            df[c_col].astype(str).str.strip()
+            .replace({"nan": "National", "none": "National", "": "National"})
+        )
     else:
-        df["__city__"] = None
+        # No city column for this channel — all rows are National
+        df["__city__"] = "National"
 
     # ── Qty & Revenue ─────────────────────────────────────────────────────────
     q_col  = col_map.get("qty")
@@ -808,24 +813,19 @@ def render_smart_upload_tab(
         return   # Wait for user to map before proceeding to upload
 
     # ─────────────────────────────────────────────────────────────────────────
-    # PHASE 4 — All clear: show summary and sync button
+    # PHASE 4 — Build all final DataFrames in memory (no DB writes yet)
     # ─────────────────────────────────────────────────────────────────────────
     ch_summary = ", ".join(sorted({r["sel_ch"] for r in resolved}))
     n_files    = len(resolved)
     st.success(
         f"✅ **{n_files} file{'s' if n_files>1 else ''} ready** — {ch_summary}. "
-        "All products mapped. Press Sync to upload."
+        "All products mapped. Building preview…"
     )
-
-    if not st.button("🚀 Sync All to Cloud", type="primary", key="su2_sync"):
-        return
-
-    # ── Upload each file ──────────────────────────────────────────────────────
-    overall_errors: list[str] = []
-    total_records  = 0
 
     # Reload item_map in case it was just updated in this session
     fresh_item_map = _load_item_map(supabase)
+
+    staged_data: list[dict] = []   # one entry per resolved file
 
     for cfg in resolved:
         sel_ch        = cfg["sel_ch"]
@@ -836,14 +836,14 @@ def render_smart_upload_tab(
             st.warning(f"⚠️ {cfg['uf'].name}: No valid rows after filtering — skipped.")
             continue
 
-        # Build upload rows
+        # Build upload rows (same logic as before, but no DB touch)
         rows: list[dict] = []
         for _, r in work_df.iterrows():
             mk         = str(r["m_key"])
             master_sku = fresh_item_map.get(mk, mk)
-            city_val   = r["__city__"]
-            if pd.isna(city_val) or str(city_val).strip().lower() in ("", "nan", "none"):
-                city_val = None
+            city_val   = str(r["__city__"]).strip() if pd.notna(r["__city__"]) else "National"
+            if city_val.lower() in ("", "nan", "none"):
+                city_val = "National"
             rows.append({
                 "date":      str(r["__date__"]),
                 "channel":   sel_ch,
@@ -853,7 +853,7 @@ def render_smart_upload_tab(
                 "city":      city_val,
             })
 
-        # Aggregate (in case file is order-level, e.g. Blinkit)
+        # Aggregate (handles order-level files like Blinkit)
         group_cols = ["date", "channel", "item_name", "city"]
         final_df = (
             pd.DataFrame(rows)
@@ -863,22 +863,153 @@ def render_smart_upload_tab(
         )
         final_df["qty_sold"] = final_df["qty_sold"].fillna(0.0)
         final_df["revenue"]  = final_df["revenue"].fillna(0.0)
-        final_df["city"]     = (
-            final_df["city"].astype(object)
-            .where(final_df["city"].notna(), other=None)
+        final_df["city"] = (
+            final_df["city"].fillna("National")
+            .astype(str).str.strip()
+            .replace({"": "National", "nan": "National", "none": "National"})
         )
+
+        staged_data.append({
+            "cfg":      cfg,
+            "sel_ch":   sel_ch,
+            "final_df": final_df,
+        })
+
+    if not staged_data:
+        st.error("No valid data to upload after processing all files.")
+        return
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # PHASE 5 — Preview: compare incoming data vs current DB state
+    # ─────────────────────────────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("📋 Preview — Review before writing to DB")
+    st.info(
+        "⚠️ Nothing has been written to the database yet. "
+        "Review the comparison below and click **Confirm** to proceed, "
+        "or **Cancel** to abort with no changes."
+    )
+
+    preview_rows: list[dict] = []
+
+    for entry in staged_data:
+        sel_ch   = entry["sel_ch"]
+        final_df = entry["final_df"]
+
+        new_rows    = len(final_df)
+        new_revenue = final_df["revenue"].sum()
+        new_qty     = final_df["qty_sold"].sum()
+
+        unique_dates = final_df["date"].dropna().unique().tolist()
+        date_min = min(unique_dates) if unique_dates else "—"
+        date_max = max(unique_dates) if unique_dates else "—"
+        date_range_str = date_min if date_min == date_max else f"{date_min} → {date_max}"
+
+        # Query DB for existing rows covering the same (channel, dates)
+        db_rows    = 0
+        db_revenue = 0.0
+        db_qty     = 0.0
+        try:
+            DEL_CHUNK = 50
+            all_db_records: list[dict] = []
+            for di in range(0, len(unique_dates), DEL_CHUNK):
+                date_batch = unique_dates[di: di + DEL_CHUNK]
+                res = (
+                    supabase.table("sales")
+                    .select("qty_sold,revenue")
+                    .eq("channel", sel_ch)
+                    .in_("date", date_batch)
+                    .execute()
+                )
+                if res.data:
+                    all_db_records.extend(res.data)
+            db_rows    = len(all_db_records)
+            db_revenue = sum(float(r.get("revenue", 0) or 0) for r in all_db_records)
+            db_qty     = sum(float(r.get("qty_sold", 0) or 0) for r in all_db_records)
+        except Exception as e:
+            db_rows    = -1
+            db_revenue = 0.0
+            db_qty     = 0.0
+            st.warning(f"Could not fetch existing DB data for {sel_ch}: {e}")
+
+        delta_rev = new_revenue - db_revenue
+        delta_qty = new_qty     - db_qty
+
+        preview_rows.append({
+            "Channel":       sel_ch,
+            "File":          entry["cfg"]["uf"].name,
+            "Date Range":    date_range_str,
+            "DB Rows":       db_rows if db_rows >= 0 else "error",
+            "DB Revenue ₹":  f"{db_revenue:,.0f}",
+            "DB Qty":        f"{db_qty:,.1f}",
+            "New Rows":      new_rows,
+            "New Revenue ₹": f"{new_revenue:,.0f}",
+            "New Qty":       f"{new_qty:,.1f}",
+            "Δ Revenue ₹":   f"{delta_rev:+,.0f}",
+        })
+
+    preview_df = pd.DataFrame(preview_rows)
+    st.dataframe(preview_df, use_container_width=True, hide_index=True)
+
+    st.markdown(
+        "**What will happen on Confirm:**  \n"
+        "For each channel above, all existing DB rows for the listed dates will be "
+        "**deleted** and replaced with the new rows from your file. "
+        "Dates not present in your file are untouched."
+    )
+
+    col_confirm, col_cancel, _ = st.columns([1, 1, 4])
+
+    with col_cancel:
+        if st.button("❌ Cancel", key="su2_cancel"):
+            st.info("Upload cancelled — no changes were made to the database.")
+            return
+
+    with col_confirm:
+        confirmed = st.button("✅ Confirm & Push to Live DB", type="primary", key="su2_confirm")
+
+    if not confirmed:
+        return
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # PHASE 6 — Execute: delete-then-insert for each staged file
+    # ─────────────────────────────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("🚀 Writing to database…")
+
+    overall_errors: list[str] = []
+    total_records  = 0
+
+    for entry in staged_data:
+        sel_ch   = entry["sel_ch"]
+        final_df = entry["final_df"]
+        cfg      = entry["cfg"]
+        active_schema = cfg["active_schema"]
 
         CHUNK   = 500
         records = final_df.to_dict(orient="records")
 
         try:
+            # Delete existing rows for the dates being re-uploaded
+            unique_dates = final_df["date"].dropna().unique().tolist()
+            with st.spinner(
+                f"Clearing existing {sel_ch} data for "
+                f"{len(unique_dates)} date(s) before re-insert…"
+            ):
+                DEL_CHUNK = 50
+                for di in range(0, len(unique_dates), DEL_CHUNK):
+                    date_batch = unique_dates[di: di + DEL_CHUNK]
+                    supabase.table("sales").delete()\
+                        .eq("channel", sel_ch)\
+                        .in_("date", date_batch)\
+                        .execute()
+
             with upload_progress_bar(
                 len(records), chunk_size=CHUNK, label=f"Uploading {sel_ch}"
             ) as tick:
                 for j in range(0, len(records), CHUNK):
-                    res = supabase.table("sales").upsert(
+                    res = supabase.table("sales").insert(
                         records[j: j + CHUNK],
-                        on_conflict="date,channel,item_name,city",
                     ).execute()
                     if hasattr(res, "error") and res.error:
                         overall_errors.append(f"{sel_ch} chunk {j//CHUNK+1}: {res.error}")
@@ -891,9 +1022,9 @@ def render_smart_upload_tab(
             overall_errors.append(f"{sel_ch}: {e}")
             continue
 
-        # Save column template for new channels so next upload is automatic
+        # Save column template for new channels
         if cfg["is_new_channel"]:
-            col_sigs = [c.lower() for c in cfg["raw_df"].columns.tolist()[:10]]
+            col_sigs  = [c.lower() for c in cfg["raw_df"].columns.tolist()[:10]]
             fname_sig = re.sub(r"[_\-\s\.]+\d+.*$", "", cfg["uf"].name.lower())[:30]
             _save_template(
                 supabase, sel_ch, cfg["col_map"],
