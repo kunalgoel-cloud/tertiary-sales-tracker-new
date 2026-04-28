@@ -183,11 +183,11 @@ KNOWN_SCHEMAS: dict[str, ChannelSchema] = {
         col_channel_sku   = "FCN",
         col_qty           = "Sum of units_sold",
         col_revenue       = "Sum of gmv",
-        col_date          = "sale_date",    # "Wed Apr 01 2026 00:00:00 GMT+0530..." — pd.to_datetime handles it
+        col_date          = "sale_date",    # "Wed Apr 01 2026 00:00:00 GMT+0530..." — JS-style date
         col_city          = None,           # National — no city column
         date_in_file      = True,
         city_in_file      = False,
-        date_parse_fn     = "standard",
+        date_parse_fn     = "js_date",      # Custom parser strips JS timezone cruft
     ),
 }
 
@@ -224,6 +224,16 @@ def _parse_date(val, parse_fn: str) -> str | None:
             return pd.to_datetime(part).strftime("%Y-%m-%d")
         except Exception:
             return None
+    elif parse_fn == "js_date":
+        # JavaScript-style: "Wed Apr 01 2026 00:00:00 GMT+0530 (India Standard Time)"
+        # Extract the "Mon DD YYYY" portion and parse it.
+        m = re.search(r'(\w{3})\s+(\d{1,2})\s+(\d{4})', s)
+        if m:
+            try:
+                return datetime.strptime(f"{m.group(1)} {m.group(2)} {m.group(3)}", "%b %d %Y").strftime("%Y-%m-%d")
+            except ValueError:
+                pass
+        return None
     else:  # "standard"
         try:
             return pd.to_datetime(s).strftime("%Y-%m-%d")
