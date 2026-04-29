@@ -709,7 +709,18 @@ if _TAB_DEEPDIVE >= 0:
                 }),
                 hide_index=True, use_container_width=True,
             )
-    
+            sku_csv_export = sku_perf.copy()
+            sku_csv_export["Rev Share %"] = sku_csv_export["Rev Share %"].round(1).astype(str) + "%"
+            sku_csv_export["Avg Price (₹)"] = sku_csv_export["Avg Price (₹)"].round(1)
+            sku_csv_export["DRR (₹)"] = sku_csv_export["DRR (₹)"].round(0).astype(int)
+            st.download_button(
+                "⬇️ Download SKU table as CSV",
+                data=sku_csv_export.to_csv(index=False).encode("utf-8"),
+                file_name="sku_performance.csv",
+                mime="text/csv",
+                key="dl_sku_perf",
+            )
+
             st.divider()
     
             # ════════════════════════════════
