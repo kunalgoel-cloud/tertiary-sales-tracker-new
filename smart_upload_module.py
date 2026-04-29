@@ -786,15 +786,17 @@ def render_smart_upload_tab(
             new_mappings: dict[str, str] = {}
             cols_per_row = 2
             keys_list = sorted(all_new_keys.keys())
-            for row_start in range(0, len(keys_list), cols_per_row):
-                row_keys = keys_list[row_start: row_start + cols_per_row]
-                form_cols = st.columns(len(row_keys))
-                for col_widget, k in zip(form_cols, row_keys):
-                    with col_widget:
-                        new_mappings[k] = st.selectbox(
-                            f"`{k[:60]}{'…' if len(k)>60 else ''}`",
-                            masters, key=f"su2_sku_{row_start}_{k[:30]}",
-                        )
+            for idx, k in enumerate(keys_list):
+                row_start = (idx // cols_per_row) * cols_per_row
+                if idx % cols_per_row == 0:
+                    row_keys   = keys_list[row_start: row_start + cols_per_row]
+                    form_cols  = st.columns(len(row_keys))
+                col_widget = form_cols[idx % cols_per_row]
+                with col_widget:
+                    new_mappings[k] = st.selectbox(
+                        f"`{k[:60]}{'…' if len(k)>60 else ''}`",
+                        masters, key=f"su2_sku_{idx}",
+                    )
 
             if st.form_submit_button("💾 Save mappings & continue", type="primary"):
                 saved_count = 0
