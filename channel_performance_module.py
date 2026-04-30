@@ -719,6 +719,12 @@ def _render_dashboard(merged: pd.DataFrame,
         # Apply product filter if active (matches item_name to master SKU names)
         if sel_products:
             _rs = _rs[_rs["item_name"].isin(sel_products)]
+        # Apply location filter — normalise both sides so hub-code variants match.
+        # Without this, _true_total_units counts nationwide sales while _true_inv
+        # only covers the filtered locations, causing STR to be massively overstated.
+        if set(sel_locations) != set(u_locations):
+            _loc_cities = {_norm_city(loc) for loc in sel_locations}
+            _rs = _rs[_rs["city"].apply(_norm_city).isin(_loc_cities)]
         _total = 0.0
         for _ch in sel_channels:
             _kw   = _CH_KEYWORD.get(_ch, _ch.lower())
@@ -893,10 +899,13 @@ def _render_dashboard(merged: pd.DataFrame,
         # _w_doc / _w_str / _g_drr — raw_sales cannot be disaggregated by
         # product or location without the inventory-level join.
         if grp_col == "channel" and raw_sales is not None and not raw_sales.empty and n_days > 0:
-            # Respect product filter if active (same logic as top metric cards)
+            # Respect product and location filters (same logic as top metric cards)
             _rs_grp = raw_sales.copy()
             if sel_products:
                 _rs_grp = _rs_grp[_rs_grp["item_name"].isin(sel_products)]
+            if set(sel_locations) != set(u_locations):
+                _loc_cities = {_norm_city(loc) for loc in sel_locations}
+                _rs_grp = _rs_grp[_rs_grp["city"].apply(_norm_city).isin(_loc_cities)]
 
             _ch_units: dict[str, float] = {}
             _ch_doc:   dict[str, float] = {}
