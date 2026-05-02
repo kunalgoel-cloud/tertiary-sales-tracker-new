@@ -530,7 +530,15 @@ def _build_work_df(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _schema_from_template(ch: str, tmpl: dict) -> ChannelSchema:
-    """Reconstruct a minimal ChannelSchema from a saved Supabase template row."""
+    """Reconstruct a minimal ChannelSchema from a saved Supabase template row.
+
+    For channels that exist in KNOWN_SCHEMAS, we always inherit the canonical
+    date_parse_fn from code rather than the saved template — this ensures that
+    schema fixes (e.g. js_date → dmy) take effect immediately without needing
+    to delete and re-save the Supabase template.
+    """
+    # Prefer KNOWN_SCHEMAS date_parse_fn if available; fall back to "standard"
+    known_parse_fn = KNOWN_SCHEMAS[ch].date_parse_fn if ch in KNOWN_SCHEMAS else "standard"
     return ChannelSchema(
         channel_name     = ch,
         filename_signals = tmpl.get("filename_signals_list", []),
@@ -546,7 +554,7 @@ def _schema_from_template(ch: str, tmpl: dict) -> ChannelSchema:
         city_in_file     = bool(tmpl.get("city_in_file", True)),
         skiprows         = int(tmpl.get("skiprows") or 0),
         sheet_name       = tmpl.get("sheet_name"),
-        date_parse_fn    = "standard",
+        date_parse_fn    = known_parse_fn,
     )
 
 
