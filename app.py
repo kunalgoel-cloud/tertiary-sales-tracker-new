@@ -11,6 +11,7 @@ from channel_performance_module import render_channel_performance_tab
 from vending_module import render_vending_tab
 from sop_module import render_sop_tab
 from smart_upload_module import render_smart_upload_tab
+from deals_promos_module import render_deals_promos_tab
 
 # ── Global Filter System ──────────────────────────────────────────────────────
 # Centralized filter state management. All tabs share these filter values
@@ -444,6 +445,7 @@ def _tidx(key: str) -> int:
 _TAB_ANALYTICS      = _tidx("trend_analytics")
 _TAB_DEEPDIVE       = _tidx("deep_dive")
 _TAB_MARKETING      = _tidx("performance_marketing")
+_TAB_DEALSPROMOS    = _tidx("deals_promos")
 _TAB_UPLOAD         = _tidx("smart_upload")
 _TAB_MONTHLY_UPLOAD = _tidx("monthly_upload")
 _TAB_CONFIG         = _tidx("configuration")
@@ -960,6 +962,14 @@ if _TAB_MARKETING >= 0:
                     st.rerun()
         else:
             render_marketing_tab(role)
+
+# ══════════════════════════════════════════════
+# TAB – DEALS & PROMOS
+# ══════════════════════════════════════════════
+if _TAB_DEALSPROMOS >= 0:
+    with tabs[_TAB_DEALSPROMOS]:
+        page_header("Deals & Promos", "Generate channel deal files from sales signals", role="")
+        render_deals_promos_tab(history_df, role)
 
 # ══════════════════════════════════════════════
 # TAB 4 – SMART UPLOAD  (admin only)
