@@ -187,7 +187,7 @@ KNOWN_SCHEMAS: dict[str, ChannelSchema] = {
         col_city          = None,           # National — no city column
         date_in_file      = True,
         city_in_file      = False,
-        date_parse_fn     = "js_date",      # Custom parser strips JS timezone cruft
+        date_parse_fn     = "dmy",           # DD-MM-YYYY e.g. "01-04-2026"
     ),
 }
 
@@ -234,6 +234,17 @@ def _parse_date(val, parse_fn: str) -> str | None:
             except ValueError:
                 pass
         return None
+    elif parse_fn == "dmy":
+        # DD-MM-YYYY format e.g. "01-04-2026" → "2026-04-01"
+        for fmt in ("%d-%m-%Y", "%d/%m/%Y", "%d-%m-%y", "%d/%m/%y"):
+            try:
+                return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+            except ValueError:
+                pass
+        try:
+            return pd.to_datetime(s, dayfirst=True).strftime("%Y-%m-%d")
+        except Exception:
+            return None
     else:  # "standard"
         try:
             return pd.to_datetime(s).strftime("%Y-%m-%d")
