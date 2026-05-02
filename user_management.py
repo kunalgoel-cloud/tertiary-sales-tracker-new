@@ -53,6 +53,7 @@ ALL_TABS = [
     ("trend_analytics",     "📊 Trend Analytics"),
     ("deep_dive",           "🔬 Deep Dive"),
     ("performance_marketing","📣 Performance Marketing"),
+    ("deals_promos",        "🏷️ Deals & Promos"),
     ("smart_upload",        "📤 Smart Upload"),
     ("monthly_upload",      "📅 Monthly Channel Upload"),
     ("configuration",       "🛠 Configuration"),
