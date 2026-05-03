@@ -890,22 +890,35 @@ def _render_dashboard(merged: pd.DataFrame,
             pass
 
         # ── Build metrics series for the grouped table ────────────────────────
-        # For Channel grouping: compute DRR, DOC, and STR directly from
-        # raw_sales per channel.  This avoids the city-join undercount (tier-2
-        # delivery cities not present in inventory files) that affects all three
-        # metrics when derived from city-joined units_sold / per-row doc/str.
+        # For Channel and Product groupings: compute DRR/DOC/STR directly from
+        # raw_sales to avoid the city-join undercount (channels like Amazon have
+        # no city in sales rows, so city-joined units_sold is near-zero).
         #
-        # For Product / Location groupings: fall back to city-joined values via
-        # _w_doc / _w_str / _g_drr — raw_sales cannot be disaggregated by
-        # product or location without the inventory-level join.
-        if grp_col == "channel" and raw_sales is not None and not raw_sales.empty and n_days > 0:
-            # Respect product and location filters (same logic as top metric cards)
+        # For Location grouping: must use city-joined values because raw_sales
+        # cannot be split by warehouse/DC location without the inventory join.
+
+        # Base filtered raw_sales (shared by Channel and Product paths)
+        _rs_grp = None
+        if raw_sales is not None and not raw_sales.empty and n_days > 0:
             _rs_grp = raw_sales.copy()
-            if sel_products:
-                _rs_grp = _rs_grp[_rs_grp["item_name"].isin(sel_products)]
+            # Apply channel keyword filter
+            if sel_channels:
+                _ch_masks = [
+                    _rs_grp["channel"].str.lower().str.contains(
+                        _CH_KEYWORD.get(_ch, _ch.lower()), na=False
+                    )
+                    for _ch in sel_channels
+                ]
+                import functools, operator
+                _rs_grp = _rs_grp[functools.reduce(operator.or_, _ch_masks)]
             if set(sel_locations) != set(u_locations):
                 _loc_cities = {_norm_city(loc) for loc in sel_locations}
                 _rs_grp = _rs_grp[_rs_grp["city"].apply(_norm_city).isin(_loc_cities)]
+
+        if grp_col == "channel" and _rs_grp is not None:
+            _rs_ch = _rs_grp.copy()
+            if sel_products:
+                _rs_ch = _rs_ch[_rs_ch["item_name"].isin(sel_products)]
 
             _ch_units: dict[str, float] = {}
             _ch_doc:   dict[str, float] = {}
@@ -913,8 +926,8 @@ def _render_dashboard(merged: pd.DataFrame,
             _ch_drr:   dict[str, float] = {}
             for _ch in agg_df[grp_col].tolist():
                 _kw    = _CH_KEYWORD.get(_ch, str(_ch).lower())
-                _mask  = _rs_grp["channel"].str.lower().str.contains(_kw, na=False)
-                _qty   = float(_rs_grp.loc[_mask, "qty_sold"].sum())
+                _mask  = _rs_ch["channel"].str.lower().str.contains(_kw, na=False)
+                _qty   = float(_rs_ch.loc[_mask, "qty_sold"].sum())
                 _inv   = float(agg_df.loc[agg_df[grp_col] == _ch, "inventory"].values[0])
                 _drr_v = _qty / n_days
                 _s30   = _qty * (30.0 / n_days)
@@ -923,7 +936,6 @@ def _render_dashboard(merged: pd.DataFrame,
                 _ch_doc[_ch]   = (_inv / _drr_v) if _drr_v > 0 else float("nan")
                 _ch_str[_ch]   = (_s30 / (_s30 + _inv)) if (_s30 + _inv) > 0 else 0.0
 
-            # Overwrite all four metrics that are affected by the city-join undercount
             agg_df["units_sold"] = agg_df[grp_col].map(_ch_units)
             agg_df = (
                 agg_df
@@ -932,7 +944,34 @@ def _render_dashboard(merged: pd.DataFrame,
                 .join(pd.Series(_ch_drr, name="drr"),  on=grp_col)
                 .sort_values("inventory", ascending=False).reset_index(drop=True)
             )
+
+        elif grp_col == "master_sku" and _rs_grp is not None:
+            # Product grouping — compute per-SKU metrics from raw_sales
+            _pr_units: dict[str, float] = {}
+            _pr_doc:   dict[str, float] = {}
+            _pr_str:   dict[str, float] = {}
+            _pr_drr:   dict[str, float] = {}
+            for _sku in agg_df[grp_col].tolist():
+                _qty   = float(_rs_grp.loc[_rs_grp["item_name"] == _sku, "qty_sold"].sum())
+                _inv   = float(agg_df.loc[agg_df[grp_col] == _sku, "inventory"].values[0])
+                _drr_v = _qty / n_days
+                _s30   = _qty * (30.0 / n_days)
+                _pr_units[_sku] = _qty
+                _pr_drr[_sku]   = _drr_v
+                _pr_doc[_sku]   = (_inv / _drr_v) if _drr_v > 0 else float("nan")
+                _pr_str[_sku]   = (_s30 / (_s30 + _inv)) if (_s30 + _inv) > 0 else 0.0
+
+            agg_df["units_sold"] = agg_df[grp_col].map(_pr_units)
+            agg_df = (
+                agg_df
+                .join(pd.Series(_pr_doc, name="doc"),  on=grp_col)
+                .join(pd.Series(_pr_str, name="str"),  on=grp_col)
+                .join(pd.Series(_pr_drr, name="drr"),  on=grp_col)
+                .sort_values("inventory", ascending=False).reset_index(drop=True)
+            )
+
         else:
+            # Location grouping (or no raw_sales): must use city-joined values
             agg_df = (
                 agg_df
                 .join(table_df.groupby(grp_col).apply(_w_doc, **_apply_kwargs).rename("doc"), on=grp_col)
