@@ -306,7 +306,11 @@ def _process_master_file(uploaded_file) -> pd.DataFrame | None:
             df["Sales_Qty"] / (df["Sales_Qty"] + df["Total_SOH"]) * 100,
             0,
         )
-        df["days_of_cover"] = np.where(df["drr"] > 0, df["Total_SOH"] / df["drr"], 999)
+        df["days_of_cover"] = np.where(
+            df["drr"] > 0,
+            np.minimum(df["Total_SOH"] / df["drr"], 999),  # cap at 999 (practical infinity)
+            999,                                            # no sales → infinite DOC
+        )
 
         df["rank"]      = df["velocity"].rank(pct=True)
         df["abc_class"] = np.where(df["rank"] > 0.8, "A",
@@ -357,7 +361,10 @@ def _render_analysis(df_raw: pd.DataFrame, price_map: dict,
     m3.metric("Total SOH (Qty)",    f"{fdf['Total_SOH'].sum():,.0f}")
     m3.caption(f"₹{fdf['soh_val'].sum():,.0f}")
     m4.metric("Total Machines",     f"{fdf['Machine_Count'].sum():,.0f}")
-    finite_doc = fdf[fdf["days_of_cover"] < 999]["days_of_cover"]
+    # Avg DOC: only include locations with stock (DOC > 0) and meaningful sales (DOC < 999).
+    # DOC=0 → out of stock (excluded — these are restock alerts, not DOC data).
+    # DOC=999 → no sales at all (excluded — undefined rate).
+    finite_doc = fdf[(fdf["days_of_cover"] > 0) & (fdf["days_of_cover"] < 999)]["days_of_cover"]
     avg_doc    = finite_doc.mean() if not finite_doc.empty else float("nan")
     m5.metric("Avg Days of Cover",  f"{avg_doc:.1f}" if not np.isnan(avg_doc) else "∞")
 
@@ -426,7 +433,9 @@ def _render_analysis(df_raw: pd.DataFrame, price_map: dict,
         ).reset_index()
         city_agg["drr"]          = city_agg["Sales_Qty"] / 30
         city_agg["days_of_cover"]= np.where(
-            city_agg["drr"] > 0, city_agg["Total_SOH"] / city_agg["drr"], 999
+            city_agg["drr"] > 0,
+            np.minimum(city_agg["Total_SOH"] / city_agg["drr"], 999),
+            999
         )
         city_agg["sales_val"] = city_agg["City"].map(
             fdf.groupby("City")["sales_val"].sum()
