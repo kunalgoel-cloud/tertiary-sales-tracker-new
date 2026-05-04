@@ -84,6 +84,23 @@ KNOWN_SCHEMAS: dict[str, ChannelSchema] = {
         date_parse_fn    = "range_start",   # "20260427 - 20260427" → 2026-04-27
     ),
 
+    "BB Instant": ChannelSchema(
+        channel_name     = "BB Instant",
+        filename_signals = ["bbinstant", "bb_instant", "analytics_vd_manufacturer_bbinstant"],
+        col_signals      = ["source_sku_id", "sku_description", "location_city",
+                            "quantity", "sales", "date_range"],
+        col_product      = "sku_description",
+        col_product2     = None,
+        col_channel_sku  = "source_sku_id",
+        col_qty          = "quantity",
+        col_revenue      = "sales",
+        col_date         = "date_range",
+        col_city         = "location_city",
+        date_in_file     = True,
+        city_in_file     = True,
+        date_parse_fn    = "range_start",   # "20260401 - 20260430" → 2026-04-01
+    ),
+
     "Swiggy": ChannelSchema(
         channel_name     = "Swiggy",
         filename_signals = ["swiggy"],
