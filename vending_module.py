@@ -332,6 +332,16 @@ def _process_master_file(uploaded_file) -> pd.DataFrame | None:
 def _render_analysis(df_raw: pd.DataFrame, price_map: dict,
                      target_cust: str, sel_month: str, sel_year: int, db: dict):
     df = df_raw.copy()
+
+    # Re-compute DOC from raw columns so saved analyses benefit from the 999 cap too.
+    # Saved Supabase data may have unbounded DOC values (e.g. 10815) from before this fix.
+    if "Total_SOH" in df.columns and "drr" in df.columns:
+        df["days_of_cover"] = np.where(
+            df["drr"] > 0,
+            np.minimum(df["Total_SOH"] / df["drr"], 999),
+            999,
+        )
+
     df["unit_price"] = df["Product"].map(price_map).fillna(0)
     df["sales_val"]  = df["Sales_Qty"] * df["unit_price"]
     df["soh_val"]    = df["Total_SOH"] * df["unit_price"]
