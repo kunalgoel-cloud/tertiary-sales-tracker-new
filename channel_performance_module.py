@@ -17,6 +17,7 @@ HOW IT PLUGS IN (app_24.py):
 """
 
 import re
+import numpy as np
 import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
@@ -345,7 +346,7 @@ def _parse_amazon(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: int, db_
         sales_val = pd.Series(0.0, index=inv_df.index)
 
     inv_df["drr"]        = (sales_val / n_days).round(2)
-    inv_df["doc"]        = inv_df["inventory"] / inv_df["drr"].replace(0, 0.001)
+    inv_df["doc"]        = np.minimum(inv_df["inventory"] / inv_df["drr"].replace(0, 0.001), 999)
     inv_df["units_sold"] = sales_val
     inv_df["n_days"]     = n_days
     return inv_df[["channel_sku", "inventory", "str", "doc", "drr", "units_sold", "n_days", "location"]]
@@ -399,14 +400,14 @@ def _parse_blinkit(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: int, db
         daily_rate    = (sales_val / n_days).replace(0, 0.001)
         sales_30d     = sales_val * (30 / n_days)
         inv_df["str"] = sales_30d / (sales_30d + inv_df["inventory"]).replace(0, 1)
-        fallback_doc  = inv_df["inventory"] / (last30 / 30).replace(0, 0.001)
-        inv_df["doc"] = (inv_df["inventory"] / daily_rate).where(sales_val > 0, fallback_doc)
+        fallback_doc  = np.minimum(inv_df["inventory"] / (last30 / 30).replace(0, 0.001), 999)
+        inv_df["doc"] = np.minimum((inv_df["inventory"] / daily_rate).where(sales_val > 0, fallback_doc), 999)
         fallback_drr  = (last30 / 30).round(2)
         inv_df["drr"] = (sales_val / n_days).where(sales_val > 0, fallback_drr).round(2)
         inv_df["units_sold"] = sales_val
     else:
         inv_df["str"]        = last30 / (last30 + inv_df["inventory"]).replace(0, 1)
-        inv_df["doc"]        = inv_df["inventory"] / (last30 / 30).replace(0, 0.001)
+        inv_df["doc"]        = np.minimum(inv_df["inventory"] / (last30 / 30).replace(0, 0.001), 999)
         inv_df["drr"]        = (last30 / 30).round(2)
         inv_df["units_sold"] = last30
 
@@ -456,13 +457,13 @@ def _parse_swiggy(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: int, db_
         daily_rate    = (sales_val / n_days).replace(0, 0.001)
         sales_30d     = sales_val * (30 / n_days)
         inv_df["str"] = sales_30d / (sales_30d + inv_df["inventory"]).replace(0, 1)
-        computed_doc  = inv_df["inventory"] / daily_rate
-        inv_df["doc"] = computed_doc.where(sales_val > 0, doh_fallback.values)
+        computed_doc  = np.minimum(inv_df["inventory"] / daily_rate, 999)
+        inv_df["doc"] = computed_doc.where(sales_val > 0, np.minimum(doh_fallback.values, 999))
         fallback_drr  = (inv_df["inventory"] / doh_fallback.where(doh_fallback > 0, other=float("nan"))).fillna(0).round(2)
         inv_df["drr"] = (sales_val / n_days).where(sales_val > 0, fallback_drr).round(2)
         inv_df["units_sold"] = sales_val
     else:
-        inv_df["doc"]        = doh_fallback.values
+        inv_df["doc"]        = np.minimum(doh_fallback.values, 999)
         inv_df["str"]        = 0.0
         inv_df["drr"]        = (inv_df["inventory"] / doh_fallback.where(doh_fallback > 0, other=float("nan"))).fillna(0).round(2)
         inv_df["units_sold"] = 0.0
@@ -519,14 +520,14 @@ def _parse_bigbasket(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: int, 
         daily_rate    = (sales_val / n_days).replace(0, 0.001)
         sales_30d     = sales_val * (30 / n_days)
         inv_df["str"] = sales_30d / (sales_30d + inv_df["inventory"]).replace(0, 1)
-        computed_doc  = inv_df["inventory"] / daily_rate
-        inv_df["doc"] = computed_doc.where(sales_val > 0, doh_fallback.values)
+        computed_doc  = np.minimum(inv_df["inventory"] / daily_rate, 999)
+        inv_df["doc"] = computed_doc.where(sales_val > 0, np.minimum(doh_fallback.values, 999))
         fallback_drr  = (inv_df["inventory"] / doh_fallback.where(doh_fallback > 0, other=float("nan"))).fillna(0).round(2)
         inv_df["drr"] = (sales_val / n_days).where(sales_val > 0, fallback_drr).round(2)
         inv_df["units_sold"] = sales_val
     else:
         inv_df["str"]        = 0.0
-        inv_df["doc"]        = doh_fallback.values
+        inv_df["doc"]        = np.minimum(doh_fallback.values, 999)
         inv_df["drr"]        = (inv_df["inventory"] / doh_fallback.where(doh_fallback > 0, other=float("nan"))).fillna(0).round(2)
         inv_df["units_sold"] = 0.0
 
@@ -623,10 +624,10 @@ def _reapply_sales(snap_df: pd.DataFrame, raw_sales: pd.DataFrame,
 
     # Re-compute DRR / DOC / STR where we have fresh sales
     old_drr  = snap_df["drr"].copy()
-    old_doc  = snap_df["doc"].copy()
+    old_doc  = np.minimum(snap_df["doc"].copy(), 999)   # cap stale snapshot values too
 
     new_drr = (fresh_units / n_days).round(2)
-    new_doc = (snap_df["inventory"] / new_drr.replace(0, 0.001)).round(1)
+    new_doc = np.minimum(snap_df["inventory"] / new_drr.replace(0, 0.001), 999).round(1)
 
     sales_30d = fresh_units * (30 / n_days)
     new_str   = sales_30d / (sales_30d + snap_df["inventory"]).replace(0, 1)
@@ -751,7 +752,7 @@ def _render_dashboard(merged: pd.DataFrame,
         )
     else:
         # Fallback: weighted average of city-joined per-row DOC
-        valid_doc = table_df[(table_df["doc"] > 0) & (table_df["doc"] < 9999)]
+        valid_doc = table_df[(table_df["doc"] > 0) & (table_df["doc"] < 999)]
         if not valid_doc.empty and valid_doc["inventory"].sum() > 0:
             w_doc = (valid_doc["doc"] * valid_doc["inventory"]).sum() / valid_doc["inventory"].sum()
             m2.metric(f"Avg Days of Cover{filter_label}", f"{w_doc:.1f} days")
@@ -856,7 +857,7 @@ def _render_dashboard(merged: pd.DataFrame,
         # loop below (together with doc / str / drr) — no separate pass needed.
 
         def _w_doc(grp):
-            v = grp[(grp["doc"] > 0) & (grp["doc"] < 9999)]
+            v = grp[(grp["doc"] > 0) & (grp["doc"] < 999)]
             return (v["doc"] * v["inventory"]).sum() / v["inventory"].sum() \
                 if not v.empty and v["inventory"].sum() > 0 else float("nan")
 
