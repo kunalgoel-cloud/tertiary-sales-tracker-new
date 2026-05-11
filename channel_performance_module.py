@@ -74,6 +74,65 @@ def _norm_city(city) -> str:
     # Apply alias map
     return _CITY_ALIASES.get(s, s)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# BIG BASKET DC → CITY MAPPING
+# ─────────────────────────────────────────────────────────────────────────────
+# Maps DC base name (after stripping "-DC" suffix) to a canonical city name.
+# Used to align inventory file locations with sales city strings.
+BB_DC_CITY_MAP: dict[str, str] = {
+    "Ahmedabad":  "Ahmedabad-Gandhinagar",
+    "Bhubaneswar":"Bhubaneshwar-Cuttack",
+    "Kundli":     "Gurgaon",          # canonical key; also serves Delhi & Noida
+    "Lucknow":    "Lucknow-Kanpur",
+    "Vadodara":   "Ahmedabad-Gandhinagar",
+    "Vijayawada": "Vijayawada-Guntur",
+}
+
+# DCs that serve MULTIPLE cities — all listed cities' sales are summed and
+# attributed to the DC's canonical city key for DRR/DOC calculation.
+BB_DC_MULTICITIES: dict[str, list[str]] = {
+    "Kundli": ["Delhi", "Gurgaon", "Gurugram Rural"],
+}
+
+
+def _dc_base(dc_name: str) -> str:
+    """Strip '-DC' / '-DC2' suffixes to get the base DC name."""
+    return re.sub(r"[-\s]?DC\d*$", "", str(dc_name), flags=re.IGNORECASE).strip()
+
+
+def _aggregate_bb_multicities(city_sales: pd.DataFrame) -> pd.DataFrame:
+    """
+    For Big Basket DCs that serve multiple cities (e.g. Kundli covers Delhi +
+    Gurgaon + Noida), sum sales from all covered cities into one aggregated row
+    keyed to the DC's canonical city.  Individual covered-city rows are removed
+    to prevent double-counting in the inventory-join step.
+    """
+    if city_sales.empty:
+        return city_sales
+    city_sales = city_sales.copy()
+    if "_city_norm" not in city_sales.columns:
+        city_sales["_city_norm"] = city_sales["city"].apply(_norm_city)
+
+    aug_rows: list[pd.DataFrame] = []
+    all_covered: set[str] = set()
+
+    for dc_base_name, raw_cities in BB_DC_MULTICITIES.items():
+        covered_norms = {_norm_city(c) for c in raw_cities}
+        all_covered |= covered_norms
+        dc_key = _norm_city(BB_DC_CITY_MAP.get(dc_base_name, dc_base_name))
+        subset = city_sales[city_sales["_city_norm"].isin(covered_norms)]
+        if not subset.empty:
+            agg = subset.groupby("item_name")["qty_sold"].sum().reset_index()
+            agg["_city_norm"] = dc_key
+            aug_rows.append(agg)
+
+    # Drop individual covered-city rows; replace with DC-aggregated rows
+    result = city_sales[~city_sales["_city_norm"].isin(all_covered)].copy()
+    if aug_rows:
+        result = pd.concat([result] + aug_rows, ignore_index=True)
+    return result
+
+
 # ── Global Filter Notes ───────────────────────────────────────────────────────
 # Channel Performance does NOT use the global date/channel filter.
 # Reason: this tab's "Sales Window" (N days back) is an inventory-specific
@@ -484,17 +543,10 @@ def _parse_bigbasket(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: int, 
         if doh_col else pd.Series(0.0, index=inv_df.index)
     )
 
-    BB_DC_CITY_MAP = {
-        "Ahmedabad": "Ahmedabad-Gandhinagar", "Bhubaneswar": "Bhubaneshwar-Cuttack",
-        "Kundli": "Gurgaon", "Lucknow": "Lucknow-Kanpur",
-        "Vadodara": "Ahmedabad-Gandhinagar", "Vijayawada": "Vijayawada-Guntur",
-    }
-    def dc_to_city(dc_name):
-        city = re.sub(r"[-\s]?DC\d*$", "", str(dc_name), flags=re.IGNORECASE).strip()
-        return BB_DC_CITY_MAP.get(city, city)
-
     # Apply _norm_city after the BB alias map so both sides share the same form.
-    inv_df["_city_key"] = inv_df["location"].apply(dc_to_city).apply(_norm_city)
+    inv_df["_city_key"] = inv_df["location"].apply(
+        lambda loc: _norm_city(BB_DC_CITY_MAP.get(_dc_base(loc), _dc_base(loc)))
+    )
 
     # Translate channel_sku → master_sku for sales join
     if db_mappings is not None and not db_mappings.empty:
@@ -507,6 +559,8 @@ def _parse_bigbasket(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: int, 
         city_sales = sales_df[sales_df["city"] != "__national__"].copy()
         if not city_sales.empty:
             city_sales["_city_norm"] = city_sales["city"].apply(_norm_city)
+            # Aggregate multi-city DCs (e.g. Kundli covers Delhi + Gurgaon + Noida)
+            city_sales = _aggregate_bb_multicities(city_sales)
             inv_df = inv_df.merge(
                 city_sales[["item_name", "_city_norm", "qty_sold"]].rename(columns={"qty_sold": "units_sold"}),
                 left_on=["master_sku", "_city_key"],
@@ -586,18 +640,14 @@ def _reapply_sales(snap_df: pd.DataFrame, raw_sales: pd.DataFrame,
                 .apply(_norm_city)
             )
         elif channel == "Big Basket":
-            # Strip "-DC" / "-DC2" suffix and apply city aliases (same as _parse_bigbasket),
-            # then _norm_city for consistent casing/suffix handling.
-            BB_DC_CITY_MAP = {
-                "Ahmedabad": "Ahmedabad-Gandhinagar", "Bhubaneswar": "Bhubaneshwar-Cuttack",
-                "Kundli": "Gurgaon", "Lucknow": "Lucknow-Kanpur",
-                "Vadodara": "Ahmedabad-Gandhinagar", "Vijayawada": "Vijayawada-Guntur",
-            }
-            def _dc_to_city(dc_name):
-                city = re.sub(r"[-\s]?DC\d*$", "", str(dc_name), flags=re.IGNORECASE).strip()
-                return BB_DC_CITY_MAP.get(city, city)
-            city_sales["_ckey"] = city_sales["city"].apply(_norm_city)
-            snap_df["_ckey"]    = snap_df["location"].astype(str).apply(_dc_to_city).apply(_norm_city)
+            # Strip "-DC" / "-DC2" suffix, apply BB_DC_CITY_MAP, then _norm_city.
+            # Uses module-level BB_DC_CITY_MAP and _dc_base() helper.
+            city_sales["_city_norm"] = city_sales["city"].apply(_norm_city)
+            city_sales = _aggregate_bb_multicities(city_sales)
+            city_sales = city_sales.rename(columns={"_city_norm": "_ckey"})
+            snap_df["_ckey"] = snap_df["location"].astype(str).apply(
+                lambda loc: _norm_city(BB_DC_CITY_MAP.get(_dc_base(loc), _dc_base(loc)))
+            )
         else:
             # Blinkit and any future channels: normalise both sides uniformly.
             city_sales["_ckey"] = city_sales["city"].apply(_norm_city)
