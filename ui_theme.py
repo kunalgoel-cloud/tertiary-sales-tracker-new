@@ -367,18 +367,18 @@ def apply_chart_theme(fig: go.Figure, height: int = None) -> go.Figure:
         plot_bgcolor  = "rgba(0,0,0,0)",
         paper_bgcolor = "rgba(0,0,0,0)",
         font          = dict(family="DM Sans, system-ui, sans-serif",
-                             color="#6B5F55", size=11),
-        title_font    = dict(family="DM Sans", color="#1C1917", size=14),
+                             color="#6B5F55", size=13),
+        title_font    = dict(family="DM Sans", color="#1C1917", size=15),
         legend        = dict(
             bgcolor     = "rgba(255,255,255,0.9)",
             bordercolor = "#E2DDD8",
             borderwidth = 1,
-            font        = dict(size=11, color="#6B5F55"),
+            font        = dict(size=12, color="#6B5F55"),
         ),
         hoverlabel = dict(
             bgcolor     = "#FFFFFF",
             bordercolor = "#E2DDD8",
-            font        = dict(family="DM Sans", color="#1C1917", size=12),
+            font        = dict(family="DM Sans", color="#1C1917", size=13),
         ),
         margin = dict(l=12, r=12, t=12, b=12),
     )
@@ -389,16 +389,16 @@ def apply_chart_theme(fig: go.Figure, height: int = None) -> go.Figure:
         gridcolor  = "#F0EDE8",
         linecolor  = "#E2DDD8",
         tickcolor  = "#E2DDD8",
-        tickfont   = dict(color="#A89E95", size=10),
-        title_font = dict(color="#6B5F55", size=11),
+        tickfont   = dict(color="#A89E95", size=12),
+        title_font = dict(color="#6B5F55", size=13),
         zeroline   = False,
     )
     fig.update_yaxes(
         gridcolor  = "#F0EDE8",
         linecolor  = "rgba(0,0,0,0)",
         tickcolor  = "#E2DDD8",
-        tickfont   = dict(color="#A89E95", size=10),
-        title_font = dict(color="#6B5F55", size=11),
+        tickfont   = dict(color="#A89E95", size=12),
+        title_font = dict(color="#6B5F55", size=13),
         zeroline   = False,
     )
     if height:
