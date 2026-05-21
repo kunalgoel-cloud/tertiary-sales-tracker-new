@@ -544,7 +544,7 @@ if _TAB_ANALYTICS >= 0:
             )
             if show_labels:
                 fig.update_traces(texttemplate="%{y:.2s}", textposition="inside",
-                                  textfont_size=10)
+                                  textfont_size=13)
                 totals = plot_df.groupby("date")[target_col].sum().reset_index()
                 fig.add_scatter(
                     x=totals["date"],
@@ -553,7 +553,7 @@ if _TAB_ANALYTICS >= 0:
                     mode="text",
                     textposition="top center",
                     showlegend=False,
-                    textfont=dict(color="#1C1917", size=10, family="JetBrains Mono"),
+                    textfont=dict(color="#1C1917", size=13, family="JetBrains Mono"),
                 )
             fig = apply_chart_theme(fig)
             # Preserve stacked bar mode and give top labels room to breathe
