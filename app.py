@@ -546,16 +546,17 @@ if _TAB_ANALYTICS >= 0:
                 fig.update_traces(texttemplate="%{y:.2s}", textposition="inside",
                                   textfont_size=13)
                 totals = plot_df.groupby("date")[target_col].sum().reset_index()
-                fig.add_scatter(
-                    x=totals["date"],
-                    y=totals[target_col],
-                    text=totals[target_col].apply(lambda x: f"{x:,.0f}"),
-                    mode="text",
-                    textposition="top center",
-                    showlegend=False,
-                    textfont=dict(color="#1C1917", size=13, family="JetBrains Mono"),
-                    textangle=-90,
-                )
+                for _, row in totals.iterrows():
+                    fig.add_annotation(
+                        x=row["date"],
+                        y=row[target_col],
+                        text=f"{row[target_col]:,.0f}",
+                        showarrow=False,
+                        yanchor="bottom",
+                        yshift=4,
+                        textangle=-90,
+                        font=dict(color="#1C1917", size=13, family="JetBrains Mono"),
+                    )
             fig = apply_chart_theme(fig)
             # Preserve stacked bar mode and give top labels room to breathe
             fig.update_layout(barmode="stack", margin=dict(l=12, r=12, t=48, b=12))
