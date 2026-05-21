@@ -554,6 +554,7 @@ if _TAB_ANALYTICS >= 0:
                     textposition="top center",
                     showlegend=False,
                     textfont=dict(color="#1C1917", size=13, family="JetBrains Mono"),
+                    textangle=-90,
                 )
             fig = apply_chart_theme(fig)
             # Preserve stacked bar mode and give top labels room to breathe
