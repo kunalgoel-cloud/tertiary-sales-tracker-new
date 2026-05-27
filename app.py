@@ -153,90 +153,9 @@ def invalidate_data_cache():
     get_table.clear()
 
 # ─────────────────────────────────────────────
-# 3. AUTHENTICATION
+# 3. MAIN APP
 # ─────────────────────────────────────────────
-def check_auth() -> bool:
-    if "authenticated" not in st.session_state:
-        # ── Styled login page ─────────────────────────────────────────────────
-        _, center_col, _ = st.columns([1, 1.2, 1])
-        with center_col:
-            st.markdown(
-                """
-                <div style="text-align:center; margin-top:2.5rem; margin-bottom:2rem;">
-                  <div style="font-family:'DM Serif Display',Georgia,serif;
-                              font-size:2rem; color:#C47A2B; margin-bottom:0.3rem;">
-                    Mamanourish
-                  </div>
-                  <div style="font-size:0.75rem; color:#A89E95;
-                              letter-spacing:0.12em; text-transform:uppercase;">
-                    Executive Sales Portal
-                  </div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-            # Role selector now includes "Custom User"
-            role_choice = st.selectbox(
-                "Role",
-                ["Select Role", "Admin (Full Access)", "Viewer (View Only)", "Custom User"],
-                label_visibility="collapsed",
-                placeholder="Select your role…",
-            )
-
-            # Show username field only for Custom User
-            username_input = ""
-            if role_choice == "Custom User":
-                username_input = st.text_input(
-                    "Username", placeholder="Enter your username…",
-                    label_visibility="collapsed",
-                )
-
-            pw = st.text_input(
-                "Password", type="password",
-                placeholder="Enter password…",
-                label_visibility="collapsed",
-            )
-
-            if st.button("Sign In →", use_container_width=True):
-                try:
-                    admin_pw  = st.secrets["ADMIN_PASSWORD"]
-                    viewer_pw = st.secrets["VIEWER_PASSWORD"]
-                except KeyError:
-                    st.error("ADMIN_PASSWORD / VIEWER_PASSWORD not set in Streamlit Secrets.")
-                    return False
-
-                if role_choice == "Admin (Full Access)" and pw == admin_pw:
-                    st.session_state["authenticated"] = True
-                    st.session_state["role"] = "admin"
-                    st.rerun()
-                elif role_choice == "Viewer (View Only)" and pw == viewer_pw:
-                    st.session_state["authenticated"] = True
-                    st.session_state["role"] = "viewer"
-                    st.rerun()
-                elif role_choice == "Custom User":
-                    # Authenticate against app_users table via user_management module
-                    if load_user_session(supabase, username_input.strip(), pw):
-                        st.rerun()
-                    else:
-                        st.error("Invalid username or password.")
-                else:
-                    st.error("Incorrect password or role — please try again.")
-
-            st.markdown(
-                '<div style="text-align:center;margin-top:1.5rem;font-size:0.7rem;color:#A89E95;">Mamanourish © 2025</div>',
-                unsafe_allow_html=True,
-            )
-        return False
-    return True
-
-# ─────────────────────────────────────────────
-# 4. MAIN APP
-# ─────────────────────────────────────────────
-if not check_auth():
-    st.stop()
-
-role: str = st.session_state["role"]
+role: str = "admin"
 
 history_df  = get_table("sales",           ("id", "date", "channel", "item_name", "qty_sold", "revenue"))
 master_skus  = get_table("master_skus",    ("name",))
@@ -283,14 +202,11 @@ def requires_city_channel(ch: str) -> bool:
 with st.sidebar:
     # ── Branded sidebar header ────────────────────────────────────────────────
     st.markdown(
-        f"""
+        """
         <div style="margin-bottom:1rem;">
           <div style="font-family:'DM Serif Display',Georgia,serif;
                       font-size:1.15rem; color:#F5A623; margin-bottom:0.15rem;">
             Mamanourish
-          </div>
-          <div class="role-badge">
-            {"🔑 Admin" if role == "admin" else "👁 Viewer"}
           </div>
         </div>
         """,
@@ -407,10 +323,6 @@ with st.sidebar:
         st.rerun()
 
     st.divider()
-    if st.button("Logout"):
-        del st.session_state["authenticated"]
-        del st.session_state["role"]
-        st.rerun()
 
 # ─────────────────────────────────────────────
 # TABS — built dynamically based on role + user permissions
