@@ -156,6 +156,7 @@ def invalidate_data_cache():
 # 3. MAIN APP
 # ─────────────────────────────────────────────
 role: str = "admin"
+st.session_state["role"] = "admin"
 
 history_df  = get_table("sales",           ("id", "date", "channel", "item_name", "qty_sold", "revenue"))
 master_skus  = get_table("master_skus",    ("name",))
