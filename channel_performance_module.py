@@ -242,8 +242,15 @@ def _channel_sales(sales_df: pd.DataFrame, channel_keyword: str) -> pd.DataFrame
     if ch.empty:
         return pd.DataFrame(columns=["item_name", "city", "qty_sold", "revenue"])
 
-    city_rows    = ch[ch["city"].notna() & (ch["city"].str.strip() != "")]
-    no_city_rows = ch[ch["city"].isna()  | (ch["city"].str.strip() == "")]
+    # Treat NULL, empty string, and "National" (Smart Upload's sentinel for
+    # channels without a city column, e.g. Amazon) all as no-city rows.
+    _no_city_mask = (
+        ch["city"].isna()
+        | (ch["city"].str.strip() == "")
+        | (ch["city"].str.strip().str.lower() == "national")
+    )
+    city_rows    = ch[~_no_city_mask]
+    no_city_rows = ch[_no_city_mask]
 
     parts = []
     if not city_rows.empty:
