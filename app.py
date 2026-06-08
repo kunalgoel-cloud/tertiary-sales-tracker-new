@@ -1273,11 +1273,105 @@ if role == "admin":
 
         st.divider()
         st.markdown("#### 🗺 Current SKU Mappings")
-        if not item_map_df.empty:
-            display_item_map = item_map_df.rename(columns={"raw_name": "SKU / Channel Name", "master_name": "Master SKU"})
-            st.dataframe(display_item_map, hide_index=True)
-        else:
+
+        if item_map_df.empty:
             st.info("No mappings saved yet.")
+        else:
+            # ── Search bar ────────────────────────────────────────────────────
+            sku_search = st.text_input(
+                "🔍 Search mappings",
+                placeholder="Type any part of the SKU / Channel Name or Master SKU…",
+                key="cfg_sku_search",
+            )
+            filtered_map = item_map_df.copy()
+            if sku_search.strip():
+                q = sku_search.strip().lower()
+                mask = (
+                    filtered_map["raw_name"].str.lower().str.contains(q, na=False)
+                    | filtered_map["master_name"].str.lower().str.contains(q, na=False)
+                )
+                filtered_map = filtered_map[mask]
+
+            st.caption(
+                f"Showing **{len(filtered_map)}** of {len(item_map_df)} mappings. "
+                "Select a row to edit or delete it."
+            )
+
+            # ── Table ─────────────────────────────────────────────────────────
+            display_map = filtered_map.reset_index(drop=True).rename(
+                columns={"raw_name": "SKU / Channel Name", "master_name": "Master SKU"}
+            )
+            sel = st.dataframe(
+                display_map,
+                hide_index=False,
+                use_container_width=True,
+                on_select="rerun",
+                selection_mode="single-row",
+                key="cfg_sku_table",
+            )
+
+            selected_rows = sel.selection.rows if sel.selection else []
+
+            # ── Edit / Delete panel (appears when a row is selected) ──────────
+            if selected_rows:
+                row_idx   = selected_rows[0]
+                orig_raw  = filtered_map.iloc[row_idx]["raw_name"]
+                orig_mast = filtered_map.iloc[row_idx]["master_name"]
+
+                st.markdown(f"**Selected:** `{orig_raw[:80]}{'…' if len(orig_raw) > 80 else ''}`")
+                edit_col, del_col = st.columns([3, 1])
+
+                with edit_col:
+                    with st.form("cfg_edit_mapping_form", clear_on_submit=False):
+                        new_master = st.selectbox(
+                            "Change Master SKU to:",
+                            options=master_list,
+                            index=master_list.index(orig_mast) if orig_mast in master_list else 0,
+                            key="cfg_edit_master_sel",
+                        )
+                        if st.form_submit_button("💾 Save change", type="primary"):
+                            if new_master and new_master != orig_mast:
+                                try:
+                                    supabase.table("item_map").update(
+                                        {"master_name": new_master}
+                                    ).eq("raw_name", orig_raw).execute()
+                                    st.success(f"Updated → **{new_master}**")
+                                    invalidate_data_cache()
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Update failed: {e}")
+                            else:
+                                st.info("No change made.")
+
+                with del_col:
+                    st.markdown("&nbsp;", unsafe_allow_html=True)  # spacer
+                    if st.button("🗑️ Delete mapping", key="cfg_del_mapping_btn",
+                                 use_container_width=True):
+                        st.session_state["cfg_confirm_del"] = orig_raw
+
+                # Confirm-delete dialog
+                if st.session_state.get("cfg_confirm_del") == orig_raw:
+                    st.warning(
+                        f"Delete mapping for `{orig_raw[:60]}{'…' if len(orig_raw) > 60 else ''}`? "
+                        "This cannot be undone."
+                    )
+                    yes_col, no_col = st.columns(2)
+                    if yes_col.button("✅ Yes, delete", key="cfg_del_yes",
+                                      use_container_width=True):
+                        try:
+                            supabase.table("item_map").delete().eq(
+                                "raw_name", orig_raw
+                            ).execute()
+                            st.success("Mapping deleted.")
+                            st.session_state.pop("cfg_confirm_del", None)
+                            invalidate_data_cache()
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Delete failed: {e}")
+                    if no_col.button("❌ Cancel", key="cfg_del_no",
+                                     use_container_width=True):
+                        st.session_state.pop("cfg_confirm_del", None)
+                        st.rerun()
 
 # ══════════════════════════════════════════════
 # TAB – CHANNEL PERFORMANCE (admin + viewer, last tab)
