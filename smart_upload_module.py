@@ -814,9 +814,9 @@ def render_smart_upload_tab(
     if all_new_keys:
         n = len(all_new_keys)
         st.warning(
-            f"🗺 **{n} new product name{'s' if n > 1 else ''}** found across your files — "
+            f"🗺 **{n} new SKU{'s' if n > 1 else ''}** found across your files — "
             "map them to master SKUs to continue. "
-            "Already-known products are pre-filled automatically."
+            "Already-known SKUs are pre-filled automatically."
         )
         with st.form("su2_sku_form"):
             new_mappings: dict[str, str] = {}
