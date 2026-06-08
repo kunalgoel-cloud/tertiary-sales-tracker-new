@@ -1029,7 +1029,7 @@ if role == "admin":
                               if mc_work.empty:
                                   st.error("No valid product rows found after filtering.")
                               else:
-                                  st.markdown("#### 🗺 Map Raw Product Names → Master SKUs")
+                                  st.markdown("#### 🗺 Map Channel SKUs → Master SKUs")
                                   saved_map_mc: dict = {}
                                   if not item_map_df.empty:
                                       saved_map_mc = dict(zip(item_map_df["raw_name"], item_map_df["master_name"]))
@@ -1272,9 +1272,10 @@ if role == "admin":
                 st.dataframe(display_chans, hide_index=True)
 
         st.divider()
-        st.markdown("#### 🗺 Current Item Mappings")
+        st.markdown("#### 🗺 Current SKU Mappings")
         if not item_map_df.empty:
-            st.dataframe(item_map_df, hide_index=True)
+            display_item_map = item_map_df.rename(columns={"raw_name": "SKU / Channel Name", "master_name": "Master SKU"})
+            st.dataframe(display_item_map, hide_index=True)
         else:
             st.info("No mappings saved yet.")
 
