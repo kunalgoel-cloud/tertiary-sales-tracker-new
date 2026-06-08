@@ -1325,8 +1325,8 @@ if role == "admin":
                     with st.form("cfg_edit_mapping_form", clear_on_submit=False):
                         new_master = st.selectbox(
                             "Change Master SKU to:",
-                            options=master_list,
-                            index=master_list.index(orig_mast) if orig_mast in master_list else 0,
+                            options=master_skus["name"].tolist() if not master_skus.empty else [],
+                            index=master_skus["name"].tolist().index(orig_mast) if not master_skus.empty and orig_mast in master_skus["name"].tolist() else 0,
                             key="cfg_edit_master_sel",
                         )
                         if st.form_submit_button("💾 Save change", type="primary"):
