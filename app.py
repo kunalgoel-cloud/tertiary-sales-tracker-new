@@ -1287,8 +1287,8 @@ if role == "admin":
             if sku_search.strip():
                 q = sku_search.strip().lower()
                 mask = (
-                    filtered_map["raw_name"].str.lower().str.contains(q, na=False)
-                    | filtered_map["master_name"].str.lower().str.contains(q, na=False)
+                    filtered_map["raw_name"].str.lower().str.contains(q, na=False, regex=False)
+                    | filtered_map["master_name"].str.lower().str.contains(q, na=False, regex=False)
                 )
                 filtered_map = filtered_map[mask]
 
