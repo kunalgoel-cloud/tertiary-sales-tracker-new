@@ -538,7 +538,102 @@ def _parse_swiggy(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: int, db_
     return inv_df[["channel_sku", "inventory", "str", "doc", "drr", "units_sold", "n_days", "location"]]
 
 
+def _is_bb_new_format(inv_df: pd.DataFrame) -> bool:
+    """
+    Detects BigBasket's current export format (e.g. qoh_bbsambandhan_*.csv):
+    columns 'sku_id', 'city', 'SOH' — a flat, city-level QOH report with no
+    DC/warehouse layer and no Day-of-Cover column.
+    """
+    cols = set(inv_df.columns)
+    return {"sku_id", "city", "SOH"}.issubset(cols)
+
+
 def _parse_bigbasket(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: int, db_mappings: pd.DataFrame = None) -> pd.DataFrame:
+    """
+    Dispatches to the current BigBasket QOH format (city-level, no DC layer)
+    or the legacy DC-level format, based on which columns are present.
+    """
+    if _is_bb_new_format(inv_df):
+        return _parse_bigbasket_new(inv_df, sales_df, n_days, db_mappings)
+    return _parse_bigbasket_legacy(inv_df, sales_df, n_days, db_mappings)
+
+
+def _parse_bigbasket_new(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: int, db_mappings: pd.DataFrame = None) -> pd.DataFrame:
+    """
+    Parses BigBasket's current QOH export format: one row per SKU per city,
+    columns 'sku_id', 'city', 'SOH' (no DC/warehouse layer, no Day-of-Cover
+    column).
+
+    City matching: '_norm_city()' is applied directly to the 'city' value.
+    Its existing suffix-stripping rule (drops a trailing "-word" / " word")
+    already collapses BigBasket's combined service-area names — e.g.
+    "Ahmedabad-Gandhinagar" → "ahmedabad", "Bhubaneshwar-Cuttack" →
+    "bhubaneshwar", "Vijayawada-Guntur" → "vijayawada", "Lucknow-Kanpur" →
+    "lucknow" — to the same keys the legacy DC-mapped format produced, and
+    "Gurugram Rural" already aliases to "gurgaon" via _CITY_ALIASES. So no
+    separate DC-mapping table is needed for this format.
+
+    DRR/DOC are sourced entirely from sales: DRR = units_sold / n_days, and
+    DOC = inventory / DRR. There's no Day-of-Cover column to fall back on
+    here, so SKUs with no matching sales in the window get DRR = 0, DOC = 0
+    (no inventory-derived estimate is made).
+    """
+    inv_df = inv_df.copy()
+    inv_df["channel_sku"] = inv_df["sku_id"].astype(str).str.strip()
+    inv_df["location"]    = inv_df["city"].astype(str).str.strip()
+    inv_df["inventory"]   = pd.to_numeric(inv_df["SOH"], errors="coerce").fillna(0)
+    inv_df["_city_key"]   = inv_df["location"].apply(_norm_city)
+
+    # Translate channel_sku → master_sku for sales join
+    if db_mappings is not None and not db_mappings.empty:
+        bb_map = db_mappings[db_mappings["channel"] == "Big Basket"].set_index("channel_sku")["master_sku"].to_dict()
+        inv_df["master_sku"] = inv_df["channel_sku"].map(bb_map).fillna(inv_df["channel_sku"]).astype(str)
+    else:
+        inv_df["master_sku"] = inv_df["channel_sku"].astype(str)
+
+    if not sales_df.empty:
+        city_sales = sales_df[sales_df["city"] != "__national__"].copy()
+        if not city_sales.empty:
+            city_sales["_city_norm"] = city_sales["city"].apply(_norm_city)
+            # Multiple raw sales-side city labels can normalise to the same
+            # key (e.g. "Gurugram Rural" → "gurgaon"), so sum per item+key.
+            city_sales = (
+                city_sales.groupby(["item_name", "_city_norm"], as_index=False)["qty_sold"].sum()
+            )
+            inv_df = inv_df.merge(
+                city_sales.rename(columns={"qty_sold": "units_sold"}),
+                left_on=["master_sku", "_city_key"],
+                right_on=["item_name", "_city_norm"],
+                how="left",
+            ).fillna(0)
+            sales_val = pd.to_numeric(inv_df["units_sold"], errors="coerce").fillna(0)
+        else:
+            sales_val = pd.Series(0.0, index=inv_df.index)
+
+        daily_rate    = (sales_val / n_days).replace(0, 0.001)
+        sales_30d     = sales_val * (30 / n_days)
+        inv_df["str"] = sales_30d / (sales_30d + inv_df["inventory"]).replace(0, 1)
+        computed_doc  = np.minimum(inv_df["inventory"] / daily_rate, 999)
+        inv_df["doc"] = computed_doc.where(sales_val > 0, 0)
+        inv_df["drr"] = (sales_val / n_days).round(2)
+        inv_df["units_sold"] = sales_val
+    else:
+        inv_df["str"]        = 0.0
+        inv_df["doc"]        = 0.0
+        inv_df["drr"]        = 0.0
+        inv_df["units_sold"] = 0.0
+
+    inv_df["n_days"] = n_days
+    return inv_df[["channel_sku", "inventory", "str", "doc", "drr", "units_sold", "n_days", "location"]]
+
+
+def _parse_bigbasket_legacy(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: int, db_mappings: pd.DataFrame = None) -> pd.DataFrame:
+    """
+    DEPRECATED — kept only as a fallback in case an old-format BigBasket file
+    (DC-level: 'SKU_Id', 'DC', 'Total SOH', optional Day-of-Cover column) is
+    still uploaded. New uploads should use the current QOH format, handled by
+    `_parse_bigbasket_new`.
+    """
     inv_df = inv_df.copy()
     inv_df["channel_sku"] = inv_df["SKU_Id"].astype(str).str.strip()
     inv_df["location"]    = inv_df["DC"].astype(str).str.strip() if "DC" in inv_df.columns else "Unknown"
@@ -647,14 +742,17 @@ def _reapply_sales(snap_df: pd.DataFrame, raw_sales: pd.DataFrame,
                 .apply(_norm_city)
             )
         elif channel == "Big Basket":
-            # Strip "-DC" / "-DC2" suffix, apply BB_DC_CITY_MAP, then _norm_city.
-            # Uses module-level BB_DC_CITY_MAP and _dc_base() helper.
+            # Current QOH format stores 'location' as a plain city name
+            # already (no DC/warehouse layer), so normalise both sides the
+            # same way the new-format parser does — see _parse_bigbasket_new.
+            # (Snapshots saved from the old DC-level format will no longer
+            # match here; re-upload a fresh file to regenerate the snapshot.)
             city_sales["_city_norm"] = city_sales["city"].apply(_norm_city)
-            city_sales = _aggregate_bb_multicities(city_sales)
-            city_sales = city_sales.rename(columns={"_city_norm": "_ckey"})
-            snap_df["_ckey"] = snap_df["location"].astype(str).apply(
-                lambda loc: _norm_city(BB_DC_CITY_MAP.get(_dc_base(loc), _dc_base(loc)))
+            city_sales = (
+                city_sales.groupby(["item_name", "_city_norm"], as_index=False)["qty_sold"].sum()
             )
+            city_sales = city_sales.rename(columns={"_city_norm": "_ckey"})
+            snap_df["_ckey"] = snap_df["location"].astype(str).apply(_norm_city)
         else:
             # Blinkit and any future channels: normalise both sides uniformly.
             city_sales["_ckey"] = city_sales["city"].apply(_norm_city)
