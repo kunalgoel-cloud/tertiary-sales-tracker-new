@@ -476,6 +476,13 @@ if _TAB_ANALYTICS >= 0:
             st.plotly_chart(fig, use_container_width=True)
             display_cols = [c for c in filtered.columns if c not in ("date_dt", "id")]
             st.dataframe(filtered[display_cols], hide_index=True)
+            st.download_button(
+                "⬇️ Download table as CSV",
+                data=filtered[display_cols].to_csv(index=False).encode("utf-8"),
+                file_name=f"{metric_label.lower().replace(' ', '_')}_{start_date}_{end_date}.csv",
+                mime="text/csv",
+                key="analytics_table_csv_download",
+            )
 
 # ══════════════════════════════════════════════
 # TAB 2 – DEEP DIVE  (new)
