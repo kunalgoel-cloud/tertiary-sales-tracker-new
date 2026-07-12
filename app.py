@@ -539,6 +539,12 @@ if _TAB_ANALYTICS >= 0:
 
                 st.caption(f"Showing {len(table_filtered):,} of {len(filtered):,} rows")
 
+            tm1, tm2 = st.columns(2)
+            if "qty_sold" in table_filtered.columns:
+                tm1.metric("Filtered Total Qty Sold", f"{table_filtered['qty_sold'].sum():,.0f}")
+            if "revenue" in table_filtered.columns:
+                tm2.metric("Filtered Total Revenue", f"{currency_prefix}{table_filtered['revenue'].sum():,.2f}")
+
             display_cols = [c for c in table_filtered.columns if c not in ("date_dt", "id")]
             st.dataframe(table_filtered[display_cols], hide_index=True)
             st.download_button(
