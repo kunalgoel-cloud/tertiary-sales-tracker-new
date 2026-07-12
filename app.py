@@ -8,6 +8,7 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta
 from marketing_module import render_marketing_tab
 from channel_performance_module import render_channel_performance_tab
+from city_geo import get_city_coords
 from vending_module import render_vending_tab
 from sop_module import render_sop_tab
 from smart_upload_module import render_smart_upload_tab
@@ -477,6 +478,7 @@ if _TAB_ANALYTICS >= 0:
             fig.update_layout(barmode="stack", margin=dict(l=12, r=12, t=48, b=12))
             st.plotly_chart(fig, use_container_width=True)
             table_filtered = filtered.copy()
+            sel_tf_chan, sel_tf_item, sel_tf_city = [], [], []
             with st.expander("🔍 Filter table", expanded=False):
                 tfc1, tfc2, tfc3 = st.columns(3)
 
@@ -503,6 +505,7 @@ if _TAB_ANALYTICS >= 0:
                 if "date_dt" in table_filtered.columns and not table_filtered.empty:
                     min_d = table_filtered["date_dt"].min().date()
                     max_d = table_filtered["date_dt"].max().date()
+                    tf_win_start, tf_win_end = min_d, max_d
                     if min_d < max_d:
                         with tfc4:
                             sel_tf_preset = st.radio(
@@ -516,16 +519,18 @@ if _TAB_ANALYTICS >= 0:
                                     min_value=min_d, max_value=max_d, key="tf_dates",
                                 )
                                 if isinstance(sel_tf_dates, tuple) and len(sel_tf_dates) == 2:
-                                    d0, d1 = sel_tf_dates
+                                    tf_win_start, tf_win_end = sel_tf_dates
                                 else:
-                                    d0, d1 = min_d, max_d
+                                    tf_win_start, tf_win_end = min_d, max_d
                             else:
-                                d0, d1 = _resolve_preset(sel_tf_preset, min_d, max_d)
-                                d0 = max(d0, min_d)
+                                tf_win_start, tf_win_end = _resolve_preset(sel_tf_preset, min_d, max_d)
+                                tf_win_start = max(tf_win_start, min_d)
                         table_filtered = table_filtered[
-                            (table_filtered["date_dt"].dt.date >= d0) &
-                            (table_filtered["date_dt"].dt.date <= d1)
+                            (table_filtered["date_dt"].dt.date >= tf_win_start) &
+                            (table_filtered["date_dt"].dt.date <= tf_win_end)
                         ]
+                else:
+                    tf_win_start, tf_win_end = start_date, end_date
 
                 if "qty_sold" in table_filtered.columns and not table_filtered.empty:
                     q_min, q_max = float(table_filtered["qty_sold"].min()), float(table_filtered["qty_sold"].max())
@@ -568,6 +573,128 @@ if _TAB_ANALYTICS >= 0:
                 mime="text/csv",
                 key="analytics_table_csv_download",
             )
+
+            # ── GEOGRAPHY VIEW: heat map + city breakdown table ───────────────
+            if "city" in table_filtered.columns and table_filtered["city"].notna().any():
+                st.divider()
+                st.markdown("#### 🗺️ Geography View")
+                geo_metric_label = st.radio(
+                    "Heat map metric", ["Sales (Revenue)", "Units Sold"],
+                    horizontal=True, key="geo_metric_choice",
+                )
+                geo_col = "revenue" if geo_metric_label.startswith("Sales") else "qty_sold"
+
+                city_agg = (
+                    table_filtered.dropna(subset=["city"])
+                    .groupby("city", as_index=False)
+                    .agg(revenue=("revenue", "sum"), qty_sold=("qty_sold", "sum"))
+                )
+                coord_pairs = city_agg["city"].apply(lambda c: get_city_coords(c) or (None, None))
+                city_agg["lat"] = coord_pairs.apply(lambda t: t[0])
+                city_agg["lon"] = coord_pairs.apply(lambda t: t[1])
+                mapped = city_agg.dropna(subset=["lat", "lon"])
+                unmapped_n = len(city_agg) - len(mapped)
+
+                if not mapped.empty:
+                    geo_fig = px.density_mapbox(
+                        mapped, lat="lat", lon="lon", z=geo_col,
+                        radius=35, center=dict(lat=22.5, lon=80.0), zoom=3.6,
+                        mapbox_style="carto-positron", height=520,
+                        color_continuous_scale="YlOrRd",
+                        hover_name="city",
+                        hover_data={geo_col: ":,.0f", "lat": False, "lon": False},
+                    )
+                    geo_fig.update_layout(margin=dict(l=0, r=0, t=10, b=0))
+                    st.plotly_chart(geo_fig, use_container_width=True)
+                    if unmapped_n:
+                        st.caption(
+                            f"{unmapped_n} of {len(city_agg)} cities aren't in the coordinate "
+                            "lookup and are excluded from the heat map (still included in the "
+                            "table below)."
+                        )
+                else:
+                    st.info(
+                        "None of the cities in the current filter match the coordinate lookup, "
+                        "so the heat map can't render. The table below still reflects all "
+                        "filtered data."
+                    )
+
+                # ── City breakdown table with % change vs the prior period of equal length ──
+                win_days   = (tf_win_end - tf_win_start).days + 1
+                prev_end   = tf_win_start - timedelta(days=1)
+                prev_start = prev_end - timedelta(days=win_days - 1)
+
+                prev_slice = filtered
+                if "date_dt" in prev_slice.columns:
+                    prev_slice = prev_slice[
+                        (prev_slice["date_dt"].dt.date >= prev_start) &
+                        (prev_slice["date_dt"].dt.date <= prev_end)
+                    ]
+                else:
+                    prev_slice = prev_slice.iloc[0:0]
+                # Match the same channel/item narrowing used above (city / qty / revenue are
+                # row-level display filters, not part of "what we're comparing").
+                if sel_tf_chan:
+                    prev_slice = prev_slice[prev_slice["channel"].isin(sel_tf_chan)]
+                if sel_tf_item:
+                    prev_slice = prev_slice[prev_slice["item_name"].isin(sel_tf_item)]
+
+                if not prev_slice.empty:
+                    prev_agg = (
+                        prev_slice.dropna(subset=["city"])
+                        .groupby("city", as_index=False)
+                        .agg(prev_revenue=("revenue", "sum"), prev_qty_sold=("qty_sold", "sum"))
+                    )
+                else:
+                    prev_agg = pd.DataFrame(columns=["city", "prev_revenue", "prev_qty_sold"])
+
+                city_table = city_agg[["city", "revenue", "qty_sold"]].merge(prev_agg, on="city", how="left")
+
+                def _pct_change(cur, prev):
+                    if pd.isna(prev) or prev == 0:
+                        return None
+                    return (cur - prev) / prev * 100
+
+                city_table["Sales Δ%"] = city_table.apply(lambda r: _pct_change(r["revenue"], r["prev_revenue"]), axis=1)
+                city_table["Units Δ%"] = city_table.apply(lambda r: _pct_change(r["qty_sold"], r["prev_qty_sold"]), axis=1)
+
+                def _badge(row):
+                    tags = []
+                    if row["revenue"] == city_table["revenue"].max():
+                        tags.append("⭐ Top Performer")
+                    if pd.notna(row["Sales Δ%"]) and row["Sales Δ%"] == city_table["Sales Δ%"].max() and row["Sales Δ%"] > 0:
+                        tags.append("📈 High Growth")
+                    if pd.notna(row["Sales Δ%"]) and row["Sales Δ%"] == city_table["Sales Δ%"].min() and row["Sales Δ%"] < 0:
+                        tags.append("📉 Declining")
+                    return " ".join(tags)
+
+                city_table["Badge"] = city_table.apply(_badge, axis=1)
+                city_table = city_table.sort_values("revenue", ascending=False)
+
+                display_city_table = city_table.rename(columns={
+                    "city": "City", "revenue": "Sales", "qty_sold": "Units Sold",
+                })[["City", "Sales", "Units Sold", "Sales Δ%", "Units Δ%", "Badge"]]
+
+                st.dataframe(
+                    display_city_table,
+                    hide_index=True,
+                    column_config={
+                        "Sales":    st.column_config.NumberColumn(format=f"{currency_prefix}%.0f"),
+                        "Sales Δ%": st.column_config.NumberColumn(format="%.1f%%"),
+                        "Units Δ%": st.column_config.NumberColumn(format="%.1f%%"),
+                    },
+                )
+                st.caption(
+                    f"⭐ Top Performer · 📈 High Growth · 📉 Declining — "
+                    f"Δ% compares to the prior {win_days}-day period ({prev_start} – {prev_end})."
+                )
+                st.download_button(
+                    "⬇️ Download city breakdown as CSV",
+                    data=display_city_table.to_csv(index=False).encode("utf-8"),
+                    file_name=f"city_breakdown_{tf_win_start}_{tf_win_end}.csv",
+                    mime="text/csv",
+                    key="geo_city_table_csv_download",
+                )
 
 # ══════════════════════════════════════════════
 # TAB 2 – DEEP DIVE  (new)
