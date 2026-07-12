@@ -22,6 +22,8 @@ from global_filters import (
     apply_global_filters,
     get_global_filters,
     get_date_range,
+    PERIOD_OPTIONS,
+    _resolve_preset,
 )
 
 # ── UI Design System ──────────────────────────────────────────────────────────
@@ -502,16 +504,28 @@ if _TAB_ANALYTICS >= 0:
                     min_d = table_filtered["date_dt"].min().date()
                     max_d = table_filtered["date_dt"].max().date()
                     if min_d < max_d:
-                        sel_tf_dates = tfc4.date_input(
-                            "Date range", value=(min_d, max_d),
-                            min_value=min_d, max_value=max_d, key="tf_dates",
-                        )
-                        if isinstance(sel_tf_dates, tuple) and len(sel_tf_dates) == 2:
-                            d0, d1 = sel_tf_dates
-                            table_filtered = table_filtered[
-                                (table_filtered["date_dt"].dt.date >= d0) &
-                                (table_filtered["date_dt"].dt.date <= d1)
-                            ]
+                        with tfc4:
+                            sel_tf_preset = st.radio(
+                                "Date range", PERIOD_OPTIONS,
+                                index=PERIOD_OPTIONS.index("All Time"),
+                                key="tf_date_preset", horizontal=True,
+                            )
+                            if sel_tf_preset == "Custom":
+                                sel_tf_dates = st.date_input(
+                                    "Custom Date Range", value=(min_d, max_d),
+                                    min_value=min_d, max_value=max_d, key="tf_dates",
+                                )
+                                if isinstance(sel_tf_dates, tuple) and len(sel_tf_dates) == 2:
+                                    d0, d1 = sel_tf_dates
+                                else:
+                                    d0, d1 = min_d, max_d
+                            else:
+                                d0, d1 = _resolve_preset(sel_tf_preset, min_d, max_d)
+                                d0 = max(d0, min_d)
+                        table_filtered = table_filtered[
+                            (table_filtered["date_dt"].dt.date >= d0) &
+                            (table_filtered["date_dt"].dt.date <= d1)
+                        ]
 
                 if "qty_sold" in table_filtered.columns and not table_filtered.empty:
                     q_min, q_max = float(table_filtered["qty_sold"].min()), float(table_filtered["qty_sold"].max())
