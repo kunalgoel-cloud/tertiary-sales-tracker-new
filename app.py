@@ -605,7 +605,10 @@ if _TAB_ANALYTICS >= 0:
                         hover_data={geo_col: ":,.0f", "lat": False, "lon": False},
                     )
                     geo_fig.update_layout(margin=dict(l=0, r=0, t=10, b=0))
-                    st.plotly_chart(geo_fig, use_container_width=True)
+                    st.plotly_chart(
+                        geo_fig, use_container_width=True,
+                        config={"scrollZoom": True, "displayModeBar": True},
+                    )
                     if unmapped_n:
                         st.caption(
                             f"{unmapped_n} of {len(city_agg)} cities aren't in the coordinate "
@@ -624,14 +627,10 @@ if _TAB_ANALYTICS >= 0:
                 prev_end   = tf_win_start - timedelta(days=1)
                 prev_start = prev_end - timedelta(days=win_days - 1)
 
-                prev_slice = filtered
-                if "date_dt" in prev_slice.columns:
-                    prev_slice = prev_slice[
-                        (prev_slice["date_dt"].dt.date >= prev_start) &
-                        (prev_slice["date_dt"].dt.date <= prev_end)
-                    ]
-                else:
-                    prev_slice = prev_slice.iloc[0:0]
+                prev_slice = get_filtered_df(
+                    "analytics_prev", history_df,
+                    prev_start, prev_end, _gf_chans, _gf_prods,
+                )
                 # Match the same channel/item narrowing used above (city / qty / revenue are
                 # row-level display filters, not part of "what we're comparing").
                 if sel_tf_chan:
@@ -652,7 +651,7 @@ if _TAB_ANALYTICS >= 0:
 
                 def _pct_change(cur, prev):
                     if pd.isna(prev) or prev == 0:
-                        return None
+                        return float("nan")
                     return (cur - prev) / prev * 100
 
                 city_table["Sales Δ%"] = city_table.apply(lambda r: _pct_change(r["revenue"], r["prev_revenue"]), axis=1)
