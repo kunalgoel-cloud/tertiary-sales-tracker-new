@@ -678,7 +678,7 @@ if _TAB_ANALYTICS >= 0:
                     display_city_table,
                     hide_index=True,
                     column_config={
-                        "Sales":    st.column_config.NumberColumn(format=f"{currency_prefix}%.0f"),
+                        "Sales":    st.column_config.NumberColumn(f"Sales ({currency_prefix})", format="%.0f"),
                         "Sales Δ%": st.column_config.NumberColumn(format="%.1f%%"),
                         "Units Δ%": st.column_config.NumberColumn(format="%.1f%%"),
                     },
