@@ -474,11 +474,76 @@ if _TAB_ANALYTICS >= 0:
             # Preserve stacked bar mode and give top labels room to breathe
             fig.update_layout(barmode="stack", margin=dict(l=12, r=12, t=48, b=12))
             st.plotly_chart(fig, use_container_width=True)
-            display_cols = [c for c in filtered.columns if c not in ("date_dt", "id")]
-            st.dataframe(filtered[display_cols], hide_index=True)
+            table_filtered = filtered.copy()
+            with st.expander("🔍 Filter table", expanded=False):
+                tfc1, tfc2, tfc3 = st.columns(3)
+
+                if "channel" in table_filtered.columns:
+                    chan_opts = sorted(table_filtered["channel"].dropna().unique())
+                    sel_tf_chan = tfc1.multiselect("Channel", chan_opts, key="tf_channel")
+                    if sel_tf_chan:
+                        table_filtered = table_filtered[table_filtered["channel"].isin(sel_tf_chan)]
+
+                if "item_name" in table_filtered.columns:
+                    item_opts = sorted(table_filtered["item_name"].dropna().unique())
+                    sel_tf_item = tfc2.multiselect("Item", item_opts, key="tf_item")
+                    if sel_tf_item:
+                        table_filtered = table_filtered[table_filtered["item_name"].isin(sel_tf_item)]
+
+                if "city" in table_filtered.columns:
+                    city_opts = sorted(table_filtered["city"].dropna().unique())
+                    sel_tf_city = tfc3.multiselect("City", city_opts, key="tf_city")
+                    if sel_tf_city:
+                        table_filtered = table_filtered[table_filtered["city"].isin(sel_tf_city)]
+
+                tfc4, tfc5, tfc6 = st.columns(3)
+
+                if "date_dt" in table_filtered.columns and not table_filtered.empty:
+                    min_d = table_filtered["date_dt"].min().date()
+                    max_d = table_filtered["date_dt"].max().date()
+                    if min_d < max_d:
+                        sel_tf_dates = tfc4.date_input(
+                            "Date range", value=(min_d, max_d),
+                            min_value=min_d, max_value=max_d, key="tf_dates",
+                        )
+                        if isinstance(sel_tf_dates, tuple) and len(sel_tf_dates) == 2:
+                            d0, d1 = sel_tf_dates
+                            table_filtered = table_filtered[
+                                (table_filtered["date_dt"].dt.date >= d0) &
+                                (table_filtered["date_dt"].dt.date <= d1)
+                            ]
+
+                if "qty_sold" in table_filtered.columns and not table_filtered.empty:
+                    q_min, q_max = float(table_filtered["qty_sold"].min()), float(table_filtered["qty_sold"].max())
+                    if q_min < q_max:
+                        sel_qty = tfc5.slider(
+                            "Qty sold range", min_value=q_min, max_value=q_max,
+                            value=(q_min, q_max), key="tf_qty",
+                        )
+                        table_filtered = table_filtered[
+                            (table_filtered["qty_sold"] >= sel_qty[0]) &
+                            (table_filtered["qty_sold"] <= sel_qty[1])
+                        ]
+
+                if "revenue" in table_filtered.columns and not table_filtered.empty:
+                    r_min, r_max = float(table_filtered["revenue"].min()), float(table_filtered["revenue"].max())
+                    if r_min < r_max:
+                        sel_rev = tfc6.slider(
+                            "Revenue range", min_value=r_min, max_value=r_max,
+                            value=(r_min, r_max), key="tf_revenue",
+                        )
+                        table_filtered = table_filtered[
+                            (table_filtered["revenue"] >= sel_rev[0]) &
+                            (table_filtered["revenue"] <= sel_rev[1])
+                        ]
+
+                st.caption(f"Showing {len(table_filtered):,} of {len(filtered):,} rows")
+
+            display_cols = [c for c in table_filtered.columns if c not in ("date_dt", "id")]
+            st.dataframe(table_filtered[display_cols], hide_index=True)
             st.download_button(
                 "⬇️ Download table as CSV",
-                data=filtered[display_cols].to_csv(index=False).encode("utf-8"),
+                data=table_filtered[display_cols].to_csv(index=False).encode("utf-8"),
                 file_name=f"{metric_label.lower().replace(' ', '_')}_{start_date}_{end_date}.csv",
                 mime="text/csv",
                 key="analytics_table_csv_download",
