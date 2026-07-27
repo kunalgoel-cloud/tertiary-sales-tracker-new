@@ -34,7 +34,8 @@ WHAT THIS MODULE PROVIDES:
 import hashlib
 import time
 import contextlib
-from typing import Any
+from datetime import timedelta
+from typing import Any, Optional
 
 import pandas as pd
 import streamlit as st
@@ -205,6 +206,52 @@ def get_filtered_df(
     The cache_key parameter is kept for API compatibility but is unused.
     """
     return apply_filters_fast(df, start, end, channels, products)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3B. PERIOD-OVER-PERIOD KPI DELTAS
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared by the Trend Analytics and Performance Marketing KPI rows. Given the
+# currently selected [start, end] window, previous_period_range() returns the
+# immediately-preceding window of the same length (e.g. selecting "Last 7
+# Days" compares against the 7 days before that). Callers filter their own
+# DataFrame against that window and pass both values into delta_str() to get
+# a ready-to-use st.metric(delta=...) string.
+
+def previous_period_range(start, end):
+    """
+    Given a date range [start, end] (datetime.date), return the immediately
+    preceding period of the same length: (prev_start, prev_end).
+
+    Example: start=Jul 20, end=Jul 26 (7 days) -> prev = Jul 13 -> Jul 19.
+    """
+    period_len = (end - start).days + 1
+    prev_end = start - timedelta(days=1)
+    prev_start = prev_end - timedelta(days=period_len - 1)
+    return prev_start, prev_end
+
+
+def pct_delta(current: float, previous: float) -> Optional[float]:
+    """
+    % change of current vs previous. Returns None when the previous period
+    has no comparable value (zero, missing, or NaN) so callers can skip
+    showing a delta instead of a nonsensical ±inf / 0% figure.
+    """
+    if previous is None or pd.isna(previous) or previous == 0:
+        return None
+    return (current - previous) / previous * 100
+
+
+def delta_str(current: float, previous: float, precision: int = 1) -> Optional[str]:
+    """
+    Format a period-over-period % change for st.metric(delta=...).
+    Returns None (no delta badge shown) when there's no comparable prior value.
+    """
+    d = pct_delta(current, previous)
+    if d is None:
+        return None
+    sign = "+" if d >= 0 else ""
+    return f"{sign}{d:.{precision}f}% vs prev period"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
