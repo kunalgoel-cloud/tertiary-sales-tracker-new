@@ -18,7 +18,8 @@ LEARNING NEW CHANNELS
   every subsequent upload is fully automatic.
 
 KNOWN CHANNELS (built-in schemas, zero config needed)
-  Big Basket · Swiggy · Blinkit · Amazon Seller · Amazon RKW · Shopify
+  Big Basket · BB Instant · Swiggy · Blinkit · Amazon Seller · Amazon RKW ·
+  Shopify · Firstclub · Daalchini
 """
 
 from __future__ import annotations
@@ -205,6 +206,21 @@ KNOWN_SCHEMAS: dict[str, ChannelSchema] = {
         date_in_file      = True,
         city_in_file      = False,
         date_parse_fn     = "dmy",           # DD-MM-YYYY e.g. "01-04-2026"
+    ),
+
+    "Daalchini": ChannelSchema(
+        channel_name      = "Daalchini",
+        filename_signals  = ["daalchini", "product_wise_by_quantity_sold"],
+        col_signals       = ["mvid", "offer_price", "qty_sold", "name", "revenue"],
+        col_product       = "name",
+        col_product2      = None,
+        col_channel_sku   = "mvid",
+        col_qty           = "qty_sold",
+        col_revenue       = "revenue",
+        col_date          = None,           # Manual date — export has no date column
+        col_city          = None,           # National — vending machine report has no city column
+        date_in_file      = False,
+        city_in_file      = False,
     ),
 }
 
