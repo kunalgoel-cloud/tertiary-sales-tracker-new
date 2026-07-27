@@ -34,6 +34,26 @@ except ImportError:
     _GLOBAL_FILTERS_AVAILABLE = False
 
 try:
+    from performance import previous_period_range, delta_str
+    _PERIOD_DELTA_AVAILABLE = True
+except ImportError:
+    _PERIOD_DELTA_AVAILABLE = False
+    from datetime import timedelta as _timedelta
+
+    def previous_period_range(start, end):
+        period_len = (end - start).days + 1
+        prev_end = start - _timedelta(days=1)
+        prev_start = prev_end - _timedelta(days=period_len - 1)
+        return prev_start, prev_end
+
+    def delta_str(current, previous, precision: int = 1):
+        if previous is None or previous == 0:
+            return None
+        d = (current - previous) / previous * 100
+        sign = "+" if d >= 0 else ""
+        return f"{sign}{d:.{precision}f}% vs prev period"
+
+try:
     from ui_theme import apply_chart_theme, brand_color_sequence, section_header, empty_state
     _UI_THEME_AVAILABLE = True
 except ImportError:
@@ -585,7 +605,7 @@ def _apply_filters(df: pd.DataFrame, key_prefix: str, show_product: bool = True)
     if pr_f and "product" in df.columns:
         f = f[f["product"].isin(pr_f)]
 
-    return f, start, end
+    return f, start, end, ch_f, pr_f
 
 
 # ─────────────────────────────────────────────────────────────
@@ -603,7 +623,7 @@ def _render_dashboard(sb):
     df_p = df_p.drop(columns=["id", "created_at"], errors="ignore")
     df_p["date"] = pd.to_datetime(df_p["date"])
 
-    f_df, _, _ = _apply_filters(df_p, "dash")
+    f_df, dash_start, dash_end, dash_ch_f, dash_pr_f = _apply_filters(df_p, "dash")
     if f_df.empty:
         st.warning("No data matches the selected filters.")
         return
@@ -613,11 +633,33 @@ def _render_dashboard(sb):
     roas    = t_sales / t_spend if t_spend > 0 else 0
     acos    = (t_spend / t_sales * 100) if t_sales > 0 else 0
 
+    # ── Previous-period comparison ─────────────────────────────────────────
+    # Same-length window immediately preceding the selected range, with the
+    # same channel/product filters applied (re-sliced from df_p directly so
+    # we don't re-render the filter widgets a second time).
+    prev_start, prev_end = previous_period_range(dash_start, dash_end)
+    prev_df = df_p[(df_p["date"] >= pd.to_datetime(prev_start)) & (df_p["date"] <= pd.to_datetime(prev_end))]
+    if dash_ch_f:
+        prev_df = prev_df[prev_df["channel"].isin(dash_ch_f)]
+    if dash_pr_f and "product" in df_p.columns:
+        prev_df = prev_df[prev_df["product"].isin(dash_pr_f)]
+
+    prev_spend = prev_df["spend"].sum()
+    prev_sales = prev_df["sales"].sum()
+    prev_roas  = prev_sales / prev_spend if prev_spend > 0 else 0
+    prev_acos  = (prev_spend / prev_sales * 100) if prev_sales > 0 else 0
+    _prev_help = f"vs {prev_start} → {prev_end} (prior period)."
+
     k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Total Ad Spend",   f"₹{t_spend:,.0f}")
-    k2.metric("Total Ad Revenue", f"₹{t_sales:,.0f}")
-    k3.metric("Overall ROAS",     f"{roas:.2f}x")
-    k4.metric("ACOS",             f"{acos:.1f}%", help="Ad Spend ÷ Ad-Attributed Revenue × 100")
+    k1.metric("Total Ad Spend",   f"₹{t_spend:,.0f}", delta=delta_str(t_spend, prev_spend), help=_prev_help)
+    k2.metric("Total Ad Revenue", f"₹{t_sales:,.0f}", delta=delta_str(t_sales, prev_sales), help=_prev_help)
+    k3.metric("Overall ROAS",     f"{roas:.2f}x",     delta=delta_str(roas, prev_roas),     help=_prev_help)
+    k4.metric(
+        "ACOS", f"{acos:.1f}%",
+        delta=delta_str(acos, prev_acos, precision=1),
+        delta_color="inverse",  # lower ACOS is better, so a rise should read as "bad" (red)
+        help=f"Ad Spend ÷ Ad-Attributed Revenue × 100. {_prev_help}",
+    )
 
     st.divider()
     st.markdown("#### 📈 Spend vs ROAS by Channel")
