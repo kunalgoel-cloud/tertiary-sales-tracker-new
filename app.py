@@ -55,6 +55,8 @@ from performance import (
     lazy_section,
     is_lazy_skip,
     cached_agg,
+    previous_period_range,
+    delta_str,
 )
 
 # ── User Management & Access Control ─────────────────────────────────────────
@@ -431,12 +433,29 @@ if _TAB_ANALYTICS >= 0:
         intended_days = max((end_date - start_date).days + 1, 1)
         avg_drr       = total_val / intended_days
 
+        # ── Previous-period comparison (same length window immediately
+        # before the selected range) — powers the +/- delta on each KPI.
+        prev_start, prev_end = previous_period_range(start_date, end_date)
+        prev_filtered = get_filtered_df(
+            "analytics_prev", history_df,
+            prev_start, prev_end, _gf_chans, _gf_prods,
+        )
+        prev_days     = max((prev_end - prev_start).days + 1, 1)
+        prev_total    = prev_filtered[target_col].sum()
+        prev_avg_drr  = prev_total / prev_days
+
         m1, m2 = st.columns(2)
-        m1.metric(f"Total {metric_label}", f"{currency_prefix}{total_val:,.2f}")
+        m1.metric(
+            f"Total {metric_label}",
+            f"{currency_prefix}{total_val:,.2f}",
+            delta=delta_str(total_val, prev_total),
+            help=f"vs {prev_start} → {prev_end} ({prev_days}-day prior period).",
+        )
         m2.metric(
             "Daily Run Rate (DRR)",
             f"{currency_prefix}{avg_drr:,.2f}",
-            help=f"Total ÷ {intended_days} days in selected period.",
+            delta=delta_str(avg_drr, prev_avg_drr),
+            help=f"Total ÷ {intended_days} days in selected period. vs {prev_start} → {prev_end} ({prev_days}-day prior period).",
         )
 
         if not filtered.empty:
