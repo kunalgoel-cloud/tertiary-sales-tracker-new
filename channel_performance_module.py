@@ -361,6 +361,23 @@ def _load_file(uploaded_file, skiprows: int = 0) -> pd.DataFrame:
     return pd.read_excel(uploaded_file, skiprows=skiprows)
 
 
+def _load_bigbasket_file(uploaded_file) -> pd.DataFrame:
+    """
+    Some BigBasket QOH exports (e.g. the StoreStock sheet) carry a totals
+    row above the real header (a stray row with grand-total stock/SOH
+    figures), which pandas would otherwise read as the column names. Try
+    loading normally first; if neither the new-format nor legacy-format
+    columns are present, retry skipping one row.
+    """
+    df = _load_file(uploaded_file)
+    new_ok    = {"sku_id", "SOH"}.issubset(df.columns)
+    legacy_ok = {"SKU_Id", "Total SOH"}.issubset(df.columns)
+    if new_ok or legacy_ok:
+        return df
+    uploaded_file.seek(0)
+    return _load_file(uploaded_file, skiprows=1)
+
+
 def _find_col(df: pd.DataFrame, options: list):
     for opt in options:
         if opt in df.columns:
@@ -541,11 +558,12 @@ def _parse_swiggy(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: int, db_
 def _is_bb_new_format(inv_df: pd.DataFrame) -> bool:
     """
     Detects BigBasket's current export format (e.g. qoh_bbsambandhan_*.csv):
-    columns 'sku_id', 'city', 'SOH' — a flat, city-level QOH report with no
-    DC/warehouse layer and no Day-of-Cover column.
+    columns 'sku_id', 'city'/'city_name', 'SOH' — a flat, city-level QOH
+    report with no DC/warehouse layer and no Day-of-Cover column.
     """
     cols = set(inv_df.columns)
-    return {"sku_id", "city", "SOH"}.issubset(cols)
+    has_city = "city" in cols or "city_name" in cols
+    return has_city and {"sku_id", "SOH"}.issubset(cols)
 
 
 def _parse_bigbasket(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: int, db_mappings: pd.DataFrame = None) -> pd.DataFrame:
@@ -579,8 +597,9 @@ def _parse_bigbasket_new(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: i
     (no inventory-derived estimate is made).
     """
     inv_df = inv_df.copy()
+    city_col = "city" if "city" in inv_df.columns else "city_name"
     inv_df["channel_sku"] = inv_df["sku_id"].astype(str).str.strip()
-    inv_df["location"]    = inv_df["city"].astype(str).str.strip()
+    inv_df["location"]    = inv_df[city_col].astype(str).str.strip()
     inv_df["inventory"]   = pd.to_numeric(inv_df["SOH"], errors="coerce").fillna(0)
     inv_df["_city_key"]   = inv_df["location"].apply(_norm_city)
 
@@ -1317,7 +1336,7 @@ def render_channel_performance_tab(supabase_client, master_skus_df: pd.DataFrame
                             _load_file(f),
                             _channel_sales(raw_sales, "swiggy"), n_days, db_mappings)),
         "Big Basket": (lambda f: _parse_bigbasket(
-                            _load_file(f),
+                            _load_bigbasket_file(f),
                             _channel_sales(raw_sales, "big basket"), n_days, db_mappings)),
     }
 
