@@ -361,21 +361,58 @@ def _load_file(uploaded_file, skiprows: int = 0) -> pd.DataFrame:
     return pd.read_excel(uploaded_file, skiprows=skiprows)
 
 
-def _load_bigbasket_file(uploaded_file) -> pd.DataFrame:
+def _load_bigbasket_workbook(uploaded_file) -> dict:
     """
-    Some BigBasket QOH exports (e.g. the StoreStock sheet) carry a totals
-    row above the real header (a stray row with grand-total stock/SOH
-    figures), which pandas would otherwise read as the column names. Try
-    loading normally first; if neither the new-format nor legacy-format
-    columns are present, retry skipping one row.
+    BigBasket's current export is an Excel workbook with two SOH sheets that
+    represent two DISTINCT, ADDITIVE stock pools:
+      - StoreStock: city-level QOH (columns sku_id, city/city_name, stock,
+        SOH) — stock physically at/near the storefront.
+      - DCStock: DC/warehouse-level QOH (columns sku, location, stock, cp,
+        SOH) — stock held upstream at the distribution centre, not yet at
+        a store.
+    Both sheets carry a 'stock' column (physical unit count) AND an 'SOH'
+    column that LOOKS like a stock-on-hand quantity but is actually a ₹
+    value (SOH = stock × cp, verified exactly against DCStock's cost-price
+    column). Unit-based inventory/DRR/DOC/STR use 'stock'; 'SOH' is not
+    used. Total on-hand inventory (in units) is the SUM of 'stock' across
+    both sheets — DCStock is not a duplicate or breakdown of StoreStock.
+    CSV uploads have no sheet concept and are
+    returned as a single 'StoreStock' entry (back-compat with older
+    single-sheet BigBasket exports).
+
+    Each sheet may carry a stray totals row above its real header (grand
+    totals for stock/SOH), which pandas would otherwise read as the column
+    names — each sheet is read normally first and re-read with skiprows=1
+    only if its columns don't match any known BigBasket format.
+
+    Returns {sheet_name: DataFrame} — unrecognised sheets are still included
+    (empty-format detection happens later in `_parse_bigbasket`), so a sheet
+    BigBasket adds in future won't silently vanish, it'll just be skipped
+    with the rest of the file still processed.
     """
-    df = _load_file(uploaded_file)
-    new_ok    = {"sku_id", "SOH"}.issubset(df.columns)
-    legacy_ok = {"SKU_Id", "Total SOH"}.issubset(df.columns)
-    if new_ok or legacy_ok:
-        return df
+    if uploaded_file.name.lower().endswith(".csv"):
+        return {"StoreStock": _load_file(uploaded_file)}
+
     uploaded_file.seek(0)
-    return _load_file(uploaded_file, skiprows=1)
+    xls = pd.ExcelFile(uploaded_file)
+    sheets = {}
+    for sheet_name in xls.sheet_names:
+        df = xls.parse(sheet_name)
+        if not _bb_sheet_is_known_format(df):
+            df = xls.parse(sheet_name, skiprows=1)
+        sheets[sheet_name] = df
+    return sheets
+
+
+def _bb_sheet_is_known_format(df: pd.DataFrame) -> bool:
+    cols = set(df.columns)
+    return (
+        ("city" in cols or "city_name" in cols) and {"sku_id", "SOH"}.issubset(cols)
+    ) or (
+        {"sku", "SOH", "location"}.issubset(cols)
+    ) or (
+        {"SKU_Id", "Total SOH"}.issubset(cols)
+    )
 
 
 def _find_col(df: pd.DataFrame, options: list):
@@ -566,21 +603,40 @@ def _is_bb_new_format(inv_df: pd.DataFrame) -> bool:
     return has_city and {"sku_id", "SOH"}.issubset(cols)
 
 
-def _parse_bigbasket(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: int, db_mappings: pd.DataFrame = None) -> pd.DataFrame:
+def _parse_bigbasket(sheets: dict, sales_df: pd.DataFrame, n_days: int, db_mappings: pd.DataFrame = None) -> pd.DataFrame:
     """
-    Dispatches to the current BigBasket QOH format (city-level, no DC layer)
-    or the legacy DC-level format, based on which columns are present.
+    Parses every recognised sheet in the BigBasket workbook and concatenates
+    the results, so Total Inventory reflects StoreStock (city-level,
+    store-front stock) PLUS DCStock (DC/warehouse-held stock) — two distinct
+    physical stock pools that add together, not two views of the same
+    number. Falls back to the single-sheet legacy DC-level format for old
+    exports. Unrecognised sheets are skipped rather than raising.
     """
-    if _is_bb_new_format(inv_df):
-        return _parse_bigbasket_new(inv_df, sales_df, n_days, db_mappings)
-    return _parse_bigbasket_legacy(inv_df, sales_df, n_days, db_mappings)
+    parts = []
+    for inv_df in sheets.values():
+        if inv_df is None or inv_df.empty:
+            continue
+        if _is_bb_new_format(inv_df):
+            parts.append(_parse_bigbasket_new(inv_df, sales_df, n_days, db_mappings))
+        elif {"sku", "SOH", "location"}.issubset(set(inv_df.columns)):
+            parts.append(_parse_bigbasket_dc(inv_df, sales_df, n_days, db_mappings))
+        elif {"SKU_Id", "Total SOH"}.issubset(set(inv_df.columns)):
+            parts.append(_parse_bigbasket_legacy(inv_df, sales_df, n_days, db_mappings))
+    if not parts:
+        raise ValueError(
+            "No recognised BigBasket sheet found — expected a StoreStock "
+            "(sku_id/city/SOH), DCStock (sku/location/SOH), or legacy "
+            "(SKU_Id/DC/Total SOH) format."
+        )
+    return pd.concat(parts, ignore_index=True)
 
 
 def _parse_bigbasket_new(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: int, db_mappings: pd.DataFrame = None) -> pd.DataFrame:
     """
     Parses BigBasket's current QOH export format: one row per SKU per city,
-    columns 'sku_id', 'city', 'SOH' (no DC/warehouse layer, no Day-of-Cover
-    column).
+    columns 'sku_id', 'city', 'stock' (no DC/warehouse layer, no Day-of-Cover
+    column). 'SOH' is present in the sheet but is a ₹ value column (stock ×
+    cost price), not a unit count, so it's not used here.
 
     City matching: '_norm_city()' is applied directly to the 'city' value.
     Its existing suffix-stripping rule (drops a trailing "-word" / " word")
@@ -600,7 +656,11 @@ def _parse_bigbasket_new(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: i
     city_col = "city" if "city" in inv_df.columns else "city_name"
     inv_df["channel_sku"] = inv_df["sku_id"].astype(str).str.strip()
     inv_df["location"]    = inv_df[city_col].astype(str).str.strip()
-    inv_df["inventory"]   = pd.to_numeric(inv_df["SOH"], errors="coerce").fillna(0)
+    # NOTE: 'SOH' in this export is a ₹ value column (SOH = stock × cost
+    # price — verified exactly against DCStock's 'cp' column), not a unit
+    # count, despite the name. 'stock' is the actual physical unit count
+    # and is what feeds inventory/DRR/DOC/STR here.
+    inv_df["inventory"]   = pd.to_numeric(inv_df["stock"], errors="coerce").fillna(0)
     inv_df["_city_key"]   = inv_df["location"].apply(_norm_city)
 
     # Translate channel_sku → master_sku for sales join
@@ -616,6 +676,71 @@ def _parse_bigbasket_new(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: i
             city_sales["_city_norm"] = city_sales["city"].apply(_norm_city)
             # Multiple raw sales-side city labels can normalise to the same
             # key (e.g. "Gurugram Rural" → "gurgaon"), so sum per item+key.
+            city_sales = (
+                city_sales.groupby(["item_name", "_city_norm"], as_index=False)["qty_sold"].sum()
+            )
+            inv_df = inv_df.merge(
+                city_sales.rename(columns={"qty_sold": "units_sold"}),
+                left_on=["master_sku", "_city_key"],
+                right_on=["item_name", "_city_norm"],
+                how="left",
+            ).fillna(0)
+            sales_val = pd.to_numeric(inv_df["units_sold"], errors="coerce").fillna(0)
+        else:
+            sales_val = pd.Series(0.0, index=inv_df.index)
+
+        daily_rate    = (sales_val / n_days).replace(0, 0.001)
+        sales_30d     = sales_val * (30 / n_days)
+        inv_df["str"] = sales_30d / (sales_30d + inv_df["inventory"]).replace(0, 1)
+        computed_doc  = np.minimum(inv_df["inventory"] / daily_rate, 999)
+        inv_df["doc"] = computed_doc.where(sales_val > 0, 0)
+        inv_df["drr"] = (sales_val / n_days).round(2)
+        inv_df["units_sold"] = sales_val
+    else:
+        inv_df["str"]        = 0.0
+        inv_df["doc"]        = 0.0
+        inv_df["drr"]        = 0.0
+        inv_df["units_sold"] = 0.0
+
+    inv_df["n_days"] = n_days
+    return inv_df[["channel_sku", "inventory", "str", "doc", "drr", "units_sold", "n_days", "location"]]
+
+
+def _parse_bigbasket_dc(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: int, db_mappings: pd.DataFrame = None) -> pd.DataFrame:
+    """
+    Parses BigBasket's DCStock sheet: DC/warehouse-level QOH, one row per
+    SKU per DC, columns 'sku', 'location' (DC name, e.g. 'Bangalore-DC'),
+    'SOH'. This is stock held at the DC — a separate, additive pool from
+    StoreStock's store-front stock — so it contributes its own rows here
+    rather than being merged into the city-level rows.
+
+    Location matching reuses the DC→city alias table (_dc_base +
+    BB_DC_CITY_MAP) that the legacy DC-level format used, including
+    multi-city DC handling (e.g. Kundli serves Delhi + Gurgaon + Noida) via
+    _aggregate_bb_multicities, since a single DC's sales footprint can span
+    more than one city.
+    """
+    inv_df = inv_df.copy()
+    inv_df["channel_sku"] = inv_df["sku"].astype(str).str.strip()
+    inv_df["location"]    = inv_df["location"].astype(str).str.strip()
+    # NOTE: 'SOH' here is stock × 'cp' (cost price) — a ₹ value, not a unit
+    # count. 'stock' is the actual physical unit count.
+    inv_df["inventory"]   = pd.to_numeric(inv_df["stock"], errors="coerce").fillna(0)
+    inv_df["_city_key"]   = inv_df["location"].apply(
+        lambda loc: _norm_city(BB_DC_CITY_MAP.get(_dc_base(loc), _dc_base(loc)))
+    )
+
+    if db_mappings is not None and not db_mappings.empty:
+        bb_map = db_mappings[db_mappings["channel"] == "Big Basket"].set_index("channel_sku")["master_sku"].to_dict()
+        inv_df["master_sku"] = inv_df["channel_sku"].map(bb_map).fillna(inv_df["channel_sku"]).astype(str)
+    else:
+        inv_df["master_sku"] = inv_df["channel_sku"].astype(str)
+
+    if not sales_df.empty:
+        city_sales = sales_df[sales_df["city"] != "__national__"].copy()
+        if not city_sales.empty:
+            city_sales["_city_norm"] = city_sales["city"].apply(_norm_city)
+            city_sales = _aggregate_bb_multicities(city_sales)
             city_sales = (
                 city_sales.groupby(["item_name", "_city_norm"], as_index=False)["qty_sold"].sum()
             )
@@ -1360,7 +1485,7 @@ def render_channel_performance_tab(supabase_client, master_skus_df: pd.DataFrame
                             _load_file(f),
                             _channel_sales(raw_sales, "swiggy"), n_days, db_mappings)),
         "Big Basket": (lambda f: _parse_bigbasket(
-                            _load_bigbasket_file(f),
+                            _load_bigbasket_workbook(f),
                             _channel_sales(raw_sales, "big basket"), n_days, db_mappings)),
     }
 
