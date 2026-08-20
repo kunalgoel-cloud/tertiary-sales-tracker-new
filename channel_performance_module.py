@@ -825,9 +825,32 @@ def _render_dashboard(merged: pd.DataFrame,
     st.sidebar.divider()
     st.sidebar.header("📦 Inventory Filters")
 
+    def _sync_multiselect_with_new_items(key: str, universe: list):
+        """
+        st.multiselect's `default=` only seeds st.session_state[key] the very
+        first time this key is used in a browser session — every rerun after
+        that, whatever's already stored there wins, even if `default` is
+        passed again. That means a brand-new product/location/channel
+        introduced by a fresh upload (e.g. a new BigBasket master_sku) stays
+        silently unchecked and gets filtered out of the totals below, with
+        no error or warning shown. This diffs the current universe against
+        what we saw last render and folds any newly-appeared items into the
+        existing selection, so new data is included by default while any
+        items the user deliberately unchecked stay unchecked.
+        """
+        seen_key = f"{key}_seen_universe"
+        prev_universe = st.session_state.get(seen_key, [])
+        if key in st.session_state:
+            new_items = [x for x in universe if x not in prev_universe]
+            if new_items:
+                st.session_state[key] = list(st.session_state[key]) + new_items
+        st.session_state[seen_key] = universe
+
     u_channels   = sorted(merged["channel"].unique().tolist())
+    _sync_multiselect_with_new_items("cp_channels", u_channels)
     sel_channels = st.sidebar.multiselect("Channel", u_channels, default=u_channels, key="cp_channels")
     u_products   = sorted(merged["master_sku"].dropna().unique().tolist())
+    _sync_multiselect_with_new_items("cp_products", u_products)
     sel_products = st.sidebar.multiselect("Product", u_products, default=u_products, key="cp_products")
 
     filtered_df = merged[
@@ -836,6 +859,7 @@ def _render_dashboard(merged: pd.DataFrame,
     filtered_df = filtered_df[filtered_df["inventory"] > 0].copy()
 
     u_locations   = sorted(filtered_df["location"].dropna().unique().tolist())
+    _sync_multiselect_with_new_items("cp_locations", u_locations)
     sel_locations = st.sidebar.multiselect("Location", u_locations, default=u_locations, key="cp_locations")
     filtered_df   = filtered_df[filtered_df["location"].isin(sel_locations)]
 
