@@ -18,8 +18,8 @@ LEARNING NEW CHANNELS
   every subsequent upload is fully automatic.
 
 KNOWN CHANNELS (built-in schemas, zero config needed)
-  Big Basket · BB Instant · Swiggy · Blinkit · Amazon Seller · Amazon RKW ·
-  Shopify · Firstclub · Daalchini
+  Big Basket · BB Instant · Swiggy · Blinkit · Amazon Seller · Amazon Orders ·
+  Amazon RKW · Shopify · Firstclub · Daalchini
 """
 
 from __future__ import annotations
@@ -59,6 +59,7 @@ class ChannelSchema:
     revenue_strip_symbol: Optional[str] = None # Symbol to strip (e.g. "₹")
     filter_col:          Optional[str] = None  # Column to filter rows on
     filter_value:        Optional[str] = None  # Keep rows where filter_col == this
+    filter_exclude_value: Optional[str] = None # Drop rows where filter_col == this
     filter_min_qty:      bool = False          # Drop rows where qty ≤ 0
 
 
@@ -154,6 +155,30 @@ KNOWN_SCHEMAS: dict[str, ChannelSchema] = {
         date_in_file      = False,
         city_in_file      = False,
         revenue_strip_symbol = "₹",
+    ),
+
+    "Amazon Orders": ChannelSchema(
+        # Seller Central "All Orders" / order-item level report (Orders → Reports).
+        # One row per order line item — has its own purchase-date and ship-city,
+        # unlike the aggregated "Amazon Seller" Business Report above, which has
+        # neither and needs a manually-entered date. Multiple rows can share the
+        # same product; they're summed downstream in the standard groupby.
+        channel_name      = "Amazon Orders",
+        filename_signals  = ["amazon_orders", "all_orders", "unshipped"],
+        col_signals        = ["amazon-order-id", "purchase-date", "order-status",
+                              "ship-city", "item-price", "order-item-id"],
+        col_product       = "product-name",
+        col_product2      = None,
+        col_channel_sku   = "sku",
+        col_qty           = "quantity",
+        col_revenue       = "item-price",
+        col_date          = "purchase-date",
+        col_city          = "ship-city",
+        date_in_file      = True,
+        city_in_file      = True,
+        date_parse_fn     = "standard",     # ISO 8601 w/ tz, e.g. "2026-08-31T17:24:11+00:00"
+        filter_col        = "order-status",
+        filter_exclude_value = "Cancelled", # Drop cancelled orders; keep Pending/Unshipped/Shipped/etc.
     ),
 
     "Amazon RKW": ChannelSchema(
@@ -286,9 +311,17 @@ def _parse_date(val, parse_fn: str) -> str | None:
 
 
 def _read_file(uf, skiprows: int = 0, sheet_name=None) -> pd.DataFrame | None:
-    """Read an uploaded file (CSV or Excel) into a DataFrame."""
+    """Read an uploaded file (CSV, tab-delimited text, or Excel) into a DataFrame.
+
+    .txt / .tsv are treated as tab-delimited — this is the default export
+    format for Amazon Seller Central's "Orders → Reports" flat files (e.g.
+    the order-item level report behind the "Amazon Orders" channel), which
+    download as tab-separated .txt regardless of the data inside.
+    """
     name = uf.name.lower()
     try:
+        if name.endswith(".txt") or name.endswith(".tsv"):
+            return pd.read_csv(uf, sep="\t", skiprows=skiprows)
         if name.endswith(".csv"):
             return pd.read_csv(uf, skiprows=skiprows)
         kw: dict = {"skiprows": skiprows}
@@ -495,10 +528,14 @@ def _build_work_df(
     """
     df = raw_df.copy()
 
-    # ── Row filter: Order Status ──────────────────────────────────────────────
+    # ── Row filter: Order Status (keep only rows matching filter_value) ────────
     f_col = col_map.get("filter")
     if schema.filter_col and schema.filter_value and f_col and f_col in df.columns:
         df = df[df[f_col].astype(str).str.strip().str.upper() == schema.filter_value.upper()]
+
+    # ── Row filter: Order Status (drop rows matching filter_exclude_value) ─────
+    if schema.filter_col and schema.filter_exclude_value and f_col and f_col in df.columns:
+        df = df[df[f_col].astype(str).str.strip().str.upper() != schema.filter_exclude_value.upper()]
 
     # ── Row filter: qty > 0 ───────────────────────────────────────────────────
     if schema.filter_min_qty:
@@ -634,7 +671,7 @@ def render_smart_upload_tab(
     # ── Multi-file uploader ───────────────────────────────────────────────────
     uploaded_files = st.file_uploader(
         "Upload sales files — any channel, any number of files",
-        type=["csv", "xlsx", "xls"],
+        type=["csv", "txt", "tsv", "xlsx", "xls"],
         accept_multiple_files=True,
         key="su2_files",
     )
@@ -652,10 +689,12 @@ def render_smart_upload_tab(
         # Quick read for detection (no skiprows, first sheet)
         try:
             nl = uf.name.lower()
-            peek_df = (
-                pd.read_csv(uf, nrows=3) if nl.endswith(".csv")
-                else pd.read_excel(uf, nrows=3)
-            )
+            if nl.endswith(".txt") or nl.endswith(".tsv"):
+                peek_df = pd.read_csv(uf, sep="\t", nrows=3)
+            elif nl.endswith(".csv"):
+                peek_df = pd.read_csv(uf, nrows=3)
+            else:
+                peek_df = pd.read_excel(uf, nrows=3)
             uf.seek(0)
         except Exception:
             peek_df = pd.DataFrame()
