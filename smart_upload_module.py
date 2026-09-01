@@ -18,8 +18,8 @@ LEARNING NEW CHANNELS
   every subsequent upload is fully automatic.
 
 KNOWN CHANNELS (built-in schemas, zero config needed)
-  Big Basket · BB Instant · Swiggy · Blinkit · Amazon Seller · Amazon Orders ·
-  Amazon RKW · Shopify · Firstclub · Daalchini
+  Big Basket · BB Instant · Swiggy · Blinkit · Amazon Seller · Amazon RKW ·
+  Shopify · Firstclub · Daalchini
 """
 
 from __future__ import annotations
@@ -140,11 +140,23 @@ KNOWN_SCHEMAS: dict[str, ChannelSchema] = {
         filter_value     = "DELIVERED",
     ),
 
+    # "Amazon Seller" covers TWO structurally different exports that Amazon has
+    # used for this channel: the aggregated Business Report (no dates, no
+    # cities, manual date entry) and the newer order-item level report from
+    # Orders → Reports (one row per order line, own purchase-date/ship-city
+    # per row). Both live under this one channel name — the actual column
+    # mapping used for a given file is picked at read-time by
+    # _resolve_amazon_seller_schema() based on which columns are present,
+    # the same pattern used for BigBasket's old-vs-new StoreStock formats.
+    # KNOWN_SCHEMAS["Amazon Seller"] below is the Business Report variant and
+    # doubles as the base entry for filename/column detection; col_signals
+    # combines a few high-signal columns from both variants so either format
+    # detects as "Amazon Seller".
     "Amazon Seller": ChannelSchema(
         channel_name      = "Amazon Seller",
         filename_signals  = ["businessreport"],
-        col_signals       = ["(parent) asin", "(child) asin",
-                             "units ordered", "ordered product sales"],
+        col_signals       = ["(child) asin", "units ordered", "ordered product sales",
+                             "amazon-order-id", "purchase-date", "order-status"],
         col_product       = "Title",
         col_product2      = None,
         col_channel_sku   = "(Child) ASIN",
@@ -155,30 +167,6 @@ KNOWN_SCHEMAS: dict[str, ChannelSchema] = {
         date_in_file      = False,
         city_in_file      = False,
         revenue_strip_symbol = "₹",
-    ),
-
-    "Amazon Orders": ChannelSchema(
-        # Seller Central "All Orders" / order-item level report (Orders → Reports).
-        # One row per order line item — has its own purchase-date and ship-city,
-        # unlike the aggregated "Amazon Seller" Business Report above, which has
-        # neither and needs a manually-entered date. Multiple rows can share the
-        # same product; they're summed downstream in the standard groupby.
-        channel_name      = "Amazon Orders",
-        filename_signals  = ["amazon_orders", "all_orders", "unshipped"],
-        col_signals        = ["amazon-order-id", "purchase-date", "order-status",
-                              "ship-city", "item-price", "order-item-id"],
-        col_product       = "product-name",
-        col_product2      = None,
-        col_channel_sku   = "sku",
-        col_qty           = "quantity",
-        col_revenue       = "item-price",
-        col_date          = "purchase-date",
-        col_city          = "ship-city",
-        date_in_file      = True,
-        city_in_file      = True,
-        date_parse_fn     = "standard",     # ISO 8601 w/ tz, e.g. "2026-08-31T17:24:11+00:00"
-        filter_col        = "order-status",
-        filter_exclude_value = "Cancelled", # Drop cancelled orders; keep Pending/Unshipped/Shipped/etc.
     ),
 
     "Amazon RKW": ChannelSchema(
@@ -248,6 +236,48 @@ KNOWN_SCHEMAS: dict[str, ChannelSchema] = {
         city_in_file      = False,
     ),
 }
+
+# ── "Amazon Seller" order-item level variant ──────────────────────────────────
+# The newer Orders → Reports export (one row per order line item, own
+# purchase-date/ship-city). Not in KNOWN_SCHEMAS itself — it's selected
+# dynamically by _resolve_amazon_seller_schema() below whenever a file's
+# columns match this shape rather than the Business Report shape, so both
+# formats stay under the single "Amazon Seller" channel.
+_AMAZON_SELLER_ORDERS_SCHEMA = ChannelSchema(
+    channel_name      = "Amazon Seller",
+    filename_signals  = ["amazon_orders", "all_orders", "unshipped"],
+    col_signals       = ["amazon-order-id", "purchase-date", "order-status",
+                         "ship-city", "item-price", "order-item-id"],
+    col_product       = "product-name",
+    col_product2      = None,
+    col_channel_sku   = "sku",
+    col_qty           = "quantity",
+    col_revenue       = "item-price",
+    col_date          = "purchase-date",
+    col_city          = "ship-city",
+    date_in_file      = True,
+    city_in_file      = True,
+    date_parse_fn     = "standard",     # ISO 8601 w/ tz, e.g. "2026-08-31T17:24:11+00:00"
+    filter_col        = "order-status",
+    filter_exclude_value = "Cancelled", # Drop cancelled orders; keep Pending/Unshipped/Shipped/etc.
+)
+
+
+def _resolve_amazon_seller_schema(df: pd.DataFrame) -> ChannelSchema:
+    """
+    Amazon Seller has two live export shapes under one channel name — pick
+    the right one from the actual columns present:
+      - Order Report:      has 'purchase-date' + 'order-status' + 'product-name'
+      - Business Report:   everything else (Title / (Child) ASIN / Units Ordered)
+    Falls back to the Business Report schema (the original, still-supported
+    format) when neither signature is clearly present.
+    """
+    cols = {str(c).strip().lower() for c in df.columns}
+    orders_signature = {"purchase-date", "order-status", "product-name"}
+    if orders_signature.issubset(cols):
+        return _AMAZON_SELLER_ORDERS_SCHEMA
+    return KNOWN_SCHEMAS["Amazon Seller"]
+
 
 SKIP_LABELS = {"total", "grand total", "subtotal", "nan", "", "none"}
 
@@ -708,7 +738,9 @@ def render_smart_upload_tab(
         )
 
         # Resolve schema
-        if detected_ch in KNOWN_SCHEMAS:
+        if detected_ch == "Amazon Seller":
+            base_schema = _resolve_amazon_seller_schema(peek_df)
+        elif detected_ch in KNOWN_SCHEMAS:
             base_schema = KNOWN_SCHEMAS[detected_ch]
         elif detected_ch and detected_ch in saved_templates:
             base_schema = _schema_from_template(detected_ch, saved_templates[detected_ch])
@@ -735,7 +767,9 @@ def render_smart_upload_tab(
             sel_ch = st.selectbox("Channel", channels, index=ch_default, key=f"su2_ch_{i}")
 
             # Recompute schema if channel changed via override
-            if sel_ch in KNOWN_SCHEMAS:
+            if sel_ch == "Amazon Seller":
+                active_schema = _resolve_amazon_seller_schema(peek_df)
+            elif sel_ch in KNOWN_SCHEMAS:
                 active_schema = KNOWN_SCHEMAS[sel_ch]
             elif sel_ch in saved_templates:
                 active_schema = _schema_from_template(sel_ch, saved_templates[sel_ch])
