@@ -422,6 +422,22 @@ def _find_col(df: pd.DataFrame, options: list):
     return None
 
 
+def _find_col_ci(df: pd.DataFrame, name: str) -> str:
+    """
+    Case-insensitive column lookup. BigBasket's exports aren't consistent
+    about capitalizing 'stock' (e.g. StoreStock has used both 'stock' and
+    'Stock' across different export dates) — this finds whichever casing is
+    actually present instead of hard-coding one and breaking on the other.
+    Raises KeyError with the available columns if nothing matches, so a
+    genuinely missing/renamed column still fails loudly.
+    """
+    lname = name.lower()
+    for col in df.columns:
+        if str(col).lower() == lname:
+            return col
+    raise KeyError(f"No column matching '{name}' (case-insensitive) found. Available: {list(df.columns)}")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Channel parsers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -659,8 +675,10 @@ def _parse_bigbasket_new(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: i
     # NOTE: 'SOH' in this export is a ₹ value column (SOH = stock × cost
     # price — verified exactly against DCStock's 'cp' column), not a unit
     # count, despite the name. 'stock' is the actual physical unit count
-    # and is what feeds inventory/DRR/DOC/STR here.
-    inv_df["inventory"]   = pd.to_numeric(inv_df["stock"], errors="coerce").fillna(0)
+    # and is what feeds inventory/DRR/DOC/STR here. Column casing for
+    # 'stock' isn't consistent across export dates (seen both 'stock' and
+    # 'Stock'), hence the case-insensitive lookup.
+    inv_df["inventory"]   = pd.to_numeric(inv_df[_find_col_ci(inv_df, "stock")], errors="coerce").fillna(0)
     inv_df["_city_key"]   = inv_df["location"].apply(_norm_city)
 
     # Translate channel_sku → master_sku for sales join
@@ -724,8 +742,9 @@ def _parse_bigbasket_dc(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: in
     inv_df["channel_sku"] = inv_df["sku"].astype(str).str.strip()
     inv_df["location"]    = inv_df["location"].astype(str).str.strip()
     # NOTE: 'SOH' here is stock × 'cp' (cost price) — a ₹ value, not a unit
-    # count. 'stock' is the actual physical unit count.
-    inv_df["inventory"]   = pd.to_numeric(inv_df["stock"], errors="coerce").fillna(0)
+    # count. 'stock' is the actual physical unit count. Case-insensitive
+    # lookup since casing isn't consistent across export dates.
+    inv_df["inventory"]   = pd.to_numeric(inv_df[_find_col_ci(inv_df, "stock")], errors="coerce").fillna(0)
     inv_df["_city_key"]   = inv_df["location"].apply(
         lambda loc: _norm_city(BB_DC_CITY_MAP.get(_dc_base(loc), _dc_base(loc)))
     )
