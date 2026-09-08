@@ -59,6 +59,61 @@ def _csv_bytes(df: pd.DataFrame) -> bytes:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# City → warehouse clustering
+# ─────────────────────────────────────────────────────────────────────────────
+# Swiggy's OSA export reports WhStock per CityName, not per physical
+# warehouse — so there's no warehouse identifier in the file itself. This is
+# a GEOGRAPHIC APPROXIMATION (state/region proximity to a hub city), not
+# Swiggy's actual fulfilment routing, built because that real mapping wasn't
+# available when this was added. It covers every CityName seen in the two
+# sample exports this sub-tab was built against; an unrecognised city falls
+# back to its own name as a single-city "warehouse" rather than silently
+# mis-clubbing it. If you have the real routing, replace _WAREHOUSE_CITIES
+# below — everything downstream keys off _warehouse_for_city().
+
+_WAREHOUSE_CITIES: dict[str, list[str]] = {
+    "Noida":       ["DELHI", "NOIDA", "GURGAON", "FARIDABAD", "MEERUT", "AGRA",
+                     "ALIGARH", "MATHURA", "MORADABAD", "ROORKEE", "SAHARANPUR", "DEHRADUN"],
+    "Chandigarh":  ["CHANDIGARH", "AMBALA", "KARNAL", "PANIPAT", "SONIPAT", "ROHTAK",
+                     "LUDHIANA", "JALANDHAR", "AMRITSAR", "PATIALA", "BATHINDA"],
+    "Jaipur":      ["JAIPUR", "BIKANER", "UDAIPUR", "SRI GANGANAGAR"],
+    "Lucknow":     ["LUCKNOW"],
+    "Bhopal":      ["BHOPAL", "INDORE", "JABALPUR", "GWALIOR", "UJJAIN"],
+    "Ahmedabad":   ["AHMEDABAD", "SURAT", "VADODARA", "RAJKOT", "ANAND", "VAPI"],
+    "Mumbai":      ["MUMBAI", "PUNE", "NASHIK", "AURANGABAD", "KOLHAPUR", "LATUR",
+                     "NANDED", "AMRAVATI", "LONAVLA", "NAGPUR", "CENTRAL GOA"],
+    "Bangalore":   ["BANGALORE", "MYSORE", "HUBLI", "BELGAUM", "DAVANAGERE",
+                     "SHIVAMOGGA", "TUMAKURU", "MANGALURU", "MANIPAL"],
+    "Chennai":     ["CHENNAI", "COIMBATORE", "MADURAI", "TRICHY", "SALEM", "ERODE",
+                     "TIRUPUR", "VELLORE", "KARUR", "DINDIGUL", "THANJAVUR",
+                     "TIRUNELVELI", "THOOTHUKUDI", "KANCHIPURAM", "KARAIKKUDI",
+                     "NAGERCOIL", "PONDICHERRY", "THIRUVALLUR"],
+    "Kochi":       ["KOCHI", "THIRUVANANTHAPURAM", "KOZHIKODE", "THRISSUR", "KOLLAM",
+                     "KOTTAYAM", "ALAPPUZHA", "PALAKKAD", "KANNUR", "THIRUVALLA"],
+    "Hyderabad":   ["HYDERABAD", "KHAMMAM"],
+    "Vijayawada":  ["VIJAYAWADA", "GUNTUR", "VIZAG", "VIZIANAGARAM", "RAJAHMUNDRY",
+                     "KAKINADA", "ELURU", "BHIMAVARAM", "NELLORE", "TIRUPATI", "ANANTAPUR"],
+    "Bhubaneswar": ["BHUBANESWAR", "BERHAMPUR"],
+    "Kolkata":     ["KOLKATA", "SILIGURI"],
+    "Guwahati":    ["GUWAHATI", "DIBRUGARH", "SILCHAR"],
+    "Patna":       ["PATNA", "RANCHI", "JAMSHEDPUR"],
+    "Raipur":      ["RAIPUR", "BILASPUR", "BHILAI"],
+}
+
+_CITY_TO_WAREHOUSE: dict[str, str] = {
+    city: wh for wh, cities in _WAREHOUSE_CITIES.items() for city in cities
+}
+
+
+def _warehouse_for_city(city) -> str:
+    """CityName -> warehouse cluster. Unrecognised cities map to themselves
+    (title-cased) so they're still visibly grouped as their own bucket
+    instead of silently disappearing into an "Other" catch-all."""
+    key = str(city).strip().upper()
+    return _CITY_TO_WAREHOUSE.get(key, str(city).strip().title())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Format detection + parsing
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -88,6 +143,7 @@ def _load_osa_file(uploaded_file) -> tuple[pd.DataFrame, str]:
               "PodStock", "WhStock"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+    df["Warehouse"] = df["CityName"].apply(_warehouse_for_city)
     return df, kind
 
 
@@ -144,6 +200,7 @@ def _classify_actions(
         return "Healthy"
 
     agg["action"] = agg.apply(_tag, axis=1)
+    agg["Warehouse"] = agg["CityName"].apply(_warehouse_for_city)
     return agg
 
 
@@ -176,6 +233,27 @@ _ACTION_META = {
 }
 
 
+def _rollup_by_warehouse(bucket_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Collapses a bucket's per-(CityName, ItemName) rows to one row per
+    Warehouse — the shape a category manager actually raises a PO against,
+    since Swiggy is replenished warehouse by warehouse, not city by city.
+    """
+    return (
+        bucket_df.groupby("Warehouse", as_index=False)
+        .agg(
+            sku_cities=("ItemName", "size"),
+            cities_affected=("CityName", "nunique"),
+            skus_affected=("ItemName", "nunique"),
+            total_avg_WhStock=("avg_WhStock", "sum"),
+            total_avg_PodStock=("avg_PodStock", "sum"),
+            total_Sales=("total_Sales", "sum"),
+        )
+        .sort_values("sku_cities", ascending=False)
+        .reset_index(drop=True)
+    )
+
+
 def _render_bucket_tab(bucket_df: pd.DataFrame, action: str):
     icon, desc, action_txt = _ACTION_META[action]
     st.markdown(desc)
@@ -183,25 +261,52 @@ def _render_bucket_tab(bucket_df: pd.DataFrame, action: str):
     if bucket_df.empty:
         st.success("✅ Nothing in this bucket.")
         return
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("SKU-cities", len(bucket_df))
     c2.metric("Cities affected", bucket_df["CityName"].nunique())
     c3.metric("SKUs affected", bucket_df["ItemName"].nunique())
-    show_cols = ["CityName", "ItemName", "avg_WhStock", "avg_PodStock",
-                 "avg_Coverage", "avg_PodAvailability", "total_Sales"]
-    st.dataframe(
-        bucket_df[show_cols].sort_values("CityName").reset_index(drop=True)
-        .style.format({
-            "avg_WhStock": "{:.0f}", "avg_PodStock": "{:.0f}",
-            "avg_Coverage": "{:.1f}%", "avg_PodAvailability": "{:.1f}%",
-            "total_Sales": "{:.0f}",
-        }),
-        use_container_width=True,
+    c4.metric("Warehouses affected", bucket_df["Warehouse"].nunique())
+
+    group_by = st.radio(
+        "Group by:", ["City (detail)", "Warehouse (for raising POs)"],
+        horizontal=True, index=0, key=f"osa_groupby_{action}",
     )
-    fname = f"swiggy_{action.lower().replace(' ', '_')}.csv"
+
+    if group_by.startswith("Warehouse"):
+        display_df = _rollup_by_warehouse(bucket_df)
+        st.caption(
+            "One row per warehouse — sums the underlying city-level rows. "
+            "City→warehouse clustering is a geographic approximation, not "
+            "Swiggy's actual routing (see the module docstring); recheck "
+            "before raising a PO against an unfamiliar grouping."
+        )
+        st.dataframe(
+            display_df.style.format({
+                "total_avg_WhStock": "{:.0f}", "total_avg_PodStock": "{:.0f}",
+                "total_Sales": "{:.0f}",
+            }),
+            use_container_width=True,
+        )
+        download_df = display_df
+    else:
+        show_cols = ["Warehouse", "CityName", "ItemName", "avg_WhStock", "avg_PodStock",
+                     "avg_Coverage", "avg_PodAvailability", "total_Sales"]
+        display_df = bucket_df[show_cols].sort_values(["Warehouse", "CityName"]).reset_index(drop=True)
+        st.dataframe(
+            display_df.style.format({
+                "avg_WhStock": "{:.0f}", "avg_PodStock": "{:.0f}",
+                "avg_Coverage": "{:.1f}%", "avg_PodAvailability": "{:.1f}%",
+                "total_Sales": "{:.0f}",
+            }),
+            use_container_width=True,
+        )
+        download_df = display_df
+
+    fname_suffix = "by_warehouse" if group_by.startswith("Warehouse") else "by_city"
+    fname = f"swiggy_{action.lower().replace(' ', '_')}_{fname_suffix}.csv"
     st.download_button(
-        f"⬇️ Download '{action}' list as CSV",
-        data=_csv_bytes(bucket_df[show_cols]),
+        f"⬇️ Download '{action}' list as CSV ({fname_suffix.replace('_', ' ')})",
+        data=_csv_bytes(download_df),
         file_name=fname,
         mime="text/csv",
         use_container_width=True,
@@ -243,6 +348,15 @@ def render_swiggy_availability_subtab(supabase_client=None):
 
     date_min, date_max = df["Date"].min().date(), df["Date"].max().date()
     st.success(f"✅ {len(df):,} rows loaded ({date_min} → {date_max}) — detected **{kind}-level** format")
+
+    # ── Warehouse filter (applies to trend + action buckets below) ──────────
+    # See _WAREHOUSE_CITIES near the top of this file: cities are clustered
+    # into warehouses by geographic approximation, not confirmed Swiggy
+    # routing.
+    warehouses = sorted(df["Warehouse"].unique())
+    wh_filter = st.multiselect("Filter warehouses", warehouses, default=[], key="cp_swg_osa_wh_filter")
+    if wh_filter:
+        df = df[df["Warehouse"].isin(wh_filter)]
 
     # ── National trend (both formats) ───────────────────────────────────────
     trend = (
