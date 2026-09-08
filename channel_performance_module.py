@@ -22,6 +22,11 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
 
+# NOTE: imported lazily inside render_channel_performance_tab(), not here at
+# module level — swiggy_availability_module.py imports _load_file back from
+# this module, and a top-level import here would run before _load_file is
+# defined, causing a circular-import ImportError at app startup.
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CITY NORMALISATION
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1591,3 +1596,12 @@ def render_channel_performance_tab(supabase_client, master_skus_df: pd.DataFrame
         return
 
     _render_dashboard(merged, raw_sales=raw_sales, n_days=n_days)
+
+    # Deferred import — see note near the top-of-file imports: this avoids a
+    # circular import with swiggy_availability_module (which imports
+    # _load_file back from this module).
+    from swiggy_availability_module import render_swiggy_availability_subtab
+
+    st.divider()
+    with st.expander("📶 Swiggy Availability (OSA) — beta", expanded=False):
+        render_swiggy_availability_subtab(supabase_client)
