@@ -393,18 +393,21 @@ def _render_analysis(df_raw: pd.DataFrame, price_map: dict,
     ])
 
     with t1:
-        st.dataframe(
-            fdf[["City","Product","Total_SOH","drr","days_of_cover","str_pct"]]
-            .style.format(fmt).bar(subset=["str_pct"], color=["#f87171","#4ade80"], vmin=0, vmax=100),
-            use_container_width=True,
-        )
+        # Styler.bar() raises on a subset column that is entirely NaN (e.g. a
+        # sales-only upload with no SOH data yet) — only bar-format when there's
+        # at least one real value to draw against, so the table still renders.
+        inv_disp = fdf[["City","Product","Total_SOH","drr","days_of_cover","str_pct"]]
+        inv_styler = inv_disp.style.format(fmt)
+        if inv_disp["str_pct"].notna().any():
+            inv_styler = inv_styler.bar(subset=["str_pct"], color=["#f87171","#4ade80"], vmin=0, vmax=100)
+        st.dataframe(inv_styler, use_container_width=True)
 
     with t2:
-        st.dataframe(
-            fdf[["City","Product","Machine_Count","Sales_Qty","velocity","abc_class"]]
-            .style.format(fmt).bar(subset=["velocity"], color="#4ade80"),
-            use_container_width=True,
-        )
+        mach_disp = fdf[["City","Product","Machine_Count","Sales_Qty","velocity","abc_class"]]
+        mach_styler = mach_disp.style.format(fmt)
+        if mach_disp["velocity"].notna().any():
+            mach_styler = mach_styler.bar(subset=["velocity"], color="#4ade80")
+        st.dataframe(mach_styler, use_container_width=True)
 
     # ══════════════════════════════════════════════════════════════════════
     # TAB — DEEP DIVE
