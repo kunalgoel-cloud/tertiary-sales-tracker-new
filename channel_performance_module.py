@@ -655,9 +655,18 @@ def _parse_bigbasket(sheets: dict, sales_df: pd.DataFrame, n_days: int, db_mappi
 def _parse_bigbasket_new(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: int, db_mappings: pd.DataFrame = None) -> pd.DataFrame:
     """
     Parses BigBasket's current QOH export format: one row per SKU per city,
-    columns 'sku_id', 'city', 'stock' (no DC/warehouse layer, no Day-of-Cover
-    column). 'SOH' is present in the sheet but is a ₹ value column (stock ×
-    cost price), not a unit count, so it's not used here.
+    columns 'sku_id', 'city'. Two sub-variants have been seen:
+      - Older exports: a 'stock' column (unit count) plus an 'SOH' column
+        that is actually a ₹ value (stock × cost price), not a unit count.
+      - As of the 2026-09-24 qoh_bbsambandhan_*.csv export, BigBasket
+        dropped the 'stock' column entirely and repurposed 'SOH' to hold
+        the unit count directly (confirmed: SOH_value / SOH gives a
+        consistent per-unit ₹ price across rows — e.g. 93.6/2 = ₹46.8/unit,
+        16.25/1 = ₹16.25/unit — so in this variant 'SOH_value' is the ₹
+        figure and 'SOH' is units).
+    'stock' is preferred when present (older exports); 'SOH' is used as the
+    unit count only when 'stock' is absent (current export), so uploading
+    either format works without the parser crashing on a missing column.
 
     City matching: '_norm_city()' is applied directly to the 'city' value.
     Its existing suffix-stripping rule (drops a trailing "-word" / " word")
@@ -677,13 +686,18 @@ def _parse_bigbasket_new(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: i
     city_col = "city" if "city" in inv_df.columns else "city_name"
     inv_df["channel_sku"] = inv_df["sku_id"].astype(str).str.strip()
     inv_df["location"]    = inv_df[city_col].astype(str).str.strip()
-    # NOTE: 'SOH' in this export is a ₹ value column (SOH = stock × cost
-    # price — verified exactly against DCStock's 'cp' column), not a unit
-    # count, despite the name. 'stock' is the actual physical unit count
-    # and is what feeds inventory/DRR/DOC/STR here. Column casing for
-    # 'stock' isn't consistent across export dates (seen both 'stock' and
-    # 'Stock'), hence the case-insensitive lookup.
-    inv_df["inventory"]   = pd.to_numeric(inv_df[_find_col_ci(inv_df, "stock")], errors="coerce").fillna(0)
+    # Column casing for 'stock' isn't consistent across export dates (seen
+    # both 'stock' and 'Stock'), hence the case-insensitive lookup. When no
+    # 'stock' column exists at all (current qoh_bbsambandhan_*.csv export),
+    # fall back to 'SOH' as the unit count — see docstring above.
+    try:
+        stock_col = _find_col_ci(inv_df, "stock")
+    except KeyError:
+        stock_col = None
+    if stock_col is not None:
+        inv_df["inventory"] = pd.to_numeric(inv_df[stock_col], errors="coerce").fillna(0)
+    else:
+        inv_df["inventory"] = pd.to_numeric(inv_df["SOH"], errors="coerce").fillna(0)
     inv_df["_city_key"]   = inv_df["location"].apply(_norm_city)
 
     # Translate channel_sku → master_sku for sales join
