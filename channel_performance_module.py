@@ -79,6 +79,29 @@ def _norm_city(city) -> str:
     # Apply alias map
     return _CITY_ALIASES.get(s, s)
 
+
+def _loc_to_city_key(loc) -> str:
+    """
+    Normalise a *display* 'location' value (as shown in the sidebar Location
+    filter / table) to the same city key _norm_city() would produce from a
+    plain city name.
+
+    Some channels' 'location' field is a compound string, not a bare city:
+    Swiggy's is "City (FacilityName)" (see _parse_swiggy: location = City +
+    " (" + FacilityName + ")"). Feeding that whole string straight into
+    _norm_city() leaves the "(facility)" suffix attached — _norm_city only
+    strips a trailing "-word"/" word" run, not a parenthesised chunk — so it
+    never matches the sales-side city key, and every SKU x location filtered
+    to a specific Swiggy facility (e.g. "Ahmedabad (AHM DELHIVERY)") silently
+    shows 0 units_sold / blank DOC in the grouped Channel/Product views and
+    the KPI tiles, even though the per-row table and saved snapshot have the
+    real numbers. Strip the "(...)" suffix first, the same way
+    _reapply_sales() already does for Swiggy, before normalising.
+    """
+    s = str(loc)
+    s = re.sub(r"\s*\([^)]*\)\s*$", "", s).strip()
+    return _norm_city(s)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # BIG BASKET DC → CITY MAPPING
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1071,7 +1094,7 @@ def _render_dashboard(merged: pd.DataFrame,
         # Without this, _true_total_units counts nationwide sales while _true_inv
         # only covers the filtered locations, causing STR to be massively overstated.
         if set(sel_locations) != set(u_locations):
-            _loc_cities = {_norm_city(loc) for loc in sel_locations}
+            _loc_cities = {_loc_to_city_key(loc) for loc in sel_locations}
             _rs = _rs[_rs["city"].apply(_norm_city).isin(_loc_cities)]
         _total = 0.0
         for _ch in sel_channels:
@@ -1260,7 +1283,7 @@ def _render_dashboard(merged: pd.DataFrame,
                 import functools, operator
                 _rs_grp = _rs_grp[functools.reduce(operator.or_, _ch_masks)]
             if set(sel_locations) != set(u_locations):
-                _loc_cities = {_norm_city(loc) for loc in sel_locations}
+                _loc_cities = {_loc_to_city_key(loc) for loc in sel_locations}
                 _rs_grp = _rs_grp[_rs_grp["city"].apply(_norm_city).isin(_loc_cities)]
 
         if grp_col == "channel" and _rs_grp is not None:
