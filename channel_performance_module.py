@@ -466,6 +466,30 @@ def _find_col_ci(df: pd.DataFrame, name: str) -> str:
     raise KeyError(f"No column matching '{name}' (case-insensitive) found. Available: {list(df.columns)}")
 
 
+def _find_first_col_ci(df: pd.DataFrame, names: list) -> str:
+    """Return the first column matching any of `names` (case-insensitive)."""
+    for name in names:
+        try:
+            return _find_col_ci(df, name)
+        except KeyError:
+            continue
+    raise KeyError(f"None of {names} found (case-insensitive). Available: {list(df.columns)}")
+
+
+_BB_DC_LOC_RE = re.compile(r"[-\s]?DC\d*$", re.IGNORECASE)
+
+
+def _bb_is_dc_location(loc) -> bool:
+    """True for BigBasket DC-sheet locations such as 'Kundli-DC', 'Bangalore-DC2'."""
+    return bool(_BB_DC_LOC_RE.search(str(loc).strip()))
+
+
+def _bb_dc_city_key(loc) -> str:
+    """Canonical sales-side city key for a BigBasket DC location."""
+    base = _dc_base(loc)
+    return _norm_city(BB_DC_CITY_MAP.get(base, base))
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Channel parsers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -786,10 +810,13 @@ def _parse_bigbasket_dc(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: in
     # NOTE: 'SOH' here is stock × 'cp' (cost price) — a ₹ value, not a unit
     # count. 'stock' is the actual physical unit count. Case-insensitive
     # lookup since casing isn't consistent across export dates.
-    inv_df["inventory"]   = pd.to_numeric(inv_df[_find_col_ci(inv_df, "stock")], errors="coerce").fillna(0)
-    inv_df["_city_key"]   = inv_df["location"].apply(
-        lambda loc: _norm_city(BB_DC_CITY_MAP.get(_dc_base(loc), _dc_base(loc)))
-    )
+    # The 2026-10-01 export (MamaNourish_Stock_*.xlsx) renamed the DC unit
+    # count to 'wms_qoh' (no 'stock' column; verified SOH = wms_qoh × cp), so
+    # accept either name. 'SOH' is still a ₹ value and is never used as units.
+    inv_df["inventory"]   = pd.to_numeric(
+        inv_df[_find_first_col_ci(inv_df, ["stock", "wms_qoh"])], errors="coerce"
+    ).fillna(0)
+    inv_df["_city_key"]   = inv_df["location"].apply(_bb_dc_city_key)
 
     if db_mappings is not None and not db_mappings.empty:
         bb_map = db_mappings[db_mappings["channel"] == "Big Basket"].set_index("channel_sku")["master_sku"].to_dict()
@@ -947,30 +974,44 @@ def _reapply_sales(snap_df: pd.DataFrame, raw_sales: pd.DataFrame,
                 .apply(_norm_city)
             )
         elif channel == "Big Basket":
-            # Current QOH format stores 'location' as a plain city name
-            # already (no DC/warehouse layer), so normalise both sides the
-            # same way the new-format parser does — see _parse_bigbasket_new.
-            # (Snapshots saved from the old DC-level format will no longer
-            # match here; re-upload a fresh file to regenerate the snapshot.)
+            # BigBasket snapshots hold two row types (see _parse_bigbasket):
+            #   • StoreStock rows — location is a plain city → _norm_city
+            #   • DCStock rows    — location like 'Kundli-DC' / 'Bangalore-DC2'
+            #     → DC→city map, with multi-city DCs (Kundli) aggregated.
+            # Mirror both parsers' keys, tagged with _is_dc so the two sales
+            # views don't cross-join.
             city_sales["_city_norm"] = city_sales["city"].apply(_norm_city)
-            city_sales = (
+            store_sales = (
                 city_sales.groupby(["item_name", "_city_norm"], as_index=False)["qty_sold"].sum()
             )
+            store_sales["_is_dc"] = False
+            dc_sales = _aggregate_bb_multicities(city_sales)
+            dc_sales = (
+                dc_sales.groupby(["item_name", "_city_norm"], as_index=False)["qty_sold"].sum()
+            )
+            dc_sales["_is_dc"] = True
+            city_sales = pd.concat([store_sales, dc_sales], ignore_index=True)
             city_sales = city_sales.rename(columns={"_city_norm": "_ckey"})
-            snap_df["_ckey"] = snap_df["location"].astype(str).apply(_norm_city)
+            _loc = snap_df["location"].astype(str)
+            snap_df["_is_dc"] = _loc.apply(_bb_is_dc_location)
+            snap_df["_ckey"] = [
+                _bb_dc_city_key(l) if dc else _norm_city(l)
+                for l, dc in zip(_loc, snap_df["_is_dc"])
+            ]
         else:
             # Blinkit and any future channels: normalise both sides uniformly.
             city_sales["_ckey"] = city_sales["city"].apply(_norm_city)
             snap_df["_ckey"]    = snap_df["location"].astype(str).apply(_norm_city)
 
+        _extra = ["_is_dc"] if "_is_dc" in snap_df.columns else []
         merged = snap_df.merge(
-            city_sales[["item_name", "_ckey", "qty_sold"]].rename(columns={"qty_sold": "fresh_units"}),
-            left_on=["master_sku_tmp", "_ckey"],
-            right_on=["item_name", "_ckey"],
+            city_sales[["item_name", "_ckey"] + _extra + ["qty_sold"]].rename(columns={"qty_sold": "fresh_units"}),
+            left_on=["master_sku_tmp", "_ckey"] + _extra,
+            right_on=["item_name", "_ckey"] + _extra,
             how="left",
         ).fillna(0)
         fresh_units = pd.to_numeric(merged["fresh_units"], errors="coerce").fillna(0)
-        snap_df = merged.drop(columns=["item_name", "_ckey", "fresh_units"], errors="ignore")
+        snap_df = merged.drop(columns=["item_name", "_ckey", "fresh_units"] + _extra, errors="ignore")
     else:
         # Amazon — national aggregate
         nat = (
@@ -1000,7 +1041,7 @@ def _reapply_sales(snap_df: pd.DataFrame, raw_sales: pd.DataFrame,
     snap_df["n_days"]     = n_days
 
     # Clean up temp columns
-    snap_df = snap_df.drop(columns=["master_sku_tmp", "_ckey"], errors="ignore")
+    snap_df = snap_df.drop(columns=["master_sku_tmp", "_ckey", "_is_dc"], errors="ignore")
     return snap_df
 
 
@@ -1528,7 +1569,12 @@ def render_channel_performance_tab(supabase_client, master_skus_df: pd.DataFrame
                 st.info(f"**{ch_name}**")
                 st.caption("No snapshot saved yet")
             uploaders[ch_name] = st.file_uploader(
-                f"{ch_name} Inventory", type=f_types, key=key
+                f"{ch_name} Inventory", type=f_types, key=key,
+                help=(
+                    "Upload the BigBasket stock workbook (.xlsx) with StoreStock "
+                    "+ DCStock sheets — both are read and added together. "
+                    "A single-sheet CSV also works."
+                ) if ch_name == "Big Basket" else None,
             )
 
     # ── Parse freshly uploaded files ──────────────────────────────────────────
