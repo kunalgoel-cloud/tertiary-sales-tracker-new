@@ -363,14 +363,16 @@ def build_base_forecast(
     forecast_days: int = 30,
     spend_by_date: dict | None = None,
     growth_overrides: dict | None = None,
+    lookback_days: int | None = None,
 ) -> pd.DataFrame:
     """
     Organic baseline forecast per (channel, item_name).
 
     KEY DESIGN DECISIONS (all shown transparently to user):
 
-    1. NO LOOKBACK WINDOW — uses every available day of history so
-       even sparse data contributes.  More history = more accurate.
+    1. CONFIGURABLE LOOKBACK WINDOW — lookback_days limits DRR/growth
+       calculations to the last N days of data (counted back from the
+       latest date in history).  None / 0 = use every available day.
 
     2. ORGANIC SEPARATION:
        The performance table tells us which dates had marketing spend.
@@ -412,6 +414,12 @@ def build_base_forecast(
 
     if df.empty:
         return pd.DataFrame()
+
+    if lookback_days and lookback_days > 0:
+        cutoff = df["date_dt"].max() - pd.Timedelta(days=int(lookback_days) - 1)
+        df = df[df["date_dt"] >= cutoff]
+        if df.empty:
+            return pd.DataFrame()
 
     # Zero-spend (organic) dates from marketing DB
     zero_spend_dates: set[str] = set()
@@ -773,6 +781,27 @@ def render_sop_tab(supabase_client, history_df, master_skus_df, master_chans_df,
             st.warning("Select at least one channel.")
             return
 
+        # ── DRR lookback window ───────────────────────────────────────────────
+        _lb_c1, _lb_c2 = st.columns([1, 3])
+        with _lb_c1:
+            _use_all = st.checkbox(
+                "Use all history", value=True, key="sop_lookback_all",
+                help="Untick to restrict DRR and growth-factor calculation to the last N days.",
+            )
+            lookback_days = None
+            if not _use_all:
+                lookback_days = int(st.number_input(
+                    "DRR lookback window (days)", min_value=_MIN_HISTORY_DAYS,
+                    max_value=730, value=90, step=7, key="sop_lookback_days",
+                ))
+        with _lb_c2:
+            st.caption(
+                "Lookback window for DRR: "
+                + (f"last {lookback_days} days of data." if lookback_days else "all available history.")
+                + " SKU-channels with fewer than "
+                + f"{_MIN_HISTORY_DAYS} days in the window are excluded."
+            )
+
         # ── Fetch ALL marketing data upfront ──────────────────────────────────
         with st.spinner("Loading marketing performance data…"):
             mkt = get_marketing_data(sel_channels, items)
@@ -790,6 +819,7 @@ def render_sop_tab(supabase_client, history_df, master_skus_df, master_chans_df,
                     df, forecast_days=30,
                     spend_by_date=mkt["spend_by_date"],
                     growth_overrides=st.session_state[_gf_key],
+                    lookback_days=lookback_days,
                 )
             except Exception as e:
                 st.error(f"Forecast error: {e}")
