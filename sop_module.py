@@ -945,6 +945,32 @@ def render_sop_tab(supabase_client, history_df, master_skus_df, master_chans_df,
                 use_container_width=True,
             )
 
+            # ── CSV downloads ─────────────────────────────────────────────────
+            _dl_cols = [
+                "channel", "item_name", "base_qty_30d", "base_rev_30d",
+                "mkt_uplift_qty", "mkt_uplift_rev", "total_qty_30d", "total_rev_30d",
+                "planned_mkt_spend", "sku_roas", "growth_factor", "drr_qty",
+                "organic_share", "organic_days_used", "history_days_used",
+                "avg_price", "organic_assumption",
+            ]
+            _detail_df = forecast_df[[c for c in _dl_cols if c in forecast_df.columns]]
+            _dl1, _dl2 = st.columns(2)
+            with _dl1:
+                st.download_button(
+                    "⬇️ Download table as CSV",
+                    piv_display.reset_index().rename(columns={"index": "SKU", "item_name": "SKU"})
+                        .to_csv(index=False).encode("utf-8"),
+                    file_name=f"sop_forecast_{plan_month}_{val_col}.csv",
+                    mime="text/csv", key="sop_dl_pivot",
+                )
+            with _dl2:
+                st.download_button(
+                    "⬇️ Download detailed forecast as CSV",
+                    _detail_df.to_csv(index=False).encode("utf-8"),
+                    file_name=f"sop_forecast_detail_{plan_month}.csv",
+                    mime="text/csv", key="sop_dl_detail",
+                )
+
         # ── Editable Growth Factor table ──────────────────────────────────────
         st.divider()
         st.markdown("#### ✏️ Growth Factor Assumptions")
