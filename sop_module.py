@@ -1185,7 +1185,7 @@ def render_sop_tab(supabase_client, history_df, master_skus_df, master_chans_df,
                 "Daily demand = total forecast units (organic + marketing) ÷ 30. Current stock is the latest "
                 "Channel Performance snapshot, summed across locations; open POs / in-transit are not included."
             )
-            _o_show = _order_df.drop(columns=["inv_channel", "case_set"]).rename(columns={
+            _o_show = _order_df.drop(columns=["inv_channel"]).rename(columns={
                 "channel": "Channel", "item_name": "SKU", "total_qty_30d": "30d Forecast",
                 "daily_demand": "Daily Demand", "current_stock": "Current Stock",
                 "current_cover_days": "Cover (days)", "target_stock": f"Target Stock ({cover_days}d)",
