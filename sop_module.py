@@ -572,6 +572,7 @@ def apply_marketing_uplift(
     product_roas:      dict[tuple, float],
     company_roas:      float | None,
     sku_roas_overrides: dict | None = None,
+    channel_roas_forced: dict[str, float] | None = None,
 ) -> pd.DataFrame:
     """
     Allocate per-channel budget across SKUs using PRODUCT-LEVEL ROAS from
@@ -586,6 +587,11 @@ def apply_marketing_uplift(
 
     sku_roas_overrides: {(channel, item_name): float}
         User-edited ROAS values that take precedence over all other sources.
+
+    channel_roas_forced: {channel: float}
+        Channel ROAS the user changed in the input box. Applies to every SKU
+        in that channel, taking precedence over product-level history (but
+        not over per-SKU edits).
 
     Uplift:
         sku_budget  = channel_budget × sku_weight / Σ(sku_weights)
@@ -602,6 +608,8 @@ def apply_marketing_uplift(
         """Best available ROAS for this SKU (user override takes top priority)."""
         if sku_roas_overrides and (ch, item) in sku_roas_overrides:
             return sku_roas_overrides[(ch, item)]
+        if channel_roas_forced and ch in channel_roas_forced:
+            return channel_roas_forced[ch]
         if (ch, item) in product_roas:
             return product_roas[(ch, item)]
         if ch in channel_roas:
@@ -846,6 +854,7 @@ def render_sop_tab(supabase_client, history_df, master_skus_df, master_chans_df,
         bcols = st.columns(ncols)
         channel_budgets: dict[str, float] = {}
         channel_roas_overrides: dict[str, float] = {}
+        channel_roas_forced: dict[str, float] = {}
 
         for i, ch in enumerate(sel_channels):
             with bcols[i % ncols]:
@@ -861,14 +870,18 @@ def render_sop_tab(supabase_client, history_df, master_skus_df, master_chans_df,
                     "Channel ROAS", min_value=0.1, step=0.1,
                     value=float(round(roas_val, 1)),
                     key=f"sop_roas_{ch}",
-                    help="Override ROAS if needed. Product-level ROAS from marketing DB is used per SKU.",
+                    help="Default is the historical channel ROAS, with product-level history used per SKU. "
+                         "Change this value to apply it as the target ROAS to all SKUs in the channel.",
                 )
+                if abs(channel_roas_overrides[ch] - round(roas_val, 1)) > 0.005:
+                    channel_roas_forced[ch] = float(channel_roas_overrides[ch])
 
         # ── Apply marketing uplift (uses session ROAS overrides per SKU) ──────
         forecast_df = apply_marketing_uplift(
             base_df, channel_budgets, channel_roas_overrides,
             mkt["product_roas"], mkt["company_roas"],
             sku_roas_overrides=st.session_state[_roas_key],
+            channel_roas_forced=channel_roas_forced,
         )
 
         total_budget = sum(channel_budgets.values())
@@ -1104,6 +1117,8 @@ def render_sop_tab(supabase_client, history_df, master_skus_df, master_chans_df,
                     if not base_rows.empty:
                         # model ROAS = sku_roas ignoring overrides
                         def _model_roas(r):
+                            if r["channel"] in channel_roas_forced:
+                                return channel_roas_forced[r["channel"]]
                             if (r["channel"], r["item_name"]) in mkt["product_roas"]:
                                 return mkt["product_roas"][(r["channel"], r["item_name"])]
                             if r["channel"] in channel_roas_overrides:
