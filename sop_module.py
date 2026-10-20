@@ -151,6 +151,102 @@ def _paginate(sb, table: str, select: str) -> list[dict]:
     return rows
 
 
+def _load_channel_stock(sb) -> pd.DataFrame:
+    """
+    Latest Channel Performance inventory snapshots, mapped to master SKU names.
+    Returns columns: inv_channel, item_name, stock, uploaded_at (stock summed
+    across locations). Empty frame if no snapshots or on error.
+    """
+    empty = pd.DataFrame(columns=["inv_channel", "item_name", "stock", "uploaded_at"])
+    try:
+        snap = pd.DataFrame(_paginate(
+            sb, "channel_inventory_snapshots", "channel, channel_sku, inventory, uploaded_at"))
+        if snap.empty:
+            return empty
+    except Exception:
+        return empty
+    try:
+        maps = pd.DataFrame(_paginate(
+            sb, "channel_sku_mappings", "channel, channel_sku, master_sku"))
+    except Exception:
+        maps = pd.DataFrame()
+    try:
+        item_map = pd.DataFrame(_paginate(sb, "item_map", "raw_name, master_name"))
+    except Exception:
+        item_map = pd.DataFrame()
+
+    snap["channel_sku"] = snap["channel_sku"].astype(str)
+    snap["inventory"]   = pd.to_numeric(snap["inventory"], errors="coerce").fillna(0)
+
+    def _map_channel(grp: pd.DataFrame) -> pd.Series:
+        ch = grp.name
+        lookup: dict = {}
+        if ch == "Amazon" and not item_map.empty:   # ASIN → master via Smart Upload
+            lookup.update(item_map.set_index("raw_name")["master_name"].to_dict())
+        if not maps.empty:
+            m = maps[maps["channel"] == ch]
+            lookup.update(m.set_index("channel_sku")["master_sku"].to_dict())
+        return grp["channel_sku"].map(lookup).fillna(grp["channel_sku"])
+
+    snap["item_name"] = snap.groupby("channel", group_keys=False)[["channel", "channel_sku"]].apply(_map_channel)
+    out = (snap.groupby(["channel", "item_name"], as_index=False)
+               .agg(stock=("inventory", "sum"), uploaded_at=("uploaded_at", "max"))
+               .rename(columns={"channel": "inv_channel"}))
+    return out
+
+
+def build_order_plan(
+    forecast_df: pd.DataFrame,
+    stock_df: pd.DataFrame,
+    cover_days: int,
+    forecast_days: int = 30,
+) -> pd.DataFrame:
+    """
+    Qty to order per (channel, item) to hold `cover_days` of cover.
+
+        daily_demand = total forecast units / forecast_days
+        target_stock = daily_demand × cover_days
+        order_qty    = ceil(max(target_stock − current_stock, 0))
+
+    A sales channel (e.g. "Amazon RKW") is matched to a Channel Performance
+    inventory channel (e.g. "Amazon") when the latter's name (spaces ignored)
+    is contained in the former's.
+    """
+    inv_channels = list(stock_df["inv_channel"].unique()) if not stock_df.empty else []
+
+    def _inv_ch(sales_ch: str):
+        key = sales_ch.lower().replace(" ", "")
+        for ic in inv_channels:
+            if ic.lower().replace(" ", "") in key:
+                return ic
+        return None
+
+    plan = forecast_df[["channel", "item_name", "total_qty_30d"]].copy()
+    plan["inv_channel"] = plan["channel"].map(_inv_ch)
+    plan = plan.merge(stock_df, on=["inv_channel", "item_name"], how="left")
+
+    has_snapshot = plan["inv_channel"].notna()
+    plan["current_stock"] = np.where(has_snapshot, plan["stock"].fillna(0), np.nan)
+    plan["daily_demand"]  = (plan["total_qty_30d"] / forecast_days).round(2)
+    plan["target_stock"]  = (plan["daily_demand"] * cover_days).round(0)
+    plan["current_cover_days"] = np.where(
+        has_snapshot & (plan["daily_demand"] > 0),
+        (plan["current_stock"] / plan["daily_demand"]).round(1), np.nan)
+    plan["order_qty"] = np.where(
+        has_snapshot,
+        np.ceil(np.maximum(plan["target_stock"] - plan["current_stock"], 0)),
+        np.nan,
+    )
+    plan["status"] = np.where(
+        ~has_snapshot, "No stock data for channel",
+        np.where(plan["stock"].isna(), "SKU not in stock file (stock = 0)",
+        np.where(plan["order_qty"] > 0, "Order", "Sufficient cover")))
+    plan["stock_as_of"] = plan["uploaded_at"].fillna("").astype(str).str[:10]
+    return plan[["channel", "item_name", "total_qty_30d", "daily_demand", "current_stock",
+                 "current_cover_days", "target_stock", "order_qty", "status", "stock_as_of"]
+               ].sort_values(["channel", "order_qty"], ascending=[True, False])
+
+
 def _load_plan(sb, plan_month: str) -> pd.DataFrame:
     try:
         res = sb.table(_PLAN_TABLE).select("*").eq("plan_month", plan_month).execute()
@@ -970,6 +1066,37 @@ def render_sop_tab(supabase_client, history_df, master_skus_df, master_chans_df,
                     file_name=f"sop_forecast_detail_{plan_month}.csv",
                     mime="text/csv", key="sop_dl_detail",
                 )
+
+        # ── Order plan (qty to order for target days of cover) ────────────────
+        st.divider()
+        st.markdown("#### 📦 Order Plan — Qty to Order with Channel Partner")
+        cover_days = int(st.number_input(
+            "Target days of cover", min_value=1, max_value=365, value=45, step=5,
+            key="sop_cover_days",
+            help="Order qty = (forecast daily demand × cover days) − current channel stock.",
+        ))
+        _stock_df = _load_channel_stock(supabase_client)
+        if _stock_df.empty:
+            st.info("No inventory snapshots found. Upload inventory in the Channel Performance tab first.")
+        else:
+            _order_df = build_order_plan(forecast_df, _stock_df, cover_days)
+            st.caption(
+                "Daily demand = total forecast units (organic + marketing) ÷ 30. Current stock is the latest "
+                "Channel Performance snapshot, summed across locations; open POs / in-transit are not included."
+            )
+            _o_show = _order_df.rename(columns={
+                "channel": "Channel", "item_name": "SKU", "total_qty_30d": "30d Forecast",
+                "daily_demand": "Daily Demand", "current_stock": "Current Stock",
+                "current_cover_days": "Cover (days)", "target_stock": f"Target Stock ({cover_days}d)",
+                "order_qty": "Order Qty", "status": "Status", "stock_as_of": "Stock As Of",
+            })
+            st.dataframe(_o_show, use_container_width=True, hide_index=True)
+            st.download_button(
+                "⬇️ Download order plan as CSV",
+                _o_show.to_csv(index=False).encode("utf-8"),
+                file_name=f"sop_order_plan_{plan_month}_{cover_days}d.csv",
+                mime="text/csv", key="sop_dl_order",
+            )
 
         # ── Editable Growth Factor table ──────────────────────────────────────
         st.divider()
