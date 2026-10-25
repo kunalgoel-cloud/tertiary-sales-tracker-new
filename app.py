@@ -460,30 +460,51 @@ if _TAB_ANALYTICS >= 0:
 
         if not filtered.empty:
             color_theme = "item_name" if sel_item else "channel"
+
+            # ── Interval filter: show the graph per day, week or month ────────
+            interval = st.radio(
+                "Group graph by:", ["Daily", "Weekly", "Monthly"],
+                horizontal=True, key="trend_interval",
+            )
+            if interval == "Daily":
+                _period = filtered["date"]
+                _drr_mult, _line_label = 1, "Avg DRR"
+            else:
+                _dt = pd.to_datetime(filtered["date_dt"] if "date_dt" in filtered.columns else filtered["date"])
+                _freq = "W-SUN" if interval == "Weekly" else "M"
+                _period = _dt.dt.to_period(_freq).dt.start_time
+                _drr_mult = 7 if interval == "Weekly" else 365 / 12
+                _line_label = "Avg / week (DRR × 7)" if interval == "Weekly" else "Avg / month (DRR × 30.4)"
+                st.caption(
+                    ("Weeks run Monday–Sunday and are labelled by their Monday. " if interval == "Weekly"
+                     else "Months are labelled by their first day. ")
+                    + "The first and last bars may cover a partial period."
+                )
+
             plot_df = (
-                filtered
-                .groupby(["date", color_theme])[target_col]
+                filtered.assign(period=_period)
+                .groupby(["period", color_theme])[target_col]
                 .sum()
                 .reset_index()
-                .sort_values("date")
+                .sort_values("period")
             )
             fig = px.bar(
-                plot_df, x="date", y=target_col,
+                plot_df, x="period", y=target_col,
                 color=color_theme, barmode="stack", height=480,
                 color_discrete_sequence=brand_color_sequence(),
             )
             fig.add_hline(
-                y=avg_drr, line_dash="dash", line_color="#E74C3C",
-                annotation_text="Avg DRR",
+                y=avg_drr * _drr_mult, line_dash="dash", line_color="#E74C3C",
+                annotation_text=_line_label,
                 annotation_font_color="#E74C3C",
             )
             if show_labels:
                 fig.update_traces(texttemplate="%{y:.2s}", textposition="inside",
                                   textfont_size=13)
-                totals = plot_df.groupby("date")[target_col].sum().reset_index()
+                totals = plot_df.groupby("period")[target_col].sum().reset_index()
                 for _, row in totals.iterrows():
                     fig.add_annotation(
-                        x=row["date"],
+                        x=row["period"],
                         y=row[target_col],
                         text=f"{row[target_col]:,.0f}",
                         showarrow=False,
@@ -495,6 +516,11 @@ if _TAB_ANALYTICS >= 0:
             fig = apply_chart_theme(fig)
             # Preserve stacked bar mode and give top labels room to breathe
             fig.update_layout(barmode="stack", margin=dict(l=12, r=12, t=48, b=12))
+            fig.update_xaxes(title_text="date" if interval == "Daily" else interval[:-2].lower() + " starting")
+            if interval == "Monthly":
+                fig.update_xaxes(tickformat="%b %Y", dtick="M1")
+            elif interval == "Weekly":
+                fig.update_xaxes(tickformat="%d %b", dtick=7 * 86400000)
             st.plotly_chart(fig, use_container_width=True)
             table_filtered = filtered.copy()
             sel_tf_chan, sel_tf_item, sel_tf_city = [], [], []
