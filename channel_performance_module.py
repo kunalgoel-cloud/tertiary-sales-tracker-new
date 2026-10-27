@@ -368,7 +368,7 @@ def _save_snapshot(supabase_client, parsed_df: pd.DataFrame, channel: str):
                 "str":         float(r.get("str", 0)),
                 "doc":         float(r.get("doc", 0)),
                 "drr":         float(r.get("drr", 0)),
-                "units_sold":  float(r.get("units_sold", 0)),
+                "units_sold":  None if pd.isna(r.get("units_sold", 0)) else float(r.get("units_sold", 0)),
                 "n_days":      int(r.get("n_days", 30)),
                 "location":    str(r.get("location", "")),
                 **{c: float(r.get(c, 0) or 0) for c in extra_cols},
@@ -418,6 +418,8 @@ def _load_snapshots(supabase_client) -> dict:
             for col in ["inventory", "str", "doc", "drr", "units_sold"] + extras:
                 snap_df[col] = pd.to_numeric(snap_df[col], errors="coerce").fillna(0)
             snap_df["n_days"] = pd.to_numeric(snap_df["n_days"], errors="coerce").fillna(30).astype(int)
+            if channel in _FILE_DRR_CHANNELS:
+                snap_df["units_sold"] = np.nan
             result[channel] = (uploaded_at_str, snap_df)
         return result
     except Exception as e:
@@ -593,6 +595,7 @@ def _parse_amazon_now(inv_df: pd.DataFrame, n_days: int) -> pd.DataFrame:
       doc       = inventory / DRR, capped at 999 like the other channels
       str       = 30d demand / (30d demand + inventory)
       open_po   = units on order — kept separate, NOT counted as inventory
+      units_sold = blank (the file has no sold units; nothing is estimated)
 
     DOC is computed from the unrounded DRR: rounding DRR to 2 dp first distorts
     cover badly for very low-demand rows.
@@ -618,7 +621,7 @@ def _parse_amazon_now(inv_df: pd.DataFrame, n_days: int) -> pd.DataFrame:
     d["drr"]       = drr_raw.round(2)
     sales_30d      = drr_raw * 30
     d["str"]       = sales_30d / (sales_30d + d["inventory"]).replace(0, 1)
-    d["units_sold"] = (drr_raw * n_days).round(1)
+    d["units_sold"] = np.nan   # not reported in the file — left blank; DOC / STR use DRR only
     d["n_days"]    = n_days
     return d[["channel_sku", "inventory", "str", "doc", "drr", "units_sold", "n_days", "location",
               "soh_spoke", "soh_fc", "open_po"]].reset_index(drop=True)
@@ -1404,7 +1407,8 @@ def _render_dashboard(merged: pd.DataFrame,
     else:
         gcm     = {"Channel": "channel", "Product": "master_sku", "Location": "location"}
         grp_col = gcm[group_by]
-        _agg_spec = {"inventory": ("inventory", "sum"), "units_sold": ("units_sold", "sum")}
+        _agg_spec = {"inventory": ("inventory", "sum"),
+                     "units_sold": ("units_sold", lambda s: s.sum(min_count=1))}
         if _has_po:
             _agg_spec["open_po"] = ("open_po", "sum")
         agg_df  = table_df.groupby(grp_col).agg(**_agg_spec).reset_index()
@@ -1430,10 +1434,14 @@ def _render_dashboard(merged: pd.DataFrame,
                 grp = grp.copy()
                 grp["channel"] = grp.index
             u = d = 0
+            file_drr = 0.0
             for ch, sub in grp.groupby("channel"):
+                if ch in _FILE_DRR_CHANNELS:      # DRR from the file; no units_sold
+                    file_drr += sub["drr"].sum()
+                    continue
                 u += sub["units_sold"].sum()
                 d  = max(d, sub["n_days"].max())
-            return u / d if d > 0 else 0.0
+            return (u / d if d > 0 else 0.0) + file_drr
 
         # pandas 2.2+ deprecates passing the grouping column into the applied
         # function; use include_groups=False to silence the warning and avoid
@@ -1491,7 +1499,7 @@ def _render_dashboard(merged: pd.DataFrame,
                 _inv   = float(agg_df.loc[agg_df[grp_col] == _ch, "inventory"].values[0])
                 _drr_v = _qty / n_days
                 _s30   = _qty * (30.0 / n_days)
-                _ch_units[_ch] = _qty
+                _ch_units[_ch] = float("nan") if _ch in _FILE_DRR_CHANNELS else _qty
                 _ch_drr[_ch]   = _drr_v
                 _ch_doc[_ch]   = (_inv / _drr_v) if _drr_v > 0 else float("nan")
                 _ch_str[_ch]   = (_s30 / (_s30 + _inv)) if (_s30 + _inv) > 0 else 0.0
@@ -1512,11 +1520,13 @@ def _render_dashboard(merged: pd.DataFrame,
             _pr_str:   dict[str, float] = {}
             _pr_drr:   dict[str, float] = {}
             for _sku in agg_df[grp_col].tolist():
-                _qty   = float(_rs_grp.loc[_rs_grp["item_name"] == _sku, "qty_sold"].sum()) + _file_units(sku=_sku)
+                _raw   = float(_rs_grp.loc[_rs_grp["item_name"] == _sku, "qty_sold"].sum())
+                _qty   = _raw + _file_units(sku=_sku)       # DRR basis (file DRR x window for Amazon Now)
                 _inv   = float(agg_df.loc[agg_df[grp_col] == _sku, "inventory"].values[0])
                 _drr_v = _qty / n_days
                 _s30   = _qty * (30.0 / n_days)
-                _pr_units[_sku] = _qty
+                _only_file = table_df[table_df["master_sku"] == _sku]["channel"].isin(_FILE_DRR_CHANNELS).all()
+                _pr_units[_sku] = float("nan") if _only_file else _raw
                 _pr_drr[_sku]   = _drr_v
                 _pr_doc[_sku]   = (_inv / _drr_v) if _drr_v > 0 else float("nan")
                 _pr_str[_sku]   = (_s30 / (_s30 + _inv)) if (_s30 + _inv) > 0 else 0.0
