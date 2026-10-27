@@ -1360,6 +1360,8 @@ def _render_dashboard(merged: pd.DataFrame,
         if val < 15: return "color: orange; font-weight: bold"
         return ""
 
+    if "open_po" in table_df.columns:   # None/object -> NaN so channels without POs show "–"
+        table_df["open_po"] = pd.to_numeric(table_df["open_po"], errors="coerce")
     _has_po = "open_po" in table_df.columns and table_df["open_po"].fillna(0).sum() > 0
     display_cols = [c for c in ["master_sku", "channel_sku", "channel", "location",
                                  "inventory", "open_po" if _has_po else None, "drr", "doc", "str"]
