@@ -1129,6 +1129,27 @@ def _reapply_sales(snap_df: pd.DataFrame, raw_sales: pd.DataFrame,
     return snap_df
 
 
+def _split_amazon_overlap(combined: pd.DataFrame):
+    """
+    Amazon and Amazon Now share ASINs. Drop the Amazon inventory rows whose ASIN
+    is also in the Amazon Now data, so those ASINs are reported under Amazon Now
+    only. Returns (combined_without_overlap, amazon_now_asins, n_rows_dropped).
+    """
+    now_asins = set(combined.loc[combined["channel"] == "Amazon Now", "channel_sku"].astype(str))
+    if not now_asins:
+        return combined, set(), 0
+    overlap = (combined["channel"] == "Amazon") & combined["channel_sku"].astype(str).isin(now_asins)
+    return combined[~overlap].copy(), now_asins, int(overlap.sum())
+
+
+def _drop_overlap_sales(raw_sales: pd.DataFrame, masters: set) -> pd.DataFrame:
+    """Remove Amazon (not Amazon Now) sales rows for master SKUs that Amazon Now carries."""
+    if raw_sales is None or raw_sales.empty or not masters:
+        return raw_sales
+    amazon = _channel_mask(raw_sales["channel"], "amazon", _CH_EXCLUDE["Amazon"])
+    return raw_sales[~(amazon & raw_sales["item_name"].isin(masters))].copy()
+
+
 def _render_dashboard(merged: pd.DataFrame,
                       raw_sales: pd.DataFrame = None,
                       n_days: int = 30):
@@ -1759,6 +1780,18 @@ def render_channel_performance_tab(supabase_client, master_skus_df: pd.DataFrame
     # ── SKU mapping ───────────────────────────────────────────────────────────
     combined              = pd.concat(uploaded_data, ignore_index=True)
     combined["channel_sku"] = combined["channel_sku"].astype(str)
+
+    # Amazon vs Amazon Now: report shared ASINs under Amazon Now only.
+    _excl_amz = False
+    _now_asins, _n_amz_dropped = set(), 0
+    if (combined["channel"] == "Amazon Now").any() and (combined["channel"] == "Amazon").any():
+        _excl_amz = st.checkbox(
+            "Exclude Amazon Now ASINs from Amazon", value=True, key="cp_excl_amz_now",
+            help="Amazon and Amazon Now share ASINs. When ticked, Amazon shows only the ASINs that are "
+                 "not in the Amazon Now file — their stock and sales appear under Amazon Now only.",
+        )
+        if _excl_amz:
+            combined, _now_asins, _n_amz_dropped = _split_amazon_overlap(combined)
     if not db_mappings.empty:
         db_mappings["channel_sku"] = db_mappings["channel_sku"].astype(str)
 
@@ -1805,6 +1838,14 @@ def render_channel_performance_tab(supabase_client, master_skus_df: pd.DataFrame
                         st.error(f"Failed to save mappings: {e}")
                 st.rerun()
         return
+
+    if _excl_amz and _now_asins:
+        _now_masters = set(merged.loc[merged["channel"] == "Amazon Now", "master_sku"].dropna())
+        raw_sales = _drop_overlap_sales(raw_sales, _now_masters)
+        st.caption(
+            f"🔀 Amazon excludes {len(_now_asins)} ASINs shared with Amazon Now "
+            f"({_n_amz_dropped} stock rows hidden, plus their Amazon sales); they are reported under Amazon Now."
+        )
 
     _render_dashboard(merged, raw_sales=raw_sales, n_days=n_days)
 
