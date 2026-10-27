@@ -257,7 +257,21 @@ def _get_sales(_supabase, days: int) -> pd.DataFrame:
 # Sales aggregation helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _channel_sales(sales_df: pd.DataFrame, channel_keyword: str) -> pd.DataFrame:
+# Sales-channel substrings that must NOT count towards a channel whose keyword
+# would otherwise also match them ("amazon" also matches "Amazon Now").
+_CH_EXCLUDE = {"Amazon": ["amazon now", "amazon-now", "amazon_now", "amazonnow"]}
+
+
+def _channel_mask(channel_series: pd.Series, keyword: str, exclude=None) -> pd.Series:
+    """Boolean mask: channel contains `keyword` and none of the `exclude` substrings."""
+    low  = channel_series.str.lower()
+    mask = low.str.contains(keyword.lower(), na=False)
+    for ex in (exclude or []):
+        mask &= ~low.str.contains(ex, na=False)
+    return mask
+
+
+def _channel_sales(sales_df: pd.DataFrame, channel_keyword: str, exclude=None) -> pd.DataFrame:
     """
     Filter sales for one channel and return aggregated by item_name + city.
     NULL-city (legacy) rows are tagged city='__national__' for fallback use.
@@ -265,7 +279,7 @@ def _channel_sales(sales_df: pd.DataFrame, channel_keyword: str) -> pd.DataFrame
     if sales_df.empty:
         return pd.DataFrame(columns=["item_name", "city", "qty_sold", "revenue"])
 
-    mask = sales_df["channel"].str.lower().str.contains(channel_keyword.lower(), na=False)
+    mask = _channel_mask(sales_df["channel"], channel_keyword, exclude)
     ch   = sales_df[mask].copy()
     if ch.empty:
         return pd.DataFrame(columns=["item_name", "city", "qty_sold", "revenue"])
@@ -318,6 +332,19 @@ def _channel_sales(sales_df: pd.DataFrame, channel_keyword: str) -> pd.DataFrame
 SNAPSHOT_COLS = ["channel", "channel_sku", "inventory", "str", "doc",
                  "drr", "units_sold", "n_days", "location"]
 
+# Optional columns persisted when a parser provides them (Amazon Now: stock split
+# and open POs). Needs nullable numeric columns on channel_inventory_snapshots;
+# saving falls back to the base columns if they don't exist yet. Run once:
+#   ALTER TABLE channel_inventory_snapshots ADD COLUMN IF NOT EXISTS soh_spoke NUMERIC;
+#   ALTER TABLE channel_inventory_snapshots ADD COLUMN IF NOT EXISTS soh_fc NUMERIC;
+#   ALTER TABLE channel_inventory_snapshots ADD COLUMN IF NOT EXISTS open_po NUMERIC;
+EXTRA_SNAPSHOT_COLS = ["soh_spoke", "soh_fc", "open_po"]
+
+# Channels whose DRR / DOC / STR come straight from the uploaded inventory file
+# (e.g. Amazon Now's own per-FC DRR) instead of being re-derived from the sales
+# table. Their sales rows are excluded from every raw-sales calculation.
+_FILE_DRR_CHANNELS = {"Amazon Now"}
+
 def _save_snapshot(supabase_client, parsed_df: pd.DataFrame, channel: str):
     """
     Save parsed inventory rows for a channel to channel_inventory_snapshots.
@@ -330,6 +357,7 @@ def _save_snapshot(supabase_client, parsed_df: pd.DataFrame, channel: str):
         # Insert new rows
         from datetime import timezone
         now = datetime.now(timezone.utc).isoformat()
+        extra_cols = [c for c in EXTRA_SNAPSHOT_COLS if c in parsed_df.columns]
         rows = []
         for _, r in parsed_df.iterrows():
             rows.append({
@@ -343,11 +371,25 @@ def _save_snapshot(supabase_client, parsed_df: pd.DataFrame, channel: str):
                 "units_sold":  float(r.get("units_sold", 0)),
                 "n_days":      int(r.get("n_days", 30)),
                 "location":    str(r.get("location", "")),
+                **{c: float(r.get(c, 0) or 0) for c in extra_cols},
             })
         # Insert in chunks
         CHUNK = 500
-        for i in range(0, len(rows), CHUNK):
-            supabase_client.table("channel_inventory_snapshots")                 .insert(rows[i:i+CHUNK]).execute()
+        try:
+            for i in range(0, len(rows), CHUNK):
+                supabase_client.table("channel_inventory_snapshots")                     .insert(rows[i:i+CHUNK]).execute()
+        except Exception:
+            if not extra_cols:
+                raise
+            # Extra columns not on the table yet — save the base columns only.
+            supabase_client.table("channel_inventory_snapshots")                 .delete().eq("channel", channel).execute()
+            base = [{k: v for k, v in row.items() if k not in extra_cols} for row in rows]
+            for i in range(0, len(base), CHUNK):
+                supabase_client.table("channel_inventory_snapshots")                     .insert(base[i:i+CHUNK]).execute()
+            st.warning(
+                f"{channel}: saved without {', '.join(extra_cols)} — add these numeric columns to "
+                "channel_inventory_snapshots to keep them in saved snapshots."
+            )
     except Exception as e:
         st.warning(f"Could not save inventory snapshot for {channel}: {e}")
 
@@ -371,8 +413,9 @@ def _load_snapshots(supabase_client) -> dict:
                 uploaded_at_str = dt.strftime("%-d %b %Y, %I:%M %p")
             except Exception:
                 uploaded_at_str = str(uploaded_at)
-            snap_df = grp[SNAPSHOT_COLS].copy()
-            for col in ["inventory", "str", "doc", "drr", "units_sold"]:
+            extras = [c for c in EXTRA_SNAPSHOT_COLS if c in grp.columns and grp[c].notna().any()]
+            snap_df = grp[SNAPSHOT_COLS + extras].copy()
+            for col in ["inventory", "str", "doc", "drr", "units_sold"] + extras:
                 snap_df[col] = pd.to_numeric(snap_df[col], errors="coerce").fillna(0)
             snap_df["n_days"] = pd.to_numeric(snap_df["n_days"], errors="coerce").fillna(30).astype(int)
             result[channel] = (uploaded_at_str, snap_df)
@@ -538,6 +581,47 @@ def _parse_amazon(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: int, db_
     inv_df["units_sold"] = sales_val
     inv_df["n_days"]     = n_days
     return inv_df[["channel_sku", "inventory", "str", "doc", "drr", "units_sold", "n_days", "location"]]
+
+
+def _parse_amazon_now(inv_df: pd.DataFrame, n_days: int) -> pd.DataFrame:
+    """
+    Amazon Now inventory report — one row per ASIN x fulfilment centre (FC).
+    Columns used: ASIN, FC, City, DRR, 'SOH (Spoke)', 'SOH - FC', 'Open PO'.
+
+      inventory = SOH (Spoke) + SOH - FC   (on-hand; matches the file's own DOH)
+      drr       = file DRR (Amazon's per-FC demand), not the sales table
+      doc       = inventory / DRR, capped at 999 like the other channels
+      str       = 30d demand / (30d demand + inventory)
+      open_po   = units on order — kept separate, NOT counted as inventory
+
+    DOC is computed from the unrounded DRR: rounding DRR to 2 dp first distorts
+    cover badly for very low-demand rows.
+    """
+    d = inv_df.copy()
+    d.columns = [str(c).strip() for c in d.columns]
+    missing = [c for c in ("ASIN", "FC", "City", "DRR", "SOH (Spoke)", "SOH - FC") if c not in d.columns]
+    if missing:
+        raise ValueError(f"Amazon Now file is missing column(s): {missing}")
+    d = d[d["ASIN"].notna()].copy()
+
+    d["channel_sku"] = d["ASIN"].astype(str).str.strip()
+    d["location"]    = d["City"].astype(str).str.strip() + " (" + d["FC"].astype(str).str.strip() + ")"
+    spoke = pd.to_numeric(d["SOH (Spoke)"], errors="coerce").fillna(0)
+    fc    = pd.to_numeric(d["SOH - FC"],    errors="coerce").fillna(0)
+    d["soh_spoke"] = spoke
+    d["soh_fc"]    = fc
+    d["inventory"] = spoke + fc
+    d["open_po"]   = pd.to_numeric(d["Open PO"], errors="coerce").fillna(0) if "Open PO" in d.columns else 0.0
+
+    drr_raw        = pd.to_numeric(d["DRR"], errors="coerce").fillna(0).clip(lower=0)
+    d["doc"]       = np.minimum(d["inventory"] / drr_raw.replace(0, 0.001), 999)
+    d["drr"]       = drr_raw.round(2)
+    sales_30d      = drr_raw * 30
+    d["str"]       = sales_30d / (sales_30d + d["inventory"]).replace(0, 1)
+    d["units_sold"] = (drr_raw * n_days).round(1)
+    d["n_days"]    = n_days
+    return d[["channel_sku", "inventory", "str", "doc", "drr", "units_sold", "n_days", "location",
+              "soh_spoke", "soh_fc", "open_po"]].reset_index(drop=True)
 
 
 def _parse_blinkit(inv_df: pd.DataFrame, sales_df: pd.DataFrame, n_days: int, db_mappings: pd.DataFrame = None) -> pd.DataFrame:
@@ -936,7 +1020,7 @@ def _reapply_sales(snap_df: pd.DataFrame, raw_sales: pd.DataFrame,
     """
     snap_df = snap_df.copy()
 
-    if raw_sales.empty:
+    if raw_sales.empty or channel in _FILE_DRR_CHANNELS:
         return snap_df
 
     keyword_map = {
@@ -946,7 +1030,7 @@ def _reapply_sales(snap_df: pd.DataFrame, raw_sales: pd.DataFrame,
         "Big Basket": "big basket",
     }
     keyword = keyword_map.get(channel, channel.lower())
-    sales_df = _channel_sales(raw_sales, keyword)
+    sales_df = _channel_sales(raw_sales, keyword, exclude=_CH_EXCLUDE.get(channel))
 
     if sales_df.empty:
         return snap_df
@@ -1125,6 +1209,7 @@ def _render_dashboard(merged: pd.DataFrame,
     # and the grouped-table section below.
     _CH_KEYWORD = {
         "Amazon":     "amazon",
+        "Amazon Now": "amazon now",
         "Blinkit":    "blinkit",
         "Swiggy":     "swiggy",
         "Big Basket": "big basket",
@@ -1140,7 +1225,21 @@ def _render_dashboard(merged: pd.DataFrame,
     _true_total_units: float | None = None
     _true_inv = float(table_df["inventory"].sum())   # always from filtered table
 
-    if raw_sales is not None and not raw_sales.empty and n_days > 0:
+    # Units for channels whose DRR comes from the inventory file (Amazon Now):
+    # file DRR x window days, from the already-filtered table.
+    def _file_units(ch=None, sku=None) -> float:
+        t = table_df[table_df["channel"].isin(_FILE_DRR_CHANNELS)]
+        if ch is not None:
+            t = t[t["channel"] == ch]
+        if sku is not None:
+            t = t[t["master_sku"] == sku]
+        return float((t["drr"] * n_days).sum())
+
+    _file_total = _file_units() if any(c in _FILE_DRR_CHANNELS for c in sel_channels) else 0.0
+
+    if n_days > 0 and ((raw_sales is not None and not raw_sales.empty) or _file_total > 0):
+        _rs = raw_sales.copy() if raw_sales is not None else pd.DataFrame(
+            columns=["channel", "item_name", "city", "qty_sold"])
         _rs = raw_sales.copy()
         # Apply product filter if active (matches item_name to master SKU names)
         if sel_products:
@@ -1151,10 +1250,12 @@ def _render_dashboard(merged: pd.DataFrame,
         if set(sel_locations) != set(u_locations):
             _loc_cities = {_loc_to_city_key(loc) for loc in sel_locations}
             _rs = _rs[_rs["city"].apply(_norm_city).isin(_loc_cities)]
-        _total = 0.0
+        _total = _file_total
         for _ch in sel_channels:
+            if _ch in _FILE_DRR_CHANNELS:
+                continue
             _kw   = _CH_KEYWORD.get(_ch, _ch.lower())
-            _mask = _rs["channel"].str.lower().str.contains(_kw, na=False)
+            _mask = _channel_mask(_rs["channel"], _kw, _CH_EXCLUDE.get(_ch))
             _total += _rs.loc[_mask, "qty_sold"].sum()
         if _total > 0:
             _true_total_units = _total
@@ -1238,9 +1339,13 @@ def _render_dashboard(merged: pd.DataFrame,
         if val < 15: return "color: orange; font-weight: bold"
         return ""
 
+    _has_po = "open_po" in table_df.columns and table_df["open_po"].fillna(0).sum() > 0
     display_cols = [c for c in ["master_sku", "channel_sku", "channel", "location",
-                                 "inventory", "drr", "doc", "str"] if c in table_df.columns]
+                                 "inventory", "open_po" if _has_po else None, "drr", "doc", "str"]
+                    if c and c in table_df.columns]
     fmt = {"str": "{:.2%}", "doc": "{:.1f}", "inventory": "{:,.0f}", "drr": "{:.2f}"}
+    if _has_po:
+        fmt["open_po"] = "{:,.0f}"
 
     def _csv_bytes(df: pd.DataFrame) -> bytes:
         """Format a display DataFrame for CSV export (str → %, doc/drr rounded)."""
@@ -1253,6 +1358,8 @@ def _render_dashboard(merged: pd.DataFrame,
             export["drr"] = export["drr"].round(2)
         if "inventory" in export.columns:
             export["inventory"] = export["inventory"].astype(int)
+        if "open_po" in export.columns:
+            export["open_po"] = export["open_po"].fillna(0).astype(int)
         if "units_sold" in export.columns:
             export["units_sold"] = export["units_sold"].round(1)
         return export.to_csv(index=False).encode("utf-8")
@@ -1260,7 +1367,7 @@ def _render_dashboard(merged: pd.DataFrame,
     if group_by == "None":
         _export_df = table_df[display_cols].sort_values("inventory", ascending=False)
         st.dataframe(
-            _export_df.style.format(fmt).map(color_doc, subset=["doc"]),
+            _export_df.style.format(fmt, na_rep="–").map(color_doc, subset=["doc"]),
             use_container_width=True,
         )
         st.download_button(
@@ -1274,9 +1381,10 @@ def _render_dashboard(merged: pd.DataFrame,
     else:
         gcm     = {"Channel": "channel", "Product": "master_sku", "Location": "location"}
         grp_col = gcm[group_by]
-        agg_df  = table_df.groupby(grp_col).agg(
-            inventory=("inventory", "sum"), units_sold=("units_sold", "sum")
-        ).reset_index()
+        _agg_spec = {"inventory": ("inventory", "sum"), "units_sold": ("units_sold", "sum")}
+        if _has_po:
+            _agg_spec["open_po"] = ("open_po", "sum")
+        agg_df  = table_df.groupby(grp_col).agg(**_agg_spec).reset_index()
 
         # units_sold for Channel grouping is corrected inside the metric-series
         # loop below (together with doc / str / drr) — no separate pass needed.
@@ -1325,18 +1433,18 @@ def _render_dashboard(merged: pd.DataFrame,
 
         # Base filtered raw_sales (shared by Channel and Product paths)
         _rs_grp = None
-        if raw_sales is not None and not raw_sales.empty and n_days > 0:
-            _rs_grp = raw_sales.copy()
-            # Apply channel keyword filter
+        if n_days > 0 and ((raw_sales is not None and not raw_sales.empty) or _file_total > 0):
+            _rs_grp = raw_sales.copy() if raw_sales is not None else pd.DataFrame(
+                columns=["channel", "item_name", "city", "qty_sold"])
+            # Apply channel keyword filter (file-DRR channels are handled separately)
+            _raw_chs = [c for c in sel_channels if c not in _FILE_DRR_CHANNELS]
             if sel_channels:
                 _ch_masks = [
-                    _rs_grp["channel"].str.lower().str.contains(
-                        _CH_KEYWORD.get(_ch, _ch.lower()), na=False
-                    )
-                    for _ch in sel_channels
+                    _channel_mask(_rs_grp["channel"], _CH_KEYWORD.get(_ch, _ch.lower()), _CH_EXCLUDE.get(_ch))
+                    for _ch in _raw_chs
                 ]
                 import functools, operator
-                _rs_grp = _rs_grp[functools.reduce(operator.or_, _ch_masks)]
+                _rs_grp = _rs_grp[functools.reduce(operator.or_, _ch_masks)] if _ch_masks else _rs_grp.iloc[0:0]
             if set(sel_locations) != set(u_locations):
                 _loc_cities = {_loc_to_city_key(loc) for loc in sel_locations}
                 _rs_grp = _rs_grp[_rs_grp["city"].apply(_norm_city).isin(_loc_cities)]
@@ -1352,8 +1460,11 @@ def _render_dashboard(merged: pd.DataFrame,
             _ch_drr:   dict[str, float] = {}
             for _ch in agg_df[grp_col].tolist():
                 _kw    = _CH_KEYWORD.get(_ch, str(_ch).lower())
-                _mask  = _rs_ch["channel"].str.lower().str.contains(_kw, na=False)
-                _qty   = float(_rs_ch.loc[_mask, "qty_sold"].sum())
+                if _ch in _FILE_DRR_CHANNELS:
+                    _qty = _file_units(ch=_ch)
+                else:
+                    _mask  = _channel_mask(_rs_ch["channel"], _kw, _CH_EXCLUDE.get(_ch))
+                    _qty   = float(_rs_ch.loc[_mask, "qty_sold"].sum())
                 _inv   = float(agg_df.loc[agg_df[grp_col] == _ch, "inventory"].values[0])
                 _drr_v = _qty / n_days
                 _s30   = _qty * (30.0 / n_days)
@@ -1378,7 +1489,7 @@ def _render_dashboard(merged: pd.DataFrame,
             _pr_str:   dict[str, float] = {}
             _pr_drr:   dict[str, float] = {}
             for _sku in agg_df[grp_col].tolist():
-                _qty   = float(_rs_grp.loc[_rs_grp["item_name"] == _sku, "qty_sold"].sum())
+                _qty   = float(_rs_grp.loc[_rs_grp["item_name"] == _sku, "qty_sold"].sum()) + _file_units(sku=_sku)
                 _inv   = float(agg_df.loc[agg_df[grp_col] == _sku, "inventory"].values[0])
                 _drr_v = _qty / n_days
                 _s30   = _qty * (30.0 / n_days)
@@ -1406,7 +1517,7 @@ def _render_dashboard(merged: pd.DataFrame,
                 .sort_values("inventory", ascending=False).reset_index(drop=True)
             )
         st.dataframe(
-            agg_df.style.format({**fmt, "units_sold": "{:,.1f}"})
+            agg_df.style.format({**fmt, "units_sold": "{:,.1f}"}, na_rep="–")
             .map(color_doc, subset=["doc"]),
             use_container_width=True,
         )
@@ -1552,12 +1663,13 @@ def render_channel_performance_tab(supabase_client, master_skus_df: pd.DataFrame
 
     CHANNELS = [
         ("Amazon",     "cp_amz_i", 1),
+        ("Amazon Now", "cp_amznow_i", 0),
         ("Blinkit",    "cp_blk_i", 2),
         ("Swiggy",     "cp_swg_i", 0),
         ("Big Basket", "cp_bb_i",  0),
     ]
 
-    cols = st.columns(4)
+    cols = st.columns(len(CHANNELS))
     uploaders = {}
     for i, (ch_name, key, _) in enumerate(CHANNELS):
         with cols[i]:
@@ -1583,8 +1695,9 @@ def render_channel_performance_tab(supabase_client, master_skus_df: pd.DataFrame
     ch_parse_config = {
         "Amazon":     (lambda f: _parse_amazon(
                             _load_file(f, skiprows=1),
-                            _channel_sales(raw_sales, "amazon"), n_days, db_mappings,
+                            _channel_sales(raw_sales, "amazon", exclude=_CH_EXCLUDE["Amazon"]), n_days, db_mappings,
                             item_map_df)),
+        "Amazon Now": (lambda f: _parse_amazon_now(_load_file(f), n_days)),
         "Blinkit":    (lambda f: _parse_blinkit(
                             _load_file(f, skiprows=2),
                             _channel_sales(raw_sales, "blinkit"), n_days, db_mappings)),
@@ -1649,7 +1762,22 @@ def render_channel_performance_tab(supabase_client, master_skus_df: pd.DataFrame
     if not db_mappings.empty:
         db_mappings["channel_sku"] = db_mappings["channel_sku"].astype(str)
 
-    merged   = combined.merge(db_mappings, on=["channel", "channel_sku"], how="left")
+    # Amazon Now sells the same ASINs as Amazon: unless an "Amazon Now" mapping
+    # exists, fall back to the Amazon mappings, then Smart Upload's ASIN map.
+    _map_lookup = db_mappings
+    if (combined["channel"] == "Amazon Now").any():
+        _fb = [db_mappings[db_mappings["channel"] == "Amazon"][["channel_sku", "master_sku"]]]
+        if item_map_df is not None and not item_map_df.empty:
+            _fb.append(item_map_df.dropna(subset=["master_name"]).rename(
+                columns={"raw_name": "channel_sku", "master_name": "master_sku"})[["channel_sku", "master_sku"]])
+        _fb = pd.concat(_fb, ignore_index=True)
+        _fb["channel_sku"] = _fb["channel_sku"].astype(str)
+        _own = set(db_mappings.loc[db_mappings["channel"] == "Amazon Now", "channel_sku"].astype(str))
+        _fb = _fb[~_fb["channel_sku"].isin(_own)].drop_duplicates("channel_sku", keep="first")
+        _fb.insert(0, "channel", "Amazon Now")
+        _map_lookup = pd.concat([db_mappings[["channel", "channel_sku", "master_sku"]], _fb], ignore_index=True)
+
+    merged   = combined.merge(_map_lookup, on=["channel", "channel_sku"], how="left")
     unmapped = merged[merged["master_sku"].isna()][["channel", "channel_sku"]].drop_duplicates()
 
     if not unmapped.empty:
