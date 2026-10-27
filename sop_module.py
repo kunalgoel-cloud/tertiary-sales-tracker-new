@@ -163,8 +163,10 @@ def _master_names(snap: pd.DataFrame, maps: pd.DataFrame, item_map: pd.DataFrame
     out = snap["channel_sku"].copy()
     for ch in snap["channel"].unique():
         lookup: dict = {}
-        if ch == "Amazon" and not item_map.empty:   # ASIN → master via Smart Upload
+        if ch in ("Amazon", "Amazon Now") and not item_map.empty:   # ASIN → master via Smart Upload
             lookup.update(item_map.set_index("raw_name")["master_name"].to_dict())
+        if ch == "Amazon Now" and not maps.empty:                    # same ASINs as Amazon
+            lookup.update(maps[maps["channel"] == "Amazon"].set_index("channel_sku")["master_sku"].to_dict())
         if not maps.empty:
             m_ = maps[maps["channel"] == ch]
             lookup.update(m_.set_index("channel_sku")["master_sku"].to_dict())
@@ -213,18 +215,23 @@ def _load_channel_stock_by_location(sb) -> pd.DataFrame:
     """
     Latest Channel Performance inventory snapshots, mapped to master SKU names,
     one row per (channel, SKU, location).
-    Returns columns: inv_channel, item_name, location, stock, drr, uploaded_at.
+    Returns columns: inv_channel, item_name, location, stock, open_po, drr, uploaded_at.
     Empty frame if no snapshots or on error.
     """
-    empty = pd.DataFrame(columns=["inv_channel", "item_name", "location", "stock", "drr", "uploaded_at"])
+    empty = pd.DataFrame(columns=["inv_channel", "item_name", "location", "stock", "open_po", "drr", "uploaded_at"])
+    base_sel = "channel, channel_sku, inventory, drr, location, uploaded_at"
     try:
-        snap = pd.DataFrame(_paginate(
-            sb, "channel_inventory_snapshots",
-            "channel, channel_sku, inventory, drr, location, uploaded_at"))
+        try:   # open_po exists only once the snapshot table has the optional column
+            snap = pd.DataFrame(_paginate(sb, "channel_inventory_snapshots", base_sel + ", open_po"))
+        except Exception:
+            snap = pd.DataFrame(_paginate(sb, "channel_inventory_snapshots", base_sel))
         if snap.empty:
             return empty
     except Exception:
         return empty
+    if "open_po" not in snap.columns:
+        snap["open_po"] = 0.0
+    snap["open_po"] = pd.to_numeric(snap["open_po"], errors="coerce").fillna(0)
     try:
         maps = pd.DataFrame(_paginate(
             sb, "channel_sku_mappings", "channel, channel_sku, master_sku"))
@@ -242,19 +249,19 @@ def _load_channel_stock_by_location(sb) -> pd.DataFrame:
 
     snap["item_name"] = _master_names(snap, maps, item_map)
     out = (snap.groupby(["channel", "item_name", "location"], as_index=False)
-               .agg(stock=("inventory", "sum"), drr=("drr", "sum"),
+               .agg(stock=("inventory", "sum"), open_po=("open_po", "sum"), drr=("drr", "sum"),
                     uploaded_at=("uploaded_at", "max"))
                .rename(columns={"channel": "inv_channel"}))
     return out
 
 
 def _load_channel_stock(sb) -> pd.DataFrame:
-    """SKU-level stock (summed across locations): inv_channel, item_name, stock, uploaded_at."""
+    """SKU-level stock (summed across locations): inv_channel, item_name, stock, open_po, uploaded_at."""
     loc = _load_channel_stock_by_location(sb)
     if loc.empty:
-        return pd.DataFrame(columns=["inv_channel", "item_name", "stock", "uploaded_at"])
+        return pd.DataFrame(columns=["inv_channel", "item_name", "stock", "open_po", "uploaded_at"])
     return (loc.groupby(["inv_channel", "item_name"], as_index=False)
-               .agg(stock=("stock", "sum"), uploaded_at=("uploaded_at", "max")))
+               .agg(stock=("stock", "sum"), open_po=("open_po", "sum"), uploaded_at=("uploaded_at", "max")))
 
 
 def build_location_order_plan(order_df: pd.DataFrame, loc_stock_df: pd.DataFrame) -> pd.DataFrame:
@@ -285,7 +292,7 @@ def build_location_order_plan(order_df: pd.DataFrame, loc_stock_df: pd.DataFrame
                 "channel": r_["channel"], "item_name": r_["item_name"],
                 "channel_product_id": r_["channel_product_id"],
                 "location": loc["location"], "location_drr": round(float(loc["drr"]), 2),
-                "drr_share": round(float(share[idx]), 3), "current_stock": float(loc["stock"]),
+                "drr_share": round(float(share[idx]), 3), "current_stock": float(loc["stock"]), "open_po": float(loc.get("open_po", 0) or 0),
                 "case_qty": case, "sku_order_qty": r_["order_qty"],
                 "location_order_cases": int(qty[idx]), "location_order_qty": int(qty[idx]) * case,
                 "split_basis": "DRR share" if drr_sum > 0 else "Equal split (no DRR)",
@@ -328,19 +335,22 @@ def build_order_plan(
         need         = max(target_stock − current_stock, 0)
         order_cases  = ceil(need / case_qty)        (case_qty defaults to 1)
         order_qty    = order_cases × case_qty       (always a multiple of the case qty)
+    with need = max(target_stock − current_stock − open_po, 0) when the snapshot carries open POs.
 
     A sales channel (e.g. "Amazon RKW") is matched to a Channel Performance
     inventory channel (e.g. "Amazon") when the latter's name (spaces ignored)
-    is contained in the former's.
+    is contained in the former's (longest name wins).
+
+    Open POs (when the inventory snapshot carries them, e.g. Amazon Now) count as
+    stock already on order, so they are subtracted from the need.
     """
     inv_channels = list(stock_df["inv_channel"].unique()) if not stock_df.empty else []
 
     def _inv_ch(sales_ch: str):
+        # Longest match wins, so "Amazon Now" doesn't fall into plain "Amazon".
         key = sales_ch.lower().replace(" ", "")
-        for ic in inv_channels:
-            if ic.lower().replace(" ", "") in key:
-                return ic
-        return None
+        hits = [ic for ic in inv_channels if ic.lower().replace(" ", "") in key]
+        return max(hits, key=len) if hits else None
 
     plan = forecast_df[["channel", "item_name", "total_qty_30d"]].copy()
     plan["inv_channel"] = plan["channel"].map(_inv_ch)
@@ -353,6 +363,7 @@ def build_order_plan(
 
     has_snapshot = plan["inv_channel"].notna()
     plan["current_stock"] = np.where(has_snapshot, plan["stock"].fillna(0), np.nan)
+    plan["open_po"]       = np.where(has_snapshot, plan["open_po"].fillna(0), np.nan)
     plan["daily_demand"]  = (plan["total_qty_30d"] / forecast_days).round(2)
     plan["target_stock"]  = (plan["daily_demand"] * cover_days).round(0)
     plan["current_cover_days"] = np.where(
@@ -361,7 +372,7 @@ def build_order_plan(
     case_map = {k: v for k, v in (case_qty or {}).items() if v and v >= 1}
     plan["case_set"] = plan["item_name"].isin(case_map)
     plan["case_qty"] = plan["item_name"].map(case_map).fillna(1).astype(int)
-    need = np.maximum(plan["target_stock"] - plan["current_stock"], 0)
+    need = np.maximum(plan["target_stock"] - plan["current_stock"] - plan["open_po"].fillna(0), 0)
     plan["order_cases"] = np.where(has_snapshot, np.ceil(need / plan["case_qty"]), np.nan)
     plan["order_qty"]   = plan["order_cases"] * plan["case_qty"]
     plan["status"] = np.where(
@@ -371,7 +382,7 @@ def build_order_plan(
     plan.loc[~plan["case_set"] & (plan["order_qty"] > 0), "status"] += " (no case qty set — 1 assumed)"
     plan["stock_as_of"] = plan["uploaded_at"].fillna("").astype(str).str[:10]
     return plan[["channel", "inv_channel", "item_name", "channel_product_id", "total_qty_30d", "daily_demand", "current_stock",
-                 "current_cover_days", "target_stock", "case_qty", "order_cases", "order_qty",
+                 "open_po", "current_cover_days", "target_stock", "case_qty", "order_cases", "order_qty",
                  "status", "stock_as_of"]
                ].sort_values(["channel", "order_qty"], ascending=[True, False])
 
@@ -1234,12 +1245,13 @@ def render_sop_tab(supabase_client, history_df, master_skus_df, master_chans_df,
                 product_ids=_load_channel_product_ids(supabase_client))
             st.caption(
                 "Daily demand = total forecast units (organic + marketing) ÷ 30. Current stock is the latest "
-                "Channel Performance snapshot, summed across locations; open POs / in-transit are not included."
+                "Channel Performance snapshot, summed across locations. Open POs are netted off the order where the "
+                "snapshot has them (Amazon Now); for other channels open POs / in-transit are not included."
             )
             _o_show = _order_df.drop(columns=["inv_channel"]).rename(columns={
                 "channel": "Channel", "item_name": "SKU", "channel_product_id": "Channel Product ID",
                 "total_qty_30d": "30d Forecast",
-                "daily_demand": "Daily Demand", "current_stock": "Current Stock",
+                "daily_demand": "Daily Demand", "current_stock": "Current Stock", "open_po": "Open PO",
                 "current_cover_days": "Cover (days)", "target_stock": f"Target Stock ({cover_days}d)",
                 "case_qty": "Case Qty", "order_cases": "Order Cases", "order_qty": "Order Qty", "status": "Status", "stock_as_of": "Stock As Of",
             })
@@ -1254,10 +1266,10 @@ def render_sop_tab(supabase_client, history_df, master_skus_df, master_chans_df,
             # ── Location-wise split (Swiggy / Big Basket) ─────────────────────
             _loc_stock = _load_channel_stock_by_location(supabase_client)
             _loc_chs = sorted(
-                _order_df.loc[_order_df["inv_channel"].isin(["Swiggy", "Big Basket"]), "channel"].unique()
+                _order_df.loc[_order_df["inv_channel"].isin(["Swiggy", "Big Basket", "Amazon Now"]), "channel"].unique()
             ) if not _loc_stock.empty else []
             if _loc_chs:
-                st.markdown("##### 📍 Location-wise order split (Swiggy / Big Basket)")
+                st.markdown("##### 📍 Location-wise order split (Swiggy / Big Basket / Amazon Now)")
                 _loc_ch = st.selectbox("Channel", _loc_chs, key="sop_loc_channel")
                 _loc_df = build_location_order_plan(
                     _order_df[_order_df["channel"] == _loc_ch], _loc_stock)
@@ -1272,7 +1284,7 @@ def render_sop_tab(supabase_client, history_df, master_skus_df, master_chans_df,
                         "channel": "Channel", "item_name": "SKU", "channel_product_id": "Channel Product ID",
                         "location": "Location",
                         "location_drr": "Location DRR/day", "drr_share": "DRR Share",
-                        "current_stock": "Current Stock", "case_qty": "Case Qty", "sku_order_qty": "SKU Order Qty",
+                        "current_stock": "Current Stock", "open_po": "Open PO", "case_qty": "Case Qty", "sku_order_qty": "SKU Order Qty",
                         "location_order_cases": "Location Cases", "location_order_qty": "Location Order Qty", "split_basis": "Split Basis",
                     })
                     st.dataframe(_l_show, use_container_width=True, hide_index=True)
